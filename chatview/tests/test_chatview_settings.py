@@ -149,5 +149,73 @@ class TestChatViewSettings(unittest.TestCase):
         self.assertEqual(settings.get("draw_unicode_white_space"), "none")
 
 
+class TestModelPanelThinkTag(unittest.TestCase):
+    """The effort tag rides next to the model button and opens its picker."""
+
+    def setUp(self):
+        chat_threads.clear()
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _render(self, think_level):
+        view, _ = _make_fake_view(view_id=77)
+        window = MagicMock()
+        window.id.return_value = 3
+        panel = chatview_mod.ModelPanel(view, window)
+
+        session = MagicMock()
+        sessions = MagicMock()
+        sessions.get.return_value = session
+        sessions.values.return_value = []
+
+        values = {
+            chatview_mod.CHAT_PLAN_MODE: chatview_mod.PlanMode.FAST.value,
+            chatview_mod.CHAT_AGENT: "opencode",
+            "chatview_model_opencode": "opencode/gpt-6.2-astra",
+        }
+        if think_level is not None:
+            values["chatview_think_level_opencode"] = think_level
+
+        def fake_setting(_window, _session, key, default=None):
+            return values.get(key, default)
+
+        with patch.object(chatview_mod, "chatview_sessions", sessions), \
+             patch.object(
+                 chatview_mod.chat_threads,
+                 "get_setting_for_session",
+                 side_effect=fake_setting,
+             ), \
+             patch.object(chatview_mod.chat_threads, "set_setting_for_session"), \
+             patch.object(chatview_mod, "get_input_start", return_value=0), \
+             patch.object(chatview_mod.sublime, "Phantom") as phantom_cls:
+            panel.update()
+
+        return phantom_cls.call_args.args[1]
+
+    def test_think_tag_sits_after_model_and_opens_picker(self):
+        panel_html = self._render("high")
+
+        self.assertIn('href="set_think"', panel_html)
+        self.assertIn("Think:", panel_html)
+        self.assertIn(">high<", panel_html)
+        model_pos = panel_html.index('href="set_model"')
+        think_pos = panel_html.index('href="set_think"')
+        plan_pos = panel_html.index('href="toggle_plan"')
+        self.assertLess(model_pos, think_pos)
+        self.assertLess(think_pos, plan_pos)
+
+    def test_no_think_tag_without_level(self):
+        panel_html = self._render(None)
+
+        self.assertNotIn('href="set_think"', panel_html)
+
+    def test_think_level_is_escaped(self):
+        panel_html = self._render("<high>")
+
+        self.assertIn("&lt;high&gt;", panel_html)
+        self.assertNotIn("<high>", panel_html)
+
+
 if __name__ == "__main__":
     unittest.main()

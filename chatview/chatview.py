@@ -146,6 +146,21 @@ def format_model_display_name(agent_provider, model, max_length=20):
     return display_model
 
 
+def format_think_tag_html(think_level):
+    """Return the clickable phantom tag for a selected effort level.
+
+    The tag sits right after the model button and opens the reasoning-effort
+    picker, so the level can be replaced without leaving the prompt area.
+    """
+    if not think_level:
+        return ""
+    return (
+        '<a href="set_think" class="think-tag">'
+        '<span class="label">Think:</span>'
+        f'<span class="value">{html.escape(str(think_level))}</span></a>'
+    )
+
+
 def _format_session_status(window, session):
     """Build status bar indicator text for a given session."""
     if not session:
@@ -837,6 +852,8 @@ class ModelPanel:
             self.window.run_command("term_chat_set_agent", {"view_id": view_id})
         elif href == "set_model":
             self.window.run_command("term_chat_set_model", {"view_id": view_id})
+        elif href == "set_think":
+            self.window.run_command("term_chat_set_think_level", {"view_id": view_id})
         elif href == "toggle_plan":
             self.window.run_command("term_chat_toggle_plan_mode", {"view_id": view_id})
         elif href == "stop_conversation":
@@ -921,7 +938,15 @@ class ModelPanel:
             f'<span class="value">{html.escape(display_model)}</span></a>'
         )
 
-        tags = [agent_tag, model_tag, plan_tag_html]
+        think_level = chat_threads.get_setting_for_session(
+            self.window, session, f"chatview_think_level_{agent_provider}"
+        )
+        think_tag_html = format_think_tag_html(think_level)
+
+        tags = [agent_tag, model_tag]
+        if think_tag_html:
+            tags.append(think_tag_html)
+        tags.append(plan_tag_html)
         buttons_html = "&nbsp;".join(tags)
         if task_tag_html:
             buttons_html += task_tag_html
@@ -946,6 +971,16 @@ class ModelPanel:
                     color: var(--accent);
                     background-color: color(var(--accent) alpha(0.08));
                     border: 1px solid color(var(--accent) alpha(0.15));
+                    border-radius: 3px;
+                    padding: 2px 2px;
+                    font-size: 0.9em;
+                    text-decoration: none;
+                }}
+                .think-tag {{
+                    display: inline-block;
+                    color: var(--foreground);
+                    background-color: rgba(255, 196, 0, 0.18);
+                    border: 1px solid rgba(255, 196, 0, 0.45);
                     border-radius: 3px;
                     padding: 2px 2px;
                     font-size: 0.9em;
