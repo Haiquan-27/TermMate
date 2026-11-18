@@ -1473,7 +1473,9 @@ class ChatSession:
         self.history_stash = ""
         self.permission_requests = {} # Map of request_id -> (tool_name, input_data)
         self.available_models = []  # Will be populated from control_response
-        self._model_picker_waiting = False  # True while an on-demand model fetch is pending
+        self._model_picker_waiting = False  # True while a model refresh is pending
+        self._model_picker_snapshot = None  # Model values before the pending refresh
+        self._model_picker_skip_refresh = False  # Suppress refresh for auto-reopened pickers
         self.prompt_regions = [] # List of (Region, uuid, phantom_index) for submitted prompts
         self.prompt_button_phantoms = [] # List of PhantomSet, parallel to prompt_regions
         self.session_allow_all = False
@@ -1567,10 +1569,14 @@ class ChatSession:
         update_agent_model_status(self.window)
         if self._model_picker_waiting:
             self._model_picker_waiting = False
-            sublime.set_timeout(self._reopen_model_picker, 0)
+            values = sorted(m.get("value") or "" for m in self.available_models)
+            # Only reopen when the refreshed roster actually differs from what
+            # the user was already looking at.
+            if values and values != self._model_picker_snapshot:
+                sublime.set_timeout(self._reopen_model_picker, 0)
 
     def _reopen_model_picker(self):
-        """Reopen the model picker after an on-demand fetch completes."""
+        """Reopen the model picker after a background refresh changed the list."""
         if not self.available_models:
             return
         view = self.chat_view
@@ -1578,6 +1584,8 @@ class ChatSession:
             return
         if not (self.window and self.window.is_valid()):
             return
+        # The reopened picker shows fresh data; don't kick off another fetch.
+        self._model_picker_skip_refresh = True
         self.window.run_command("term_chat_set_model", {"view_id": view.id()})
 
     def _reset_markdown_formatter(self):
@@ -3560,6 +3568,13 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         if session:
             session._model_picker_waiting = False
 
+    def confirm(self, value):
+        # Selection made; a background refresh finishing later must not reopen
+        # the picker on top of the next input step.
+        session = self._session()
+        if session:
+            session._model_picker_waiting = False
+
     def name(self):
         return "model"
 
@@ -3857,32 +3872,42 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
 
         view_id = args.get("view_id")
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
-        if session and session.available_models:
-            # Get current model to highlight it
-            agent_provider = chat_threads.get_setting_for_session(
-                self.window, session, CHAT_AGENT, "claude"
-            )
-            current_model = chat_threads.get_setting_for_session(
-                self.window, session, f"chatview_model_{agent_provider}"
-            )
-            think_level = chat_threads.get_setting_for_session(
-                self.window, session, f"chatview_think_level_{agent_provider}"
-            )
-            # Use ListInputHandler for dropdown selection
-            return TermChatSetModelListHandler(
-                current_model,
-                think_level=think_level,
-                window=self.window,
-                view_id=view_id,
-            )
 
-        if session and self._request_models(session):
-            # The agent fetches models asynchronously on connect; if the picker
-            # was opened before that finished, fetch now and reopen the picker
-            # once the models_update message has been processed.
-            session._model_picker_waiting = True
-            sublime.status_message(f"{PACKAGE_NAME}: loading models…")
-            return TermChatSetModelListHandler(window=self.window, view_id=view_id)
+        if session:
+            # Refresh on every invocation so the picker always reflects the
+            # latest server roster. The cached list is shown right away while
+            # the fetch runs in the background.
+            skip_refresh = session._model_picker_skip_refresh
+            session._model_picker_skip_refresh = False
+            if not skip_refresh and self._request_models(session):
+                session._model_picker_waiting = True
+                session._model_picker_snapshot = sorted(
+                    m.get("value") or "" for m in session.available_models
+                )
+                if not session.available_models:
+                    sublime.status_message(f"{PACKAGE_NAME}: loading models…")
+
+            if session.available_models:
+                # Get current model to highlight it
+                agent_provider = chat_threads.get_setting_for_session(
+                    self.window, session, CHAT_AGENT, "claude"
+                )
+                current_model = chat_threads.get_setting_for_session(
+                    self.window, session, f"chatview_model_{agent_provider}"
+                )
+                think_level = chat_threads.get_setting_for_session(
+                    self.window, session, f"chatview_think_level_{agent_provider}"
+                )
+                # Use ListInputHandler for dropdown selection
+                return TermChatSetModelListHandler(
+                    current_model,
+                    think_level=think_level,
+                    window=self.window,
+                    view_id=view_id,
+                )
+
+            if session._model_picker_waiting:
+                return TermChatSetModelListHandler(window=self.window, view_id=view_id)
 
         # Fallback to TextInputHandler for manual input
         return TermChatSetModelTextHandler(window=self.window, view_id=view_id)
