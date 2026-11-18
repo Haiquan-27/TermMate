@@ -1045,27 +1045,27 @@ class PermissionPanel:
                 .replace(">", "&gt;")
                 .replace('"', "&quot;"))
 
-    def _focus_plan_if_exists(self, request_id, plan_path=None):
-        """Focus an existing plan view for this request and return True if found."""
+    def _open_plan(self, request_id, plan, name):
+        """Open the plan view for this request, reusing an existing one."""
+        plan_view = None
         for v in self.window.views():
-            if v.settings().get("chatview_plan_request_id") == request_id or (plan_path and v.file_name() == plan_path):
-                self.window.focus_view(v)
-                return True
-        return False
+            if v.settings().get("chatview_plan_request_id") == request_id:
+                plan_view = v
+                break
 
-    def _open_plan(self, request_id, plan, name, background=False):
-        """Open a new plan view for this request."""
-        active_view = self.window.active_view()
+        if plan_view is None:
+            plan_view = self.window.new_file()
+            plan_view.set_name(name)
+            plan_view.settings().set("chatview_plan_request_id", request_id)
+            plan_view.set_syntax_file("Packages/Markdown/Markdown.sublime-syntax")
+            plan_view.set_scratch(True)
+        elif plan_view.substr(sublime.Region(0, plan_view.size())) != plan:
+            # Refresh stale content from a previous plan cycle in this session.
+            plan_view.run_command("select_all")
+            plan_view.run_command("right_delete")
 
-        plan_view = self.window.new_file()
-        plan_view.set_name(name)
-        plan_view.settings().set("chatview_plan_request_id", request_id)
         plan_view.run_command("append", {"characters": plan})
-        plan_view.set_syntax_file("Packages/Markdown/Markdown.sublime-syntax")
-        plan_view.set_scratch(True)
-
-        if background and active_view:
-            self.window.focus_view(active_view)
+        self.window.focus_view(plan_view)
 
     def _prepare_display_content(self, request_id, tool_name, input_data):
         """Prepare the display content for a permission request."""
@@ -1083,18 +1083,6 @@ class PermissionPanel:
             summary = input_data.get("summary", "")
             first_line = summary or (plan.split("\n")[0] if plan else "Implementation Plan")
             self.diff_data[request_id] = (plan_path, plan, "Implementation Plan")
-
-            # Automatically open the plan in a new view in the background
-            def _open():
-                if plan_path and os.path.isfile(plan_path):
-                    active_view = self.window.active_view()
-                    self.window.open_file(plan_path)
-                    if active_view:
-                        self.window.focus_view(active_view)
-                elif plan:
-                    self._open_plan(request_id, plan, "Implementation Plan", background=True)
-
-            sublime.set_timeout(_open, 0)
 
             return (
                 f'📄 <a href="show_plan" class="file-link">plan</a>\n\n'
@@ -1255,8 +1243,7 @@ class PermissionPanel:
                 plan_path, plan, name = self.diff_data[request_id]
                 if plan_path and os.path.isfile(plan_path):
                     self.window.open_file(plan_path)
-                    return
-                if not self._focus_plan_if_exists(request_id, plan_path=plan_path):
+                else:
                     self._open_plan(request_id, plan, name)
             return
         elif action == "set_approve_mode":
