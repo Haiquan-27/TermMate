@@ -146,18 +146,26 @@ def format_model_display_name(agent_provider, model, max_length=20):
     return display_model
 
 
-def format_think_tag_html(think_level):
-    """Return the clickable phantom tag for a selected effort level.
+THINK_VALUE_PREFIX = "think::"
 
-    The tag sits right after the model button and opens the reasoning-effort
-    picker, so the level can be replaced without leaving the prompt area.
+
+def format_model_tag_html(display_model, think_level=None):
+    """Return the model button, with the effort level in its tail.
+
+    The level rides inside the model link: clicking it opens the model picker,
+    which lists the current model's levels before the model roster.
     """
-    if not think_level:
-        return ""
+    think_html = ""
+    if think_level:
+        think_html = (
+            '<span class="think-sep"> · </span>'
+            f'<span class="think-value">{html.escape(str(think_level))}</span>'
+        )
     return (
-        '<a href="set_think" class="think-tag">'
-        '<span class="label">Think:</span>'
-        f'<span class="value">{html.escape(str(think_level))}</span></a>'
+        '<a href="set_model" class="model-tag">'
+        '<span class="label">Model:</span>'
+        f'<span class="value">{html.escape(display_model)}</span>'
+        f'{think_html}</a>'
     )
 
 
@@ -852,8 +860,6 @@ class ModelPanel:
             self.window.run_command("term_chat_set_agent", {"view_id": view_id})
         elif href == "set_model":
             self.window.run_command("term_chat_set_model", {"view_id": view_id})
-        elif href == "set_think":
-            self.window.run_command("term_chat_set_think_level", {"view_id": view_id})
         elif href == "toggle_plan":
             self.window.run_command("term_chat_toggle_plan_mode", {"view_id": view_id})
         elif href == "stop_conversation":
@@ -932,21 +938,12 @@ class ModelPanel:
             f'<span class="icon">✨</span>'
             f'<span class="value">{agent_provider}</span></a>'
         )
-        model_tag = (
-            f'<a href="set_model" class="model-tag">'
-            f'<span class="label">Model:</span>'
-            f'<span class="value">{html.escape(display_model)}</span></a>'
-        )
-
         think_level = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_think_level_{agent_provider}"
         )
-        think_tag_html = format_think_tag_html(think_level)
+        model_tag = format_model_tag_html(display_model, think_level)
 
-        tags = [agent_tag, model_tag]
-        if think_tag_html:
-            tags.append(think_tag_html)
-        tags.append(plan_tag_html)
+        tags = [agent_tag, model_tag, plan_tag_html]
         buttons_html = "&nbsp;".join(tags)
         if task_tag_html:
             buttons_html += task_tag_html
@@ -976,15 +973,11 @@ class ModelPanel:
                     font-size: 0.9em;
                     text-decoration: none;
                 }}
-                .think-tag {{
-                    display: inline-block;
+                .think-sep {{
+                    color: color(var(--foreground) alpha(0.35));
+                }}
+                .think-value {{
                     color: var(--yellowish);
-                    background-color: color(var(--yellowish) alpha(0.08));
-                    border: 1px solid color(var(--yellowish) alpha(0.15));
-                    border-radius: 3px;
-                    padding: 2px 2px;
-                    font-size: 0.9em;
-                    text-decoration: none;
                 }}
                 .stop-hint {{
                     color: var(--accent);
@@ -3623,6 +3616,10 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         if not model:
             return None
 
+        # Effort entries apply to the current model and finish the flow.
+        if model.startswith(THINK_VALUE_PREFIX):
+            return None
+
         window = self.window or sublime.active_window()
         session = (
             chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
@@ -3697,6 +3694,27 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
                     items.insert(0, items.pop(i))
                     break
 
+        # Offer the current model's effort levels above the roster so a level
+        # can be replaced with one click, without re-picking the model.
+        current = next(
+            (m for m in session.available_models if m.get("value") == self.current_model),
+            None,
+        )
+        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
+            current
+        )
+        if presets:
+            think_items = [
+                sublime.ListInputItem(
+                    text=f"Think: {p['value']}",
+                    value=f"{THINK_VALUE_PREFIX}{p['value']}",
+                    details=html.escape(p.get("description") or ""),
+                    annotation="current" if p["value"] == think_level else "",
+                )
+                for p in presets
+            ]
+            items = think_items + items
+
         return items
 
     def placeholder(self):
@@ -3706,6 +3724,8 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         return "Select a model"
 
     def description(self, value, text):
+        if value and value.startswith(THINK_VALUE_PREFIX):
+            return f"Reasoning Effort: {value[len(THINK_VALUE_PREFIX):]}"
         return f"Model: {value}"
 
 
@@ -3871,7 +3891,6 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         if not model:
             return
         model = model.strip()
-        level = level.strip() if level else None
 
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         agent_provider = chat_threads.get_setting_for_session(
@@ -3883,6 +3902,17 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         curr_level = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_think_level_{agent_provider}"
         )
+
+        # Effort entries in the model picker only change the level: the model
+        # selected in the session stays untouched.
+        think_only = model.startswith(THINK_VALUE_PREFIX)
+        if think_only:
+            level = model[len(THINK_VALUE_PREFIX):]
+            model = curr_model
+            if not model:
+                return
+
+        level = level.strip() if level else None
 
         models = getattr(session, "available_models", None) or [] if session else []
         active_model = next((m for m in models if m.get("value") == model), None)
@@ -3912,7 +3942,10 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
             )
             config_updates["think_level"] = next_level
 
-        if level:
+        if think_only:
+            term = "thinking level" if agent_provider == "claude" else "reasoning effort"
+            sublime.status_message(f"{PACKAGE_NAME} {term} set to: {level}")
+        elif level:
             term = "thinking" if agent_provider == "claude" else "reasoning"
             sublime.status_message(f"{PACKAGE_NAME} model set to: {model} ({term}: {level})")
         else:
