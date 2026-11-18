@@ -978,9 +978,9 @@ class ModelPanel:
                 }}
                 .think-tag {{
                     display: inline-block;
-                    color: var(--foreground);
-                    background-color: rgba(255, 196, 0, 0.18);
-                    border: 1px solid rgba(255, 196, 0, 0.45);
+                    color: var(--yellowish);
+                    background-color: color(var(--yellowish) alpha(0.08));
+                    border: 1px solid color(var(--yellowish) alpha(0.15));
                     border-radius: 3px;
                     padding: 2px 2px;
                     font-size: 0.9em;
