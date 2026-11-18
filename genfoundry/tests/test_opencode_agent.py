@@ -333,6 +333,28 @@ class TestOpenCodeTurns(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(messages[0].content, {"session_id": "ses_new"})
 
+    async def test_v1_send_message_ignores_think_level(self):
+        agent = OpenCodeAgent(
+            AgentOptions(
+                cwd=".",
+                model="anthropic/claude-3-7-sonnet",
+                think_level="high",
+            ),
+            version=1,
+        )
+        agent._is_connected = True
+        agent._session_id = "ses_v1"
+        agent._http = AsyncMock(return_value=None)
+
+        await agent.send_message("hello")
+
+        body = agent._http.await_args_list[0].kwargs["body"]
+        self.assertEqual(
+            body["model"],
+            {"providerID": "anthropic", "modelID": "claude-3-7-sonnet"},
+        )
+        self.assertNotIn("variant", body)
+
     async def test_connect_without_prompt_does_not_create_session(self):
         agent = OpenCodeAgent(AgentOptions(cwd="."), version=1)
         agent._loop = asyncio.get_running_loop()
@@ -545,6 +567,13 @@ class TestOpenCodeRuntimeConfig(unittest.TestCase):
             config["permission"],
             {"*": "ask", "edit": "allow"},
         )
+
+    def test_set_think_level_updates_options(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+
+        agent.set_think_level("high")
+
+        self.assertEqual(agent.options.think_level, "high")
 
 
 class TestOpenCodeVersionDetection(unittest.TestCase):
@@ -975,6 +1004,96 @@ class TestOpenCodeV2Turns(unittest.IsolatedAsyncioTestCase):
             {"model": {"providerID": "anthropic", "id": "claude-3-7-sonnet"}},
         )
 
+    async def test_v2_send_message_applies_reasoning_variant(self):
+        agent = OpenCodeAgent(
+            AgentOptions(
+                cwd=".",
+                model="opencode/gpt-6.2-astra",
+                think_level="high",
+            ),
+            version=2,
+        )
+        agent._is_connected = True
+        agent._session_id = "ses_v2"
+        agent._http = AsyncMock(return_value=None)
+        agent.available_models = [
+            {
+                "value": "opencode/gpt-6.2-astra",
+                "supportedReasoningEfforts": ["auto", "low", "medium", "high"],
+            }
+        ]
+
+        await agent.send_message("analyze code")
+
+        self.assertEqual(
+            agent._http.await_args_list[1].kwargs["body"],
+            {
+                "model": {
+                    "providerID": "opencode",
+                    "id": "gpt-6.2-astra",
+                    "variant": "high",
+                }
+            },
+        )
+
+    async def test_v2_send_message_auto_level_omits_variant(self):
+        for level in ("auto", "default", None):
+            with self.subTest(level=level):
+                agent = OpenCodeAgent(
+                    AgentOptions(
+                        cwd=".",
+                        model="opencode/gpt-6.2-astra",
+                        think_level=level,
+                    ),
+                    version=2,
+                )
+                agent._is_connected = True
+                agent._session_id = "ses_v2"
+                agent._http = AsyncMock(return_value=None)
+
+                await agent.send_message("hi")
+
+                self.assertEqual(
+                    agent._http.await_args_list[1].kwargs["body"],
+                    {
+                        "model": {
+                            "providerID": "opencode",
+                            "id": "gpt-6.2-astra",
+                        }
+                    },
+                )
+
+    async def test_v2_send_message_skips_unsupported_variant(self):
+        agent = OpenCodeAgent(
+            AgentOptions(
+                cwd=".",
+                model="opencode/gpt-6.2-astra",
+                think_level="max",
+            ),
+            version=2,
+        )
+        agent._is_connected = True
+        agent._session_id = "ses_v2"
+        agent._http = AsyncMock(return_value=None)
+        agent.available_models = [
+            {
+                "value": "opencode/gpt-6.2-astra",
+                "supportedReasoningEfforts": ["auto", "low", "high"],
+            }
+        ]
+
+        await agent.send_message("hi")
+
+        self.assertEqual(
+            agent._http.await_args_list[1].kwargs["body"],
+            {
+                "model": {
+                    "providerID": "opencode",
+                    "id": "gpt-6.2-astra",
+                }
+            },
+        )
+
     async def test_v2_interrupt_route(self):
         agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
         agent._is_connected = True
@@ -1040,6 +1159,52 @@ class TestOpenCodeV2ModelsAndPermissions(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             agent.available_models[1]["value"], "anthropic/claude-3-5-sonnet"
+        )
+
+    async def test_v2_fetch_models_exposes_reasoning_variants(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        raw_models = [
+            {
+                "id": "gpt-6.2-astra",
+                "modelID": "gpt-6.2-astra",
+                "providerID": "opencode",
+                "name": "GPT-6.2 Astra",
+                "variants": [
+                    {"id": "low", "settings": {"reasoningEffort": "low"}},
+                    {"id": "high", "settings": {"reasoningEffort": "high"}},
+                    {"id": "high", "settings": {"reasoningEffort": "high"}},
+                ],
+            },
+            {
+                "id": "hy4-flash-free",
+                "modelID": "hy4-flash-free",
+                "providerID": "opencode",
+                "name": "Hy4 Flash Free",
+                "variants": [],
+            },
+            {
+                "id": "qwen4-max",
+                "modelID": "qwen4-max",
+                "providerID": "opencode",
+                "name": "Qwen4 Max",
+                "variants": [{"id": "auto"}, {"id": "low"}],
+            },
+        ]
+        agent._http = AsyncMock(return_value=raw_models)
+
+        await agent._fetch_models()
+
+        self.assertEqual(
+            agent.available_models[0]["supportedReasoningEfforts"],
+            ["auto", "low", "high"],
+        )
+        self.assertNotIn(
+            "supportedReasoningEfforts", agent.available_models[1]
+        )
+        # A real "auto" variant must not be duplicated by the default entry.
+        self.assertEqual(
+            agent.available_models[2]["supportedReasoningEfforts"],
+            ["auto", "low"],
         )
 
     async def test_v2_permission_reply_route(self):
