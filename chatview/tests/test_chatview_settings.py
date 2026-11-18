@@ -316,6 +316,163 @@ class TestModelPickerThinkChain(unittest.TestCase):
         self.assertEqual(set(values), {"auto", "low", "high"})
 
 
+class TestModelPickerLoading(unittest.TestCase):
+    """Opening the picker before the roster loads must still show a panel."""
+
+    def setUp(self):
+        chat_threads.clear()
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _command(self):
+        window = MagicMock()
+        command = chatview_mod.TermChatSetModelCommand(window)
+        command.window = window
+        return command, window
+
+    def _session(self, models=None, cached=None):
+        session = MagicMock()
+        session.available_models = list(models or [])
+        agent = MagicMock()
+        agent.available_models = list(cached or [])
+        session.agent_thread.agent = agent
+        session._model_picker_skip_refresh = False
+        session._start_model_wait = MagicMock()
+        return session
+
+    def test_empty_roster_shows_loading_panel(self):
+        command, _ = self._command()
+        session = self._session()
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            command, "_request_models", return_value=False
+        ), patch.object(
+            chatview_mod, "known_models", return_value=[]
+        ), patch.object(
+            chatview_mod.sublime, "status_message"
+        ), patch.object(
+            chatview_mod.sublime, "ListInputItem", _FakeListInputItem
+        ):
+            handler = command.input({"view_id": 5})
+            items = handler.list_items()
+
+        self.assertTrue(handler.loading)
+        self.assertEqual([i.text for i in items], ["Loading models…"])
+        self.assertEqual(items[0].value, "")
+        session._start_model_wait.assert_called_once_with([])
+
+    def test_agent_cache_roster_skips_the_loading_panel(self):
+        command, _ = self._command()
+        entry = {"value": "opencode/gpt-6.2-astra", "displayName": "gpt-6.2-astra"}
+        session = self._session(cached=[entry])
+
+        def fake_setting(_window, _session, key, default=None):
+            if key == chatview_mod.CHAT_AGENT:
+                return "opencode"
+            if key == "chatview_model_opencode":
+                return "opencode/gpt-6.2-astra"
+            return default
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            command, "_request_models", return_value=True
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=fake_setting,
+        ), patch.object(
+            chatview_mod.sublime, "ListInputItem", _FakeListInputItem
+        ), patch.object(
+            chatview_mod.sublime, "status_message"
+        ):
+            handler = command.input({"view_id": 5})
+            items = handler.list_items()
+
+        self.assertFalse(handler.loading)
+        self.assertEqual([i.value for i in items], ["opencode/gpt-6.2-astra"])
+        self.assertTrue(session._model_picker_waiting)
+
+    def test_loading_panel_cancel_keeps_the_pending_refresh(self):
+        window = MagicMock()
+        session = types.SimpleNamespace(_model_picker_waiting=True)
+        handler = chatview_mod.TermChatSetModelListHandler(
+            window=window, view_id=5, loading=True
+        )
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ):
+            handler.cancel()
+
+        self.assertTrue(session._model_picker_waiting)
+
+    def test_populated_panel_cancel_stops_the_pending_refresh(self):
+        window = MagicMock()
+        session = types.SimpleNamespace(_model_picker_waiting=True)
+        handler = chatview_mod.TermChatSetModelListHandler(window=window, view_id=5)
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ):
+            handler.cancel()
+
+        self.assertFalse(session._model_picker_waiting)
+
+    def test_model_wait_retries_until_the_agent_is_ready(self):
+        session = chatview_mod.ChatSession.__new__(chatview_mod.ChatSession)
+        session._model_picker_waiting = False
+        session._model_picker_snapshot = None
+        callbacks = []
+
+        with patch.object(
+            chatview_mod.sublime,
+            "set_timeout",
+            side_effect=lambda cb, ms: callbacks.append(cb),
+        ):
+            session._start_model_wait([])
+
+            self.assertTrue(session._model_picker_waiting)
+            self.assertEqual(session._model_picker_snapshot, [])
+            self.assertEqual(len(callbacks), 1)
+
+            with patch.object(chatview_mod, "request_agent_models", return_value=False):
+                callbacks.pop()()
+            self.assertEqual(len(callbacks), 1)
+            self.assertTrue(session._model_picker_waiting)
+
+            with patch.object(chatview_mod, "request_agent_models", return_value=True):
+                callbacks.pop()()
+            self.assertEqual(callbacks, [])
+            self.assertTrue(session._model_picker_waiting)
+
+    def test_models_update_reopens_the_pending_panel(self):
+        session = chatview_mod.ChatSession.__new__(chatview_mod.ChatSession)
+        session.window = MagicMock()
+        session.available_models = [{"value": "opencode/gpt-6.2-astra"}]
+        session._model_picker_waiting = True
+        session._model_picker_snapshot = []
+        session._think_picker_waiting = False
+
+        with patch.object(chatview_mod, "update_agent_model_status"), \
+             patch.object(chatview_mod.sublime, "set_timeout") as set_timeout:
+            session.on_available_models_updated()
+
+        self.assertFalse(session._model_picker_waiting)
+        set_timeout.assert_called_once_with(session._reopen_model_picker, 0)
+
+
 class TestThinkLevelPicker(unittest.TestCase):
     """The palette command must list the selected model's own levels."""
 

@@ -1445,6 +1445,11 @@ class ChatSession:
     """
     Manages the state and UI for a single ChatView session.
     """
+    # The agent thread can still be starting when the picker opens, so a
+    # failed fetch is retried briefly before giving up.
+    MODEL_PICKER_RETRY_INTERVAL_MS = 200
+    MODEL_PICKER_RETRY_ATTEMPTS = 25
+
     def __init__(self, window, view, cwd, add_dirs=None, session_id=None, role=SessionRole.PRIMARY):
         self.window = window
         self.chat_view = view
@@ -1605,6 +1610,37 @@ class ChatSession:
         # The reopened picker shows fresh data; don't kick off another fetch.
         self._model_picker_skip_refresh = True
         self.window.run_command("term_chat_set_model", {"view_id": view.id()})
+
+    def _start_model_wait(self, models=None, attempts=None):
+        """Keep the picker in its loading state until the roster arrives.
+
+        ``request_agent_models`` fails while the agent thread is still
+        starting, so retry briefly instead of leaving an empty panel behind.
+        """
+        if attempts is None:
+            attempts = self.MODEL_PICKER_RETRY_ATTEMPTS
+        self._model_picker_waiting = True
+        self._model_picker_snapshot = sorted(
+            (m.get("value") or "") for m in (models or [])
+        )
+        sublime.set_timeout(
+            lambda: self._retry_model_fetch(attempts),
+            self.MODEL_PICKER_RETRY_INTERVAL_MS,
+        )
+
+    def _retry_model_fetch(self, attempts):
+        """Retry the model fetch until the agent can serve it."""
+        if not self._model_picker_waiting:
+            return
+        if request_agent_models(self):
+            return
+        if attempts <= 0:
+            self._model_picker_waiting = False
+            return
+        sublime.set_timeout(
+            lambda: self._retry_model_fetch(attempts - 1),
+            self.MODEL_PICKER_RETRY_INTERVAL_MS,
+        )
 
     def _reopen_think_picker(self):
         """Reopen the effort picker once model metadata has arrived."""
@@ -3578,12 +3614,44 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
         return chat_threads.get_active_or_primary_session(self.window) is not None
 
 
+def known_models(session):
+    """Return the model roster known to the session or its agent.
+
+    The session list is cleared whenever an agent restarts, while the agent
+    usually still holds the roster it fetched, so the picker can open with
+    real entries instead of an empty panel.
+    """
+    candidates = []
+    session_models = getattr(session, "available_models", None)
+    if isinstance(session_models, list):
+        candidates.extend(session_models)
+    thread = getattr(session, "agent_thread", None)
+    agent = getattr(thread, "agent", None) if thread else None
+    agent_models = getattr(agent, "available_models", None)
+    if isinstance(agent_models, list):
+        candidates.extend(agent_models)
+
+    models = []
+    seen = set()
+    for model in candidates:
+        if not isinstance(model, dict):
+            continue
+        value = model.get("value")
+        if value:
+            if value in seen:
+                continue
+            seen.add(value)
+        models.append(model)
+    return models
+
+
 class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
-    def __init__(self, current_model=None, think_level=None, window=None, view_id=None):
+    def __init__(self, current_model=None, think_level=None, window=None, view_id=None, loading=False):
         self.current_model = current_model
         self.think_level = think_level
         self.window = window or sublime.active_window()
         self.view_id = view_id
+        self.loading = loading
 
     def _session(self):
         window = self.window or sublime.active_window()
@@ -3592,6 +3660,10 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         return chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
 
     def cancel(self):
+        # Closing the loading panel must not cancel the pending reopen; only
+        # an actual dismissal of a populated picker should.
+        if self.loading:
+            return
         # If the picker was opened before the async model fetch finished,
         # stop the pending reopen when the user dismisses it.
         session = self._session()
@@ -3599,6 +3671,10 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
             session._model_picker_waiting = False
 
     def confirm(self, value):
+        # Selecting the loading placeholder must not cancel the pending
+        # reopen either.
+        if self.loading:
+            return
         # Selection made; a background refresh finishing later must not reopen
         # the picker on top of the next input step.
         session = self._session()
@@ -3624,9 +3700,9 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         )
 
         active_model = {}
-        if session and session.available_models:
+        if session:
             active_model = next(
-                (m for m in session.available_models if m.get("value") == model),
+                (m for m in known_models(session) if m.get("value") == model),
                 {},
             )
 
@@ -3657,8 +3733,11 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
             return []
 
         session = chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
-        if not session or not session.available_models:
-            return []
+        models = known_models(session)
+        if not models:
+            # Keep the panel visible while the roster loads; the background
+            # refresh reopens it with the real entries.
+            return [sublime.ListInputItem(text="Loading models…", value="")]
 
         agent_provider = chat_threads.get_setting_for_session(window, session, CHAT_AGENT, "claude")
         think_level = self.think_level or chat_threads.get_setting_for_session(
@@ -3666,7 +3745,7 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         )
 
         items = []
-        for m in session.available_models:
+        for m in models:
             desc = m.get("description") or ""
             annotation = m.get("annotation") or ""
             val = m.get("value") or ""
@@ -3691,7 +3770,9 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
 
     def placeholder(self):
         session = self._session()
-        if session is not None and not session.available_models:
+        if self.loading:
+            return "Loading models…"
+        if session is not None and not known_models(session):
             return "Loading models…"
         return "Select a model"
 
@@ -3730,12 +3811,8 @@ class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
         # effort picker still follows when the list was unavailable.
         active_model = None
         if session:
-            candidates = list(getattr(session, "available_models", None) or [])
-            thread = getattr(session, "agent_thread", None)
-            agent = getattr(thread, "agent", None) if thread else None
-            candidates.extend(getattr(agent, "available_models", None) or [])
             active_model = next(
-                (m for m in candidates if isinstance(m, dict) and m.get("value") == model),
+                (m for m in known_models(session) if m.get("value") == model),
                 None,
             )
 
@@ -3942,20 +4019,28 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
 
         if session:
+            # The session roster is cleared when an agent restarts; the agent
+            # often still has the list, so fall back to its cache.
+            models = known_models(session)
             # Refresh on every invocation so the picker always reflects the
             # latest server roster. The cached list is shown right away while
             # the fetch runs in the background.
             skip_refresh = session._model_picker_skip_refresh
             session._model_picker_skip_refresh = False
-            if not skip_refresh and self._request_models(session):
-                session._model_picker_waiting = True
-                session._model_picker_snapshot = sorted(
-                    m.get("value") or "" for m in session.available_models
-                )
-                if not session.available_models:
+            if not skip_refresh:
+                if self._request_models(session):
+                    session._model_picker_waiting = True
+                    session._model_picker_snapshot = sorted(
+                        m.get("value") or "" for m in models
+                    )
+                else:
+                    # The agent thread may still be starting; keep the panel
+                    # in its loading state and retry shortly.
+                    session._start_model_wait(models)
+                if not models:
                     sublime.status_message(f"{PACKAGE_NAME}: loading models…")
 
-            if session.available_models:
+            if models:
                 # Get current model to highlight it
                 agent_provider = chat_threads.get_setting_for_session(
                     self.window, session, CHAT_AGENT, "claude"
@@ -3974,8 +4059,13 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
                     view_id=view_id,
                 )
 
-            if session._model_picker_waiting:
-                return TermChatSetModelListHandler(window=self.window, view_id=view_id)
+            # No roster yet: show a loading picker that the pending refresh
+            # replaces once models_update lands.
+            return TermChatSetModelListHandler(
+                window=self.window,
+                view_id=view_id,
+                loading=True,
+            )
 
         # Fallback to TextInputHandler for manual input
         current_model = None
@@ -4119,13 +4209,8 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
 
         # Prefer the UI list, but fall back to the agent's own cache: restored
         # sessions can render the effort tag before models_update arrives.
-        models = list(getattr(session, "available_models", None) or [])
-        thread = getattr(session, "agent_thread", None)
-        agent = getattr(thread, "agent", None) if thread else None
-        models.extend(getattr(agent, "available_models", None) or [])
-
-        for m in models:
-            if isinstance(m, dict) and m.get("value") == current_model_val:
+        for m in known_models(session):
+            if m.get("value") == current_model_val:
                 return m
         return {}
 
