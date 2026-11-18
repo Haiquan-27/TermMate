@@ -1833,7 +1833,7 @@ class ChatSession:
         if self.agent_thread:
             self.agent_thread.stop()
 
-    def show_implement_plan_button(self, plan_text="", tool_name="CodexImplementPlan", plan_path=None, summary=""):
+    def show_implement_plan_button(self, plan_text="", tool_name="ImplementPlan", plan_path=None, summary=""):
         """Show a phantom button to trigger plan implementation via PermissionPanel."""
         request_id = f"codex_plan_{id(self)}"
         input_data = {"plan": plan_text}
