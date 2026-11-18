@@ -150,7 +150,7 @@ class TestChatViewSettings(unittest.TestCase):
 
 
 class TestModelPanelThinkTag(unittest.TestCase):
-    """The effort tag rides next to the model button and opens its picker."""
+    """The effort level rides inside the model button."""
 
     def setUp(self):
         chat_threads.clear()
@@ -193,22 +193,23 @@ class TestModelPanelThinkTag(unittest.TestCase):
 
         return phantom_cls.call_args.args[1]
 
-    def test_think_tag_sits_after_model_and_opens_picker(self):
+    def test_think_level_sits_inside_model_button(self):
         panel_html = self._render("high")
 
-        self.assertIn('href="set_think"', panel_html)
-        self.assertIn("Think:", panel_html)
-        self.assertIn(">high<", panel_html)
         model_pos = panel_html.index('href="set_model"')
-        think_pos = panel_html.index('href="set_think"')
-        plan_pos = panel_html.index('href="toggle_plan"')
-        self.assertLess(model_pos, think_pos)
-        self.assertLess(think_pos, plan_pos)
+        model_close = panel_html.index("</a>", model_pos)
+        think_pos = panel_html.index("high", model_pos)
+        self.assertLess(think_pos, model_close)
+        self.assertIn("·", panel_html[model_pos:model_close])
+        self.assertIn('class="think-value"', panel_html)
+        self.assertNotIn('href="set_think"', panel_html)
 
-    def test_no_think_tag_without_level(self):
+    def test_no_think_value_without_level(self):
         panel_html = self._render(None)
 
-        self.assertNotIn('href="set_think"', panel_html)
+        row = panel_html.split('<div class="model-row">')[1]
+        self.assertNotIn("think-value", row)
+        self.assertNotIn("·", row)
 
     def test_think_level_is_escaped(self):
         panel_html = self._render("<high>")
@@ -217,8 +218,152 @@ class TestModelPanelThinkTag(unittest.TestCase):
         self.assertNotIn("<high>", panel_html)
 
 
+class _FakeListInputItem:
+    def __init__(self, text=None, value=None, details=None, annotation=None):
+        self.text = text
+        self.value = value
+        self.details = details
+        self.annotation = annotation
+
+
+class TestModelPickerThinkEntries(unittest.TestCase):
+    """The model picker lists the current model's levels above the roster."""
+
+    def setUp(self):
+        chat_threads.clear()
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _handler(self, think_level="high"):
+        window = MagicMock()
+        session = MagicMock()
+        session.available_models = [
+            {
+                "value": "opencode/gpt-6.2-astra",
+                "displayName": "gpt-6.2-astra",
+                "supportedReasoningEfforts": ["auto", "low", "high"],
+            },
+            {"value": "opencode/other", "displayName": "other"},
+        ]
+        handler = chatview_mod.TermChatSetModelListHandler(
+            current_model="opencode/gpt-6.2-astra",
+            think_level=think_level,
+            window=window,
+            view_id=5,
+        )
+
+        def fake_setting(_window, _session, key, default=None):
+            return "opencode" if key == chatview_mod.CHAT_AGENT else default
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=fake_setting,
+        ), patch.object(
+            chatview_mod.sublime, "ListInputItem", _FakeListInputItem
+        ):
+            return handler, handler.list_items()
+
+    def test_levels_come_before_the_models(self):
+        handler, items = self._handler()
+
+        values = [item.value for item in items]
+        self.assertEqual(
+            values[:3],
+            [
+                f"{chatview_mod.THINK_VALUE_PREFIX}auto",
+                f"{chatview_mod.THINK_VALUE_PREFIX}low",
+                f"{chatview_mod.THINK_VALUE_PREFIX}high",
+            ],
+        )
+        self.assertEqual(values[3:], ["opencode/gpt-6.2-astra", "opencode/other"])
+        current = next(i for i in items if i.value.endswith("high"))
+        self.assertEqual(current.annotation, "current")
+
+    def test_level_entries_do_not_chain_another_input(self):
+        handler, _ = self._handler()
+
+        self.assertIsNone(
+            handler.next_input({"model": f"{chatview_mod.THINK_VALUE_PREFIX}high"})
+        )
+
+    def test_no_levels_without_presets(self):
+        window = MagicMock()
+        session = MagicMock()
+        session.available_models = [
+            {"value": "opencode/plain", "displayName": "plain"},
+        ]
+        handler = chatview_mod.TermChatSetModelListHandler(
+            current_model="opencode/plain", window=window, view_id=5
+        )
+
+        def fake_setting(_window, _session, key, default=None):
+            return "opencode" if key == chatview_mod.CHAT_AGENT else default
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=fake_setting,
+        ), patch.object(
+            chatview_mod.sublime, "ListInputItem", _FakeListInputItem
+        ):
+            items = handler.list_items()
+
+        self.assertEqual([i.value for i in items], ["opencode/plain"])
+
+    def test_choosing_a_level_keeps_the_current_model(self):
+        window = MagicMock()
+        command = chatview_mod.TermChatSetModelCommand(window)
+        command.window = window
+        session = MagicMock()
+        session.available_models = []
+        values = {
+            chatview_mod.CHAT_AGENT: "opencode",
+            "chatview_model_opencode": "opencode/gpt-6.2-astra",
+            "chatview_think_level_opencode": "low",
+        }
+        stored = {}
+
+        def fake_set(_window, _session, key, value):
+            stored[key] = value
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=lambda w, s, k, d=None: values.get(k, d),
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "set_setting_for_session",
+            side_effect=fake_set,
+        ), patch.object(
+            chatview_mod, "update_agent_model_status"
+        ), patch.object(
+            chatview_mod.sublime, "status_message"
+        ):
+            command.run(f"{chatview_mod.THINK_VALUE_PREFIX}high", view_id=5)
+
+        self.assertEqual(stored["chatview_model_opencode"], "opencode/gpt-6.2-astra")
+        self.assertEqual(stored["chatview_think_level_opencode"], "high")
+        session.agent_thread.update_config.assert_called_once_with(
+            model="opencode/gpt-6.2-astra", think_level="high"
+        )
+
+
 class TestThinkLevelPicker(unittest.TestCase):
-    """Clicking the effort tag must list that model's own levels."""
+    """The palette command must list the selected model's own levels."""
 
     def setUp(self):
         chat_threads.clear()
