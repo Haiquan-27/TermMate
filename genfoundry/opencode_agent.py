@@ -2000,11 +2000,21 @@ class OpenCodeAgent(BaseAgent):
                     if not provider_id or not model_id:
                         continue
                     name = item.get("name") or model_id
-                    models.append({
+                    entry: Dict[str, Any] = {
                         "displayName": name,
                         "description": provider_id,
                         "value": f"{provider_id}/{model_id}",
-                    })
+                    }
+                    # [OpenCode v2] Reasoning levels are exposed as model
+                    # variants; forward them so the picker can offer efforts.
+                    variant_ids = self._variant_ids(item.get("variants"))
+                    if variant_ids:
+                        entry["supportedReasoningEfforts"] = (
+                            variant_ids
+                            if "auto" in variant_ids
+                            else ["auto", *variant_ids]
+                        )
+                    models.append(entry)
                 if models:
                     self.available_models = models
                     await self._message_queue.put(Message(
@@ -2057,6 +2067,50 @@ class OpenCodeAgent(BaseAgent):
     def set_model(self, model: str) -> None:
         self.options.model = model
 
+    def set_think_level(self, level: Optional[str]) -> None:
+        """Switch the reasoning effort applied on the next turn.
+
+        OpenCode v2 receives the level as the model ``variant``.  The v1 HTTP
+        API has no variant/effort field, so the value is kept but not sent.
+        """
+        self.options.think_level = level
+        LOG.info("OpenCode reasoning effort switched to: %s", level)
+
+    @staticmethod
+    def _variant_ids(variants: Any) -> List[str]:
+        """Return the unique variant ids declared by a model's metadata."""
+        ids: List[str] = []
+        if not isinstance(variants, list):
+            return ids
+        for variant in variants:
+            variant_id = variant.get("id") if isinstance(variant, dict) else variant
+            if isinstance(variant_id, str) and variant_id and variant_id not in ids:
+                ids.append(variant_id)
+        return ids
+
+    def _active_variant(self) -> Optional[str]:
+        """Return the reasoning variant to send for the current turn, if any."""
+        if self.version < 2:
+            # [OpenCode v1] Unknown variant names are rejected by the server,
+            # and v1 has no way to discover them, so effort is a no-op there.
+            return None
+        level = (getattr(self.options, "think_level", None) or "").strip()
+        if not level or level.lower() in ("auto", "default"):
+            return None
+        for model in self.available_models:
+            if model.get("value") != self.options.model:
+                continue
+            efforts = model.get("supportedReasoningEfforts") or []
+            if efforts and level not in efforts:
+                LOG.warning(
+                    "Ignoring unsupported OpenCode reasoning variant %r for %s",
+                    level,
+                    self.options.model,
+                )
+                return None
+            break
+        return level
+
     async def set_plan_mode(self, plan_mode: bool) -> None:
         self.plan_mode = plan_mode
         if not plan_mode:
@@ -2078,7 +2132,11 @@ class OpenCodeAgent(BaseAgent):
         provider_id, model_id = model.split("/", 1)
         if not provider_id or not model_id:
             return None
-        return {"providerID": provider_id, "id": model_id}
+        ref = {"providerID": provider_id, "id": model_id}
+        variant = self._active_variant()
+        if variant:
+            ref["variant"] = variant
+        return ref
 
     def _session_permissions_v2(self) -> List[Dict[str, str]]:
         rules: List[Dict[str, str]] = []
@@ -2180,6 +2238,7 @@ class OpenCodeAgent(BaseAgent):
                 )
             else:
                 # [OpenCode v1] Single prompt_async request with text parts, model, and tools
+                # v1 has no variant field, so the reasoning effort is not sent.
                 body: Dict[str, Any] = {
                     "agent": agent_name,
                     "parts": [{"type": "text", "text": content}],
