@@ -1473,6 +1473,7 @@ class ChatSession:
         self.history_stash = ""
         self.permission_requests = {} # Map of request_id -> (tool_name, input_data)
         self.available_models = []  # Will be populated from control_response
+        self._model_picker_waiting = False  # True while an on-demand model fetch is pending
         self.prompt_regions = [] # List of (Region, uuid, phantom_index) for submitted prompts
         self.prompt_button_phantoms = [] # List of PhantomSet, parallel to prompt_regions
         self.session_allow_all = False
@@ -1564,6 +1565,18 @@ class ChatSession:
     def on_available_models_updated(self):
         """Called when available models are loaded or updated from the agent."""
         update_agent_model_status(self.window)
+        if self._model_picker_waiting:
+            self._model_picker_waiting = False
+            sublime.set_timeout(self._reopen_model_picker, 0)
+
+    def _reopen_model_picker(self):
+        """Reopen the model picker after an on-demand fetch completes."""
+        view = self.chat_view
+        if not (view and view.is_valid()):
+            return
+        if not (self.window and self.window.is_valid()):
+            return
+        self.window.run_command("term_chat_set_model", {"view_id": view.id()})
 
     def _reset_markdown_formatter(self):
         self.markdown_formatter = MarkdownFormatter(
@@ -3532,6 +3545,19 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         self.window = window or sublime.active_window()
         self.view_id = view_id
 
+    def _session(self):
+        window = self.window or sublime.active_window()
+        if not window:
+            return None
+        return chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
+
+    def cancel(self):
+        # If the picker was opened before the async model fetch finished,
+        # stop the pending reopen when the user dismisses it.
+        session = self._session()
+        if session:
+            session._model_picker_waiting = False
+
     def name(self):
         return "model"
 
@@ -3617,6 +3643,9 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         return items
 
     def placeholder(self):
+        session = self._session()
+        if session is not None and not session.available_models:
+            return "Loading models…"
         return "Select a model"
 
     def description(self, value, text):
@@ -3845,8 +3874,34 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
                 view_id=view_id,
             )
 
+        if session and self._request_models(session):
+            # The agent fetches models asynchronously on connect; if the picker
+            # was opened before that finished, fetch now and reopen the picker
+            # once the models_update message has been processed.
+            session._model_picker_waiting = True
+            sublime.status_message(f"{PACKAGE_NAME}: loading models…")
+            return TermChatSetModelListHandler(window=self.window, view_id=view_id)
+
         # Fallback to TextInputHandler for manual input
         return TermChatSetModelTextHandler(window=self.window, view_id=view_id)
+
+    def _request_models(self, session):
+        """Ask the session's agent to refresh its model list.
+
+        Returns True if a fetch was scheduled, False when the agent has no
+        on-demand fetch (e.g. Claude delivers models via control_response).
+        """
+        thread = getattr(session, "agent_thread", None)
+        agent = getattr(thread, "agent", None) if thread else None
+        loop = getattr(thread, "loop", None)
+        fetch = getattr(agent, "_fetch_models", None)
+        if not (fetch and loop) or loop.is_closed():
+            return False
+        try:
+            asyncio.run_coroutine_threadsafe(fetch(), loop)
+        except RuntimeError:
+            return False
+        return True
 
 
 class TermChatSetThinkLevelListHandler(sublime_plugin.ListInputHandler):

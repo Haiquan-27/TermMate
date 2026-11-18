@@ -2010,6 +2010,11 @@ class OpenCodeAgent(BaseAgent):
                     await self._message_queue.put(Message(
                         "models_update", content={"models": models}
                     ))
+                else:
+                    LOG.warning(
+                        "OpenCode /api/model returned no usable models (%d raw entries)",
+                        len(items),
+                    )
                 return
 
             result = self._unwrap(await self._http("GET", "/provider"))
