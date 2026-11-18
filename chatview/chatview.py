@@ -1498,6 +1498,8 @@ class ChatSession:
         self._model_picker_waiting = False  # True while a model refresh is pending
         self._model_picker_snapshot = None  # Model values before the pending refresh
         self._model_picker_skip_refresh = False  # Suppress refresh for auto-reopened pickers
+        self._think_picker_waiting = False  # True while models are fetched for the effort picker
+        self._think_picker_skip_refresh = False  # Suppress refetch for auto-reopened pickers
         self.prompt_regions = [] # List of (Region, uuid, phantom_index) for submitted prompts
         self.prompt_button_phantoms = [] # List of PhantomSet, parallel to prompt_regions
         self.session_allow_all = False
@@ -1596,6 +1598,10 @@ class ChatSession:
             # the user was already looking at.
             if values and values != self._model_picker_snapshot:
                 sublime.set_timeout(self._reopen_model_picker, 0)
+        if self._think_picker_waiting:
+            self._think_picker_waiting = False
+            if self.available_models:
+                sublime.set_timeout(self._reopen_think_picker, 0)
 
     def _reopen_model_picker(self):
         """Reopen the model picker after a background refresh changed the list."""
@@ -1609,6 +1615,18 @@ class ChatSession:
         # The reopened picker shows fresh data; don't kick off another fetch.
         self._model_picker_skip_refresh = True
         self.window.run_command("term_chat_set_model", {"view_id": view.id()})
+
+    def _reopen_think_picker(self):
+        """Reopen the effort picker once model metadata has arrived."""
+        if not self.available_models:
+            return
+        view = self.chat_view
+        if not (view and view.is_valid()):
+            return
+        if not (self.window and self.window.is_valid()):
+            return
+        self._think_picker_skip_refresh = True
+        self.window.run_command("term_chat_set_think_level", {"view_id": view.id()})
 
     def _reset_markdown_formatter(self):
         self.markdown_formatter = MarkdownFormatter(
@@ -3826,6 +3844,25 @@ class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
         return TermChatAgentProviderInputHandler(current_agent, available_agents)
 
 
+def request_agent_models(session):
+    """Ask the session's agent to refresh its model list.
+
+    Returns True if a fetch was scheduled, False when the agent has no
+    on-demand fetch (e.g. Claude delivers models via control_response).
+    """
+    thread = getattr(session, "agent_thread", None)
+    agent = getattr(thread, "agent", None) if thread else None
+    loop = getattr(thread, "loop", None)
+    fetch = getattr(agent, "_fetch_models", None)
+    if not (fetch and loop) or loop.is_closed():
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(fetch(), loop)
+    except RuntimeError:
+        return False
+    return True
+
+
 class TermChatSetModelCommand(sublime_plugin.WindowCommand):
     """
     Sets the model for the target ChatView session (or window default).
@@ -3935,22 +3972,8 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         return TermChatSetModelTextHandler(window=self.window, view_id=view_id)
 
     def _request_models(self, session):
-        """Ask the session's agent to refresh its model list.
-
-        Returns True if a fetch was scheduled, False when the agent has no
-        on-demand fetch (e.g. Claude delivers models via control_response).
-        """
-        thread = getattr(session, "agent_thread", None)
-        agent = getattr(thread, "agent", None) if thread else None
-        loop = getattr(thread, "loop", None)
-        fetch = getattr(agent, "_fetch_models", None)
-        if not (fetch and loop) or loop.is_closed():
-            return False
-        try:
-            asyncio.run_coroutine_threadsafe(fetch(), loop)
-        except RuntimeError:
-            return False
-        return True
+        """Ask the session's agent to refresh its model list."""
+        return request_agent_models(session)
 
 
 class TermChatSetThinkLevelListHandler(sublime_plugin.ListInputHandler):
@@ -3974,10 +3997,24 @@ class TermChatSetThinkLevelListHandler(sublime_plugin.ListInputHandler):
     def name(self):
         return "level"
 
+    def _session(self):
+        window = self.window or sublime.active_window()
+        if not window:
+            return None
+        return chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
+
     def confirm(self, value):
         self.confirmed = True
+        session = self._session()
+        if session:
+            session._think_picker_waiting = False
 
     def cancel(self):
+        session = self._session()
+        if session:
+            # Dismissing the picker must not let a pending reopen interrupt
+            # whatever the user does next.
+            session._think_picker_waiting = False
         if not self.confirmed and self.selected_model and self.window:
             self.window.run_command(
                 "term_chat_set_model",
@@ -4051,14 +4088,24 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
     Sets the thinking / reasoning effort level for the target ChatView session.
     """
     def _get_active_model(self, session, agent_provider):
-        if session:
-            current_model_val = chat_threads.get_setting_for_session(
-                self.window, session, f"chatview_model_{agent_provider}"
-            )
-            if session.available_models and current_model_val:
-                for m in session.available_models:
-                    if m.get("value") == current_model_val:
-                        return m
+        if not session:
+            return {}
+        current_model_val = chat_threads.get_setting_for_session(
+            self.window, session, f"chatview_model_{agent_provider}"
+        )
+        if not current_model_val:
+            return {}
+
+        # Prefer the UI list, but fall back to the agent's own cache: restored
+        # sessions can render the effort tag before models_update arrives.
+        models = list(getattr(session, "available_models", None) or [])
+        thread = getattr(session, "agent_thread", None)
+        agent = getattr(thread, "agent", None) if thread else None
+        models.extend(getattr(agent, "available_models", None) or [])
+
+        for m in models:
+            if isinstance(m, dict) and m.get("value") == current_model_val:
+                return m
         return {}
 
     def run(self, level=None, view_id=None):
@@ -4099,6 +4146,18 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
         current_level = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_think_level_{agent_provider}"
         )
+
+        # The model is unknown to the session (restored view, or the roster was
+        # never loaded in this process). Fetch it and reopen this picker once
+        # the metadata arrives instead of dropping to free-text input.
+        if not presets and not active_model and session is not None:
+            skip_refresh = getattr(session, "_think_picker_skip_refresh", False)
+            session._think_picker_skip_refresh = False
+            if not skip_refresh and request_agent_models(session):
+                session._think_picker_waiting = True
+                sublime.status_message(f"{PACKAGE_NAME}: loading reasoning levels…")
+                return None
+
         if presets:
             return TermChatSetThinkLevelListHandler(
                 current_level,

@@ -217,5 +217,107 @@ class TestModelPanelThinkTag(unittest.TestCase):
         self.assertNotIn("<high>", panel_html)
 
 
+class TestThinkLevelPicker(unittest.TestCase):
+    """Clicking the effort tag must list that model's own levels."""
+
+    def setUp(self):
+        chat_threads.clear()
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _command(self):
+        window = MagicMock()
+        command = chatview_mod.TermChatSetThinkLevelCommand(window)
+        command.window = window
+        return command, window
+
+    def _settings(self, values):
+        def fake_setting(_window, _session, key, default=None):
+            return values.get(key, default)
+        return fake_setting
+
+    def test_uses_agent_cached_models_when_session_list_is_empty(self):
+        command, _ = self._command()
+        entry = {
+            "value": "opencode/gpt-6.2-astra",
+            "supportedReasoningEfforts": ["auto", "low", "high"],
+        }
+        session = MagicMock()
+        session.available_models = []
+        session.agent_thread.agent.available_models = [entry]
+        session._think_picker_skip_refresh = False
+        values = {
+            chatview_mod.CHAT_AGENT: "opencode",
+            "chatview_model_opencode": "opencode/gpt-6.2-astra",
+            "chatview_think_level_opencode": "high",
+        }
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=self._settings(values),
+        ), patch.object(chatview_mod, "request_agent_models") as request:
+            handler = command.input({"view_id": 5})
+
+        request.assert_not_called()
+        self.assertIsInstance(handler, chatview_mod.TermChatSetThinkLevelListHandler)
+        self.assertEqual(handler.active_model["value"], "opencode/gpt-6.2-astra")
+        self.assertEqual(handler.current_level, "high")
+
+    def test_fetches_and_reopens_when_model_is_unknown(self):
+        command, _ = self._command()
+        session = MagicMock()
+        session.available_models = []
+        session.agent_thread.agent.available_models = []
+        session._think_picker_skip_refresh = False
+        values = {
+            chatview_mod.CHAT_AGENT: "opencode",
+            "chatview_model_opencode": "opencode/gpt-6.2-astra",
+            "chatview_think_level_opencode": "high",
+        }
+
+        with patch.object(
+            chatview_mod.chat_threads,
+            "get_active_or_primary_session",
+            return_value=session,
+        ), patch.object(
+            chatview_mod.chat_threads,
+            "get_setting_for_session",
+            side_effect=self._settings(values),
+        ), patch.object(
+            chatview_mod, "request_agent_models", return_value=True
+        ) as request, patch.object(chatview_mod.sublime, "status_message"):
+            handler = command.input({"view_id": 5})
+
+        request.assert_called_once_with(session)
+        self.assertIsNone(handler)
+        self.assertTrue(session._think_picker_waiting)
+
+    def test_request_agent_models_skips_when_fetch_unavailable(self):
+        session = MagicMock()
+        session.agent_thread = None
+        self.assertFalse(chatview_mod.request_agent_models(session))
+
+        session.agent_thread = MagicMock()
+        session.agent_thread.agent = MagicMock(spec=[])
+        self.assertFalse(chatview_mod.request_agent_models(session))
+
+    def test_request_agent_models_schedules_fetch(self):
+        session = MagicMock()
+        session.agent_thread.loop.is_closed.return_value = False
+
+        with patch.object(
+            chatview_mod.asyncio, "run_coroutine_threadsafe"
+        ) as run:
+            self.assertTrue(chatview_mod.request_agent_models(session))
+
+        run.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
