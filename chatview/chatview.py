@@ -1571,6 +1571,8 @@ class ChatSession:
 
     def _reopen_model_picker(self):
         """Reopen the model picker after an on-demand fetch completes."""
+        if not self.available_models:
+            return
         view = self.chat_view
         if not (view and view.is_valid()):
             return
