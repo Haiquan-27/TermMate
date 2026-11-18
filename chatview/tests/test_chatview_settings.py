@@ -226,8 +226,8 @@ class _FakeListInputItem:
         self.annotation = annotation
 
 
-class TestModelPickerThinkEntries(unittest.TestCase):
-    """The model picker lists the current model's levels above the roster."""
+class TestModelPickerThinkChain(unittest.TestCase):
+    """Picking a model must chain into that model's effort levels."""
 
     def setUp(self):
         chat_threads.clear()
@@ -235,7 +235,7 @@ class TestModelPickerThinkEntries(unittest.TestCase):
     def tearDown(self):
         chat_threads.clear()
 
-    def _handler(self, think_level="high"):
+    def _handler(self, current_model="opencode/gpt-6.2-astra"):
         window = MagicMock()
         session = MagicMock()
         session.available_models = [
@@ -244,122 +244,76 @@ class TestModelPickerThinkEntries(unittest.TestCase):
                 "displayName": "gpt-6.2-astra",
                 "supportedReasoningEfforts": ["auto", "low", "high"],
             },
-            {"value": "opencode/other", "displayName": "other"},
+            {"value": "opencode/plain", "displayName": "plain"},
         ]
         handler = chatview_mod.TermChatSetModelListHandler(
-            current_model="opencode/gpt-6.2-astra",
-            think_level=think_level,
+            current_model=current_model,
+            think_level="high",
             window=window,
             view_id=5,
         )
 
         def fake_setting(_window, _session, key, default=None):
-            return "opencode" if key == chatview_mod.CHAT_AGENT else default
+            if key == chatview_mod.CHAT_AGENT:
+                return "opencode"
+            if key == "chatview_think_level_opencode":
+                return "high"
+            return default
 
-        with patch.object(
+        patcher = patch.object(
             chatview_mod.chat_threads,
             "get_active_or_primary_session",
             return_value=session,
-        ), patch.object(
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(
             chatview_mod.chat_threads,
             "get_setting_for_session",
             side_effect=fake_setting,
-        ), patch.object(
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(
             chatview_mod.sublime, "ListInputItem", _FakeListInputItem
-        ):
-            return handler, handler.list_items()
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return handler
 
-    def test_levels_come_before_the_models(self):
-        handler, items = self._handler()
+    def test_list_holds_only_models_with_the_current_one_first(self):
+        handler = self._handler()
 
-        values = [item.value for item in items]
+        items = handler.list_items()
+
         self.assertEqual(
-            values[:3],
-            [
-                f"{chatview_mod.THINK_VALUE_PREFIX}auto",
-                f"{chatview_mod.THINK_VALUE_PREFIX}low",
-                f"{chatview_mod.THINK_VALUE_PREFIX}high",
-            ],
-        )
-        self.assertEqual(values[3:], ["opencode/gpt-6.2-astra", "opencode/other"])
-        current = next(i for i in items if i.value.endswith("high"))
-        self.assertEqual(current.annotation, "current")
-
-    def test_level_entries_do_not_chain_another_input(self):
-        handler, _ = self._handler()
-
-        self.assertIsNone(
-            handler.next_input({"model": f"{chatview_mod.THINK_VALUE_PREFIX}high"})
+            [i.value for i in items],
+            ["opencode/gpt-6.2-astra", "opencode/plain"],
         )
 
-    def test_no_levels_without_presets(self):
-        window = MagicMock()
-        session = MagicMock()
-        session.available_models = [
-            {"value": "opencode/plain", "displayName": "plain"},
-        ]
-        handler = chatview_mod.TermChatSetModelListHandler(
-            current_model="opencode/plain", window=window, view_id=5
-        )
+    def test_picking_the_current_model_chains_to_its_levels(self):
+        handler = self._handler()
 
-        def fake_setting(_window, _session, key, default=None):
-            return "opencode" if key == chatview_mod.CHAT_AGENT else default
+        chained = handler.next_input({"model": "opencode/gpt-6.2-astra"})
 
-        with patch.object(
-            chatview_mod.chat_threads,
-            "get_active_or_primary_session",
-            return_value=session,
-        ), patch.object(
-            chatview_mod.chat_threads,
-            "get_setting_for_session",
-            side_effect=fake_setting,
-        ), patch.object(
-            chatview_mod.sublime, "ListInputItem", _FakeListInputItem
-        ):
-            items = handler.list_items()
+        self.assertIsInstance(chained, chatview_mod.TermChatSetThinkLevelListHandler)
+        self.assertEqual(chained.active_model["value"], "opencode/gpt-6.2-astra")
+        self.assertEqual(chained.current_level, "high")
+        self.assertEqual(chained.selected_model, "opencode/gpt-6.2-astra")
 
-        self.assertEqual([i.value for i in items], ["opencode/plain"])
+    def test_model_without_levels_finishes_the_flow(self):
+        handler = self._handler()
 
-    def test_choosing_a_level_keeps_the_current_model(self):
-        window = MagicMock()
-        command = chatview_mod.TermChatSetModelCommand(window)
-        command.window = window
-        session = MagicMock()
-        session.available_models = []
-        values = {
-            chatview_mod.CHAT_AGENT: "opencode",
-            "chatview_model_opencode": "opencode/gpt-6.2-astra",
-            "chatview_think_level_opencode": "low",
-        }
-        stored = {}
+        self.assertIsNone(handler.next_input({"model": "opencode/plain"}))
 
-        def fake_set(_window, _session, key, value):
-            stored[key] = value
+    def test_chained_levels_come_from_the_picked_model(self):
+        handler = self._handler()
 
-        with patch.object(
-            chatview_mod.chat_threads,
-            "get_active_or_primary_session",
-            return_value=session,
-        ), patch.object(
-            chatview_mod.chat_threads,
-            "get_setting_for_session",
-            side_effect=lambda w, s, k, d=None: values.get(k, d),
-        ), patch.object(
-            chatview_mod.chat_threads,
-            "set_setting_for_session",
-            side_effect=fake_set,
-        ), patch.object(
-            chatview_mod, "update_agent_model_status"
-        ), patch.object(
-            chatview_mod.sublime, "status_message"
-        ):
-            command.run(f"{chatview_mod.THINK_VALUE_PREFIX}high", view_id=5)
+        chained = handler.next_input({"model": "opencode/gpt-6.2-astra"})
+        values = [item.value for item in chained.list_items()]
 
-        self.assertEqual(stored["chatview_model_opencode"], "opencode/gpt-6.2-astra")
-        self.assertEqual(stored["chatview_think_level_opencode"], "high")
-        session.agent_thread.update_config.assert_called_once_with(
-            model="opencode/gpt-6.2-astra", think_level="high"
-        )
+        self.assertEqual(values[0], "high")  # current level moves to the front
+        self.assertEqual(set(values), {"auto", "low", "high"})
 
 
 class TestThinkLevelPicker(unittest.TestCase):

@@ -146,9 +146,6 @@ def format_model_display_name(agent_provider, model, max_length=20):
     return display_model
 
 
-THINK_VALUE_PREFIX = "think::"
-
-
 def format_model_tag_html(display_model, think_level=None):
     """Return the model button, with the effort level in its tail.
 
@@ -3616,10 +3613,6 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         if not model:
             return None
 
-        # Effort entries apply to the current model and finish the flow.
-        if model.startswith(THINK_VALUE_PREFIX):
-            return None
-
         window = self.window or sublime.active_window()
         session = (
             chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
@@ -3694,27 +3687,6 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
                     items.insert(0, items.pop(i))
                     break
 
-        # Offer the current model's effort levels above the roster so a level
-        # can be replaced with one click, without re-picking the model.
-        current = next(
-            (m for m in session.available_models if m.get("value") == self.current_model),
-            None,
-        )
-        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
-            current
-        )
-        if presets:
-            think_items = [
-                sublime.ListInputItem(
-                    text=f"Think: {p['value']}",
-                    value=f"{THINK_VALUE_PREFIX}{p['value']}",
-                    details=html.escape(p.get("description") or ""),
-                    annotation="current" if p["value"] == think_level else "",
-                )
-                for p in presets
-            ]
-            items = think_items + items
-
         return items
 
     def placeholder(self):
@@ -3724,18 +3696,20 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
         return "Select a model"
 
     def description(self, value, text):
-        if value and value.startswith(THINK_VALUE_PREFIX):
-            return f"Reasoning Effort: {value[len(THINK_VALUE_PREFIX):]}"
         return f"Model: {value}"
 
 
 class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
-    def __init__(self, window=None, view_id=None):
+    def __init__(self, window=None, view_id=None, current_model=None):
         self.window = window or sublime.active_window()
         self.view_id = view_id
+        self.current_model = current_model
 
     def name(self):
         return "model"
+
+    def initial_text(self):
+        return self.current_model or ""
 
     def next_input(self, args):
         model = args.get("model")
@@ -3752,7 +3726,22 @@ class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
             if window else "claude"
         )
 
-        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(None)
+        # Resolve the typed name against whatever roster is known so the
+        # effort picker still follows when the list was unavailable.
+        active_model = None
+        if session:
+            candidates = list(getattr(session, "available_models", None) or [])
+            thread = getattr(session, "agent_thread", None)
+            agent = getattr(thread, "agent", None) if thread else None
+            candidates.extend(getattr(agent, "available_models", None) or [])
+            active_model = next(
+                (m for m in candidates if isinstance(m, dict) and m.get("value") == model),
+                None,
+            )
+
+        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
+            active_model
+        )
         if presets:
             current_level = (
                 chat_threads.get_setting_for_session(
@@ -3763,7 +3752,7 @@ class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
             return TermChatSetThinkLevelListHandler(
                 current_level=current_level,
                 agent_provider=agent_provider,
-                active_model=None,
+                active_model=active_model,
                 selected_model=model,
                 window=window,
                 view_id=self.view_id,
@@ -3891,6 +3880,7 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         if not model:
             return
         model = model.strip()
+        level = level.strip() if level else None
 
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         agent_provider = chat_threads.get_setting_for_session(
@@ -3902,17 +3892,6 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         curr_level = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_think_level_{agent_provider}"
         )
-
-        # Effort entries in the model picker only change the level: the model
-        # selected in the session stays untouched.
-        think_only = model.startswith(THINK_VALUE_PREFIX)
-        if think_only:
-            level = model[len(THINK_VALUE_PREFIX):]
-            model = curr_model
-            if not model:
-                return
-
-        level = level.strip() if level else None
 
         models = getattr(session, "available_models", None) or [] if session else []
         active_model = next((m for m in models if m.get("value") == model), None)
@@ -3942,10 +3921,7 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
             )
             config_updates["think_level"] = next_level
 
-        if think_only:
-            term = "thinking level" if agent_provider == "claude" else "reasoning effort"
-            sublime.status_message(f"{PACKAGE_NAME} {term} set to: {level}")
-        elif level:
+        if level:
             term = "thinking" if agent_provider == "claude" else "reasoning"
             sublime.status_message(f"{PACKAGE_NAME} model set to: {model} ({term}: {level})")
         else:
@@ -4002,7 +3978,19 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
                 return TermChatSetModelListHandler(window=self.window, view_id=view_id)
 
         # Fallback to TextInputHandler for manual input
-        return TermChatSetModelTextHandler(window=self.window, view_id=view_id)
+        current_model = None
+        if session:
+            agent_provider = chat_threads.get_setting_for_session(
+                self.window, session, CHAT_AGENT, "claude"
+            )
+            current_model = chat_threads.get_setting_for_session(
+                self.window, session, f"chatview_model_{agent_provider}"
+            )
+        return TermChatSetModelTextHandler(
+            window=self.window,
+            view_id=view_id,
+            current_model=current_model,
+        )
 
     def _request_models(self, session):
         """Ask the session's agent to refresh its model list."""
