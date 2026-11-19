@@ -1412,31 +1412,43 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                     )
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
-    def _handle_shell_finished(self, message):
-        """Render an OpenCode background shell completion notice."""
-        content = message.content if isinstance(message.content, dict) else {}
-        command = str(content.get("command") or "").strip()
+    def apply_shell_finished(self, command, failed=False, output="",
+                             tool_key=None, exit_code=None):
+        """Finish the row of a background shell and return its notice line.
+
+        The tool result is stored before the shell actually exits, so the
+        completion event carries the real output.  Updating the existing row
+        (instead of appending a new one) keeps ``running in background`` from
+        becoming a permanent second row.
+        """
+        command = str(command or "").strip()
         if not command:
-            return
-        failed = bool(content.get("failed"))
-        output = content.get("output")
-        output_text = output if isinstance(output, str) else ""
-        tool_key = content.get("tool_key")
+            return ""
         if tool_key and self.has_tool_call(tool_key):
-            # Finish the row that was left in the background state.  The
-            # shell notice carries the output because the tool result was
-            # stored before the shell actually finished.
             self.append_tool_call({
                 "name": "command_execution",
                 "command": command,
-                "output": output_text,
+                "output": output if isinstance(output, str) else "",
                 "status": "failed" if failed else "completed",
-                "exitCode": content.get("exit"),
+                "exitCode": exit_code,
             }, key=tool_key)
+        return self.format_shell_finished(command, failed)
+
+    def _handle_shell_finished(self, message):
+        """Render an OpenCode background shell completion notice."""
+        content = message.content if isinstance(message.content, dict) else {}
+        line = self.apply_shell_finished(
+            content.get("command"),
+            bool(content.get("failed")),
+            output=content.get("output"),
+            tool_key=content.get("tool_key"),
+            exit_code=content.get("exit"),
+        )
+        if not line:
+            return
         if not self._ends_with_newline:
             self.append_content("\n", is_tool=True)
-        self.append_content(
-            self.format_shell_finished(command, failed) + "\n", is_tool=True)
+        self.append_content(line + "\n", is_tool=True)
         self._text_trailing_newlines = 1
         self.last_is_tool_call = False
 

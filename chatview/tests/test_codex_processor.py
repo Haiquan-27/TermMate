@@ -493,6 +493,40 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.assertEqual(update["output"]["detail"], "server ready")
         self.assertEqual(calls[1][0], "↳ Shell finished · npm run dev\n")
 
+    def test_apply_shell_finished_updates_row_without_notice(self):
+        seen = {"call_bg": {"key": "call_bg"}}
+        self.session.tool_outputs = SimpleNamespace(
+            find=lambda key: seen.get(key),
+        )
+        calls = []
+
+        def append(text, flush=False, is_tool=False, tool_phantoms=None):
+            calls.append((text, tool_phantoms))
+
+        self.processor.append_content = append
+        line = self.processor.apply_shell_finished(
+            "npm run dev", False, output="server ready", tool_key="call_bg")
+
+        self.assertEqual(line, "↳ Shell finished · npm run dev")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "")
+        update = calls[0][1][0]
+        self.assertTrue(update["update"])
+        self.assertEqual(update["output"]["summary"], "1 line success")
+        self.assertEqual(update["output"]["detail"], "server ready")
+
+    def test_apply_shell_finished_without_row_returns_notice_only(self):
+        self.session.tool_outputs = SimpleNamespace(find=lambda key: None)
+        calls = []
+        self.processor.append_content = (
+            lambda text, **kw: calls.append((text, kw)))
+
+        line = self.processor.apply_shell_finished(
+            "npm run dev", False, output="ready", tool_key="gone")
+
+        self.assertEqual(line, "↳ Shell finished · npm run dev")
+        self.assertEqual(calls, [])
+
     def test_shell_failed_notice(self):
         self.session.tool_outputs = SimpleNamespace(find=lambda key: None)
         appended = []
