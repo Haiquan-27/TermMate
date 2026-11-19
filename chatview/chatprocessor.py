@@ -435,7 +435,7 @@ class BaseChatMessageProcessor:
         name = block.get("name")
         return f"⏺ {name}" if name else ""
 
-    def format_tool_result(self, block):
+    def format_tool_result(self, block, force_collapse=False):
         """Render a completed tool result for the chat view.
 
         Returns ``(inline_text, summary, detail)``:
@@ -444,6 +444,9 @@ class BaseChatMessageProcessor:
           (short output, stays selectable and searchable)
         - ``summary`` / ``detail``: data for a collapsed phantom row
           (long output is only written to the buffer when expanded)
+
+        ``force_collapse`` keeps even short output behind the phantom row.
+        Command tool calls use it so their success/failed row never vanishes.
 
         Edit-like tools return three empty strings because ``_format_tool_block``
         already renders their diff.
@@ -493,7 +496,7 @@ class BaseChatMessageProcessor:
         unit = "line" if line_count == 1 else "lines"
         summary = f"{line_count} {unit} {_tool_result_status(block)}"
 
-        if mode == "inline":
+        if mode == "inline" and not force_collapse:
             return utils.format_fenced_output(cleaned), "", ""
         return "", summary, cleaned
 
@@ -574,9 +577,8 @@ class BaseChatMessageProcessor:
                 },
                 "output": None,
             }
-            inline_text, summary, detail = self.format_tool_result(block)
-            if inline_text:
-                return inline_text, [call]
+            _, summary, detail = self.format_tool_result(
+                block, force_collapse=True)
             if detail:
                 call["output"] = {"summary": summary, "detail": detail}
             return "", [call]
