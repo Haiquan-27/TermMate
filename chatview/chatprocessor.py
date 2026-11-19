@@ -14,6 +14,14 @@ LOG = logging.getLogger("TermMate")
 
 _WINDOWS_DRIVE_PATH_RE = re.compile(r'^[a-zA-Z]:[\\/]')
 _TOOL_ARGUMENTS_MAX_CHARS = 300
+_DIFF_TOOL_NAMES = frozenset({
+    "apply_patch",
+    "edit",
+    "filechange",
+    "multiedit",
+    "patch",
+    "write",
+})
 
 
 def _is_windows_abs_path(path):
@@ -408,7 +416,71 @@ class BaseChatMessageProcessor:
         name = block.get("name")
         return f"⏺ {name}" if name else ""
 
-    def append_content(self, text, flush=False, is_tool=False):
+    def format_tool_result(self, block):
+        """Render a completed tool result for the chat view.
+
+        Returns ``(inline_text, summary, detail)``:
+
+        - ``inline_text``: fenced block to append directly to the transcript
+          (short output, stays selectable and searchable)
+        - ``summary`` / ``detail``: data for a collapsed phantom row
+          (long output is only written to the buffer when expanded)
+
+        Edit-like tools return three empty strings because ``_format_tool_block``
+        already renders their diff.
+        """
+        if not isinstance(block, dict):
+            return "", "", ""
+
+        name = str(block.get("name") or "").lower()
+        metadata = block.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if metadata.get("diff") or name in _DIFF_TOOL_NAMES:
+            return "", "", ""
+
+        output = block.get("output")
+        if isinstance(output, list):
+            output = "\n".join(
+                str(item.get("text") or "")
+                for item in output
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        text = output if output else block.get("error")
+        if not isinstance(text, str):
+            text = "" if text is None else str(text)
+
+        getter = getattr(self.session, "get_setting", None)
+        inline_lines, inline_max_chars = 3, 400
+        try:
+            settings = sublime.load_settings("TermMate.sublime-settings")
+            inline_lines = settings.get("tool_output_inline_lines", 3)
+            inline_max_chars = settings.get("tool_output_inline_max_chars", 400)
+        except Exception:
+            pass
+        if getter is not None:
+            inline_lines = getter("tool_output_inline_lines", inline_lines)
+            inline_max_chars = getter(
+                "tool_output_inline_max_chars", inline_max_chars
+            )
+
+        mode, cleaned = utils.classify_tool_output(
+            text, inline_lines, inline_max_chars
+        )
+        if mode is None:
+            return "", "", ""
+
+        line_count = len(cleaned.splitlines())
+        unit = "line" if line_count == 1 else "lines"
+        summary = f"{line_count} {unit}"
+        if block.get("error") or block.get("status") == "error":
+            summary = f"error · {summary}"
+
+        if mode == "inline":
+            return utils.format_fenced_output(cleaned), "", ""
+        return "", summary, cleaned
+
+    def append_content(self, text, flush=False, is_tool=False, tool_outputs=None):
         """Append Markdown content through the chat session."""
         if text:
             raw = text.replace("\r", "")
@@ -417,7 +489,12 @@ class BaseChatMessageProcessor:
         if not is_tool and text and text.strip().startswith("⏺"):
             is_tool = True
         if is_tool:
-            self.session.append_markdown(text, flush=flush, is_tool=True)
+            if tool_outputs:
+                self.session.append_markdown(
+                    text, flush=flush, is_tool=True, tool_outputs=tool_outputs
+                )
+            else:
+                self.session.append_markdown(text, flush=flush, is_tool=True)
         else:
             self.session.append_markdown(text, flush=flush)
 
@@ -1054,11 +1131,23 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                     self.append_content("\n" * needed, is_tool=True)
             self.last_is_tool_call = True
             self._text_trailing_newlines = 0
+            block = message.content if isinstance(message.content, dict) else {}
+            rendered = self._format_tool_block(block)
+            inline_text, summary, detail = self.format_tool_result(block)
+            tool_outputs = None
+            if inline_text:
+                rendered = f"{rendered}\n{inline_text}"
+            elif detail:
+                tool_outputs = [{
+                    "line": rendered.count("\n"),
+                    "summary": summary,
+                    "detail": detail,
+                }]
             self.append_content(
-                self._format_tool_block(message.content) + "\n", is_tool=True
+                rendered + "\n", is_tool=True, tool_outputs=tool_outputs
             )
-            if message.content.get("name") == "fileChange":
-                self._record_file_changes(message.content)
+            if block.get("name") == "fileChange":
+                self._record_file_changes(block)
         elif message.type == "error":
             self.append_error(message.content)
             self.session.stop_loading()

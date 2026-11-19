@@ -30,6 +30,7 @@ from .chatpanel import (
 )
 
 from .md_render import MarkdownFormatter
+from .tooloutput import ToolOutputManager
 from .chatrender import (
     extract_diff_fold_ranges,
     quick_popup_manager,
@@ -1466,6 +1467,9 @@ class ChatSession:
         self.add_dirs = add_dirs or []
         self.loading_animation = LoadingAnimation(self.chat_view)
         self.table_phantoms = TablePhantomManager(self.chat_view)
+        self.tool_outputs = ToolOutputManager(
+            self.chat_view, get_input_start, set_input_start
+        )
 
         self.notice_phantom = NoticePhantom(
             self.chat_view,
@@ -1679,7 +1683,7 @@ class ChatSession:
             pass
         return None
 
-    def append_markdown(self, text, flush=False, is_tool=False):
+    def append_markdown(self, text, flush=False, is_tool=False, tool_outputs=None):
         """Format and append Markdown content to the chat view."""
         if self.pending_response_separator and text:
             self.pending_response_separator = False
@@ -1689,9 +1693,9 @@ class ChatSession:
         html_tables = self.markdown_formatter.take_html_tables()
         if formatted_text:
             sublime.set_timeout(
-                lambda ft=formatted_text, ht=html_tables, it=is_tool: self.chat_view.run_command(
+                lambda ft=formatted_text, ht=html_tables, it=is_tool, to=tool_outputs: self.chat_view.run_command(
                     "term_chat_output_append",
-                    {"text": ft, "html_tables": ht, "is_tool": it},
+                    {"text": ft, "html_tables": ht, "is_tool": it, "tool_outputs": to},
                 ),
                 0,
             )
@@ -2137,6 +2141,7 @@ class ChatSession:
 
         self.artifact.truncate(cut_point)
         self.table_phantoms.truncate(cut_point)
+        self.tool_outputs.truncate(cut_point)
         self.token_summary_phantom.clear()
 
 
@@ -2323,7 +2328,7 @@ class ChatSession:
         Keys: summary (str|None), mtime (float), turns (list).
         """
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
-        history_limit = settings.get("session_history_limit", 1)
+        history_limit = settings.get("session_history_limit", 50)
 
         if agent == "codex":
             info = get_codex_session_info(
@@ -2370,6 +2375,25 @@ class ChatSession:
 
         return None
 
+    def _clear_transcript(self):
+        """Reset everything visible before replaying a resumed session.
+
+        Keeps the text the user is currently typing in the input area; clears
+        the transcript, prompt gutter state, artifacts and every phantom.
+        """
+        self.stop_loading()
+        self.token_usage = None
+        self.token_summary_phantom.clear()
+        self.clear_prompt_highlights()
+        self.artifact.clear()
+        self.table_phantoms.clear()
+        self.tool_outputs.clear()
+        quick_popup_manager.close(self.chat_view.id())
+        self._reset_markdown_formatter()
+        self.chat_view.settings().erase(CHAT_LAST_Y)
+        self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
+        self.chat_view.run_command("term_chat_rewind_truncate", {"cut_point": 0})
+
     def _append_resume_history(self, agent, session_id, session_info):
         """Render resume banner and recent turns to the chat view. Pure display — no I/O."""
         import datetime
@@ -2379,7 +2403,18 @@ class ChatSession:
         self.chat_view.run_command("term_chat_output_append",
             {"text": f"\n[Resuming session for {agent}]\n\n"})
 
-        for turn in (session_info or {}).get("turns", []):
+        turns = (session_info or {}).get("turns", [])
+        replayed_events = any(turn.get("events") for turn in turns)
+        if not replayed_events and agent != "opencode":
+            self.chat_view.run_command(
+                "term_chat_output_append",
+                {"text": f"· Tool calls are not replayed for {agent} yet.\n\n"},
+            )
+
+        for turn in turns:
+            if turn.get("events"):
+                self._replay_turn_events(turn)
+                continue
             if turn.get("prompt"):
                 self._replay_prompt(turn["prompt"])
                 if turn.get("response"):
@@ -2402,6 +2437,61 @@ class ChatSession:
         else:
             self.chat_view.run_command("term_chat_output_append",
                 {"text": f"\n■ ResumeConversation ({session_id[:8]})\n\n"})
+
+    def _replay_turn_events(self, turn):
+        """Replay one structured turn (user text, assistant text, tool calls)."""
+        separator_pending = False
+        for event in turn.get("events") or []:
+            kind = event.get("kind")
+            if kind == "user":
+                text = event.get("text")
+                if text:
+                    self._replay_prompt(text)
+                    separator_pending = True
+                continue
+
+            if separator_pending:
+                self.chat_view.run_command(
+                    "term_chat_output_append",
+                    {"text": f"\n{AGENT_SEPARATOR}\n\n"},
+                )
+                separator_pending = False
+
+            if kind == "assistant":
+                text = event.get("text")
+                if text:
+                    formatter = self.markdown_formatter
+                    rendered = formatter.format(text + "\n\n", flush=True)
+                    self.chat_view.run_command("term_chat_output_append", {
+                        "text": rendered,
+                        "html_tables": formatter.take_html_tables(),
+                    })
+            elif kind == "tool":
+                block = event.get("block")
+                if isinstance(block, dict):
+                    self._replay_tool_event(block)
+
+    def _replay_tool_event(self, block):
+        """Render one historical tool call with its collapsed/expanded output."""
+        processor = self.message_processor
+        if processor is None:
+            return
+        rendered = processor._format_tool_block(block)
+        inline_text, summary, detail = processor.format_tool_result(block)
+        tool_outputs = None
+        if inline_text:
+            rendered = f"{rendered}\n{inline_text}"
+        elif detail:
+            tool_outputs = [{
+                "line": rendered.count("\n"),
+                "summary": summary,
+                "detail": detail,
+            }]
+        self.chat_view.run_command("term_chat_output_append", {
+            "text": rendered + "\n",
+            "is_tool": True,
+            "tool_outputs": tool_outputs,
+        })
 
     def update_plan_mode(self, plan_mode):
         """Update the plan mode for the current session."""
@@ -3077,7 +3167,7 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
             _, y = self.view.viewport_position()
             self.view.settings().set(CHAT_LAST_Y, y)
 
-    def run(self, edit, text, html_tables=None, is_tool=False):
+    def run(self, edit, text, html_tables=None, is_tool=False, tool_outputs=None):
         follow = self._should_follow()
 
         insert_at = get_input_start(self.view, 0) - 1
@@ -3085,14 +3175,13 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
         # The anchor region shifts with the insert; re-set to keep the
         # settings value in sync (and re-anchor if the anchor was missing).
         set_input_start(self.view, insert_at + inserted + 1)
-        if html_tables:
-            session = chatview_sessions.get(self.view.id())
-            if session:
-                for table in html_tables:
-                    start = insert_at + table["start"]
-                    end = insert_at + table["end"]
-                    session.table_phantoms.add(
-                        sublime.Region(start, end), table["html"])
+        session = chatview_sessions.get(self.view.id())
+        if html_tables and session:
+            for table in html_tables:
+                start = insert_at + table["start"]
+                end = insert_at + table["end"]
+                session.table_phantoms.add(
+                    sublime.Region(start, end), table["html"])
 
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
         diff_folds = extract_diff_fold_ranges(
@@ -3104,9 +3193,36 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
             if end > start:
                 self.view.fold(sublime.Region(insert_at + start, insert_at + end))
 
+        if tool_outputs and session:
+            start_row = self.view.rowcol(insert_at)[0]
+            for item in tool_outputs:
+                detail = item.get("detail")
+                if not detail:
+                    continue
+                row = start_row + int(item.get("line") or 0)
+                row_start = self.view.text_point(row, 0)
+                anchor_point = self.view.line(row_start).end()
+                session.tool_outputs.add(
+                    sublime.Region(anchor_point, anchor_point),
+                    item.get("summary"),
+                    detail,
+                )
+
         if not is_tool:
             quick_popup_manager.append(self.view.id(), text)
         self._update_scroll(follow)
+
+
+class TermChatToolOutputToggleCommand(sublime_plugin.TextCommand):
+    """Expand or collapse a tool-output phantom row."""
+
+    def run(self, edit, key):
+        session = chatview_sessions.get(self.view.id())
+        if session and session.tool_outputs:
+            session.tool_outputs.toggle(edit, key)
+
+    def is_enabled(self, key=None):
+        return True
 
 
 class TermChatInputPromptCommand(sublime_plugin.TextCommand):
@@ -3549,6 +3665,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
             if active_session is not None:
                 active_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
                 active_session.has_sent_message = False
+                active_session._clear_transcript()
                 active_session.reload_agent(session_id_override=chosen_id, quiet=False)
             else:
                 self.window.run_command("term_chat_cli")
@@ -3560,6 +3677,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                         return
                     new_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
                     new_session.has_sent_message = False
+                    new_session._clear_transcript()
                     new_session.reload_agent(session_id_override=chosen_id, quiet=False)
 
                 sublime.set_timeout(_resume_after_open, 0)

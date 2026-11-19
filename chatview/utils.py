@@ -1,5 +1,6 @@
 import logging
 import difflib
+import re
 import sublime
 
 
@@ -113,4 +114,72 @@ def format_token_count(count):
     val = n / 1_000_000.0
     formatted = f"{val:.1f}"
     return f"{formatted[:-2] if formatted.endswith('.0') else formatted}M"
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+
+
+def strip_ansi(text):
+    """Remove ANSI escape sequences (SGR colours, OSC titles) from tool output."""
+    if not text:
+        return ""
+    return _ANSI_OSC_RE.sub("", _ANSI_RE.sub("", text))
+
+
+def backtick_fence_for(text):
+    """Return a backtick fence longer than any run of backticks inside text."""
+    longest = 0
+    run = 0
+    for char in text or "":
+        if char == "`":
+            run += 1
+            if run > longest:
+                longest = run
+        else:
+            run = 0
+    return "`" * max(3, longest + 1)
+
+
+def clean_tool_output(text):
+    """Normalise line endings, strip ANSI codes and trailing blank lines."""
+    if not text:
+        return ""
+    cleaned = strip_ansi(text).replace("\r\n", "\n").replace("\r", "\n")
+    return cleaned.rstrip("\n")
+
+
+def format_fenced_output(text, info="text"):
+    """Wrap tool output in a fenced code block that Sublime can fold."""
+    cleaned = clean_tool_output(text)
+    if not cleaned.strip():
+        return ""
+    fence = backtick_fence_for(cleaned)
+    return f"{fence}{info}\n{cleaned}\n{fence}\n"
+
+
+def classify_tool_output(text, inline_lines=3, inline_max_chars=400):
+    """Decide how tool output should be rendered.
+
+    Returns (mode, cleaned_text) where mode is:
+      "inline"    - short enough to write straight into the chat buffer
+      "collapsed" - long enough to hide behind a phantom show button
+      None        - nothing worth rendering
+    """
+    cleaned = clean_tool_output(text)
+    if not cleaned.strip():
+        return None, ""
+    try:
+        line_limit = int(inline_lines)
+    except (TypeError, ValueError):
+        line_limit = 3
+    try:
+        char_limit = int(inline_max_chars)
+    except (TypeError, ValueError):
+        char_limit = 400
+    line_count = len(cleaned.splitlines())
+    if line_count <= line_limit and len(cleaned) <= char_limit:
+        return "inline", cleaned
+    return "collapsed", cleaned
+
 
