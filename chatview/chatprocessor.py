@@ -255,6 +255,10 @@ def _tool_call_phase(block):
     metadata still says ``status: running`` and carries a ``shellID``.
     """
     status = str(block.get("status") or "").strip().lower()
+    if block.get("background") and status in _TOOL_RUNNING_STATES:
+        # The adapter knows the shell was started in the background, so the
+        # row can say so before any completion event arrives.
+        return "background"
     metadata = block.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
@@ -670,6 +674,21 @@ class BaseChatMessageProcessor:
         outputs = getattr(self.session, "tool_outputs", None)
         return bool(key and outputs and outputs.find(key) is not None)
 
+    @staticmethod
+    def message_key(message):
+        """Stable id used to update a row in place.
+
+        Agent messages store their id on ``id``; older adapters used
+        ``msg_id``.  Accept both so a repeated event can find its row.
+        """
+        return (getattr(message, "msg_id", None)
+                or getattr(message, "id", None))
+
+    def format_shell_finished(self, command, failed=False):
+        """One-line notice shown when a shell command finishes."""
+        label = "Shell failed" if failed else "Shell finished"
+        return f"↳ {label} · {self._command_preview(command)}"
+
     def append_tool_call(self, block, key=None):
         """Append one tool call, or update its existing phantom row.
 
@@ -1081,7 +1100,7 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             self.session.start_loading()
             self.append_tool_call(
                 message.content,
-                key=getattr(message, "msg_id", None),
+                key=self.message_key(message),
             )
             if message.content.get("name") == "fileChange":
                 self._record_file_changes(message.content)
@@ -1279,6 +1298,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
     def __init__(self, session):
         super().__init__(session)
         self._text_trailing_newlines = 1
+        self._text_msg_id = None
 
     def _handle_typed_message(self, message):
         # Unlike Codex, OpenCode's adapter emits only streaming text and does
@@ -1292,6 +1312,19 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             content = message.content if isinstance(message.content, str) else ""
             if not content:
                 return
+            msg_id = self.message_key(message)
+            if (msg_id and self._text_msg_id
+                    and msg_id != self._text_msg_id
+                    and not self.last_is_tool_call
+                    and content[:1] not in ("\n", "\r")):
+                # A new assistant message started mid-turn (for example after
+                # a background command finished): keep the two messages from
+                # running together on one line.
+                needed = max(0, 2 - self._text_trailing_newlines)
+                if needed:
+                    content = "\n" * needed + content
+            if msg_id:
+                self._text_msg_id = msg_id
             if self.last_is_tool_call:
                 if not content.startswith(("\n", "\r\n")):
                     self.append_content("\n")
@@ -1305,21 +1338,19 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                 self._text_trailing_newlines = min(2, trailing)
             return
         if message.type == "tool_use":
-            if not self.last_is_tool_call:
+            block = message.content if isinstance(message.content, dict) else {}
+            key = self.message_key(message)
+            if not self.has_tool_call(key) and not self.last_is_tool_call:
                 needed = max(0, 2 - self._text_trailing_newlines)
                 if needed > 0:
                     self.append_content("\n" * needed, is_tool=True)
             self.last_is_tool_call = True
             self._text_trailing_newlines = 0
-            block = message.content if isinstance(message.content, dict) else {}
-            rendered, phantoms = self.format_tool_call(block)
-            self.append_content(
-                (rendered + "\n") if rendered else "",
-                is_tool=True,
-                tool_phantoms=phantoms or None,
-            )
+            self.append_tool_call(block, key=key)
             if block.get("name") == "fileChange":
                 self._record_file_changes(block)
+        elif message.type == "shell_finished":
+            self._handle_shell_finished(message)
         elif message.type == "error":
             self.append_error(message.content)
             self.session.stop_loading()
@@ -1350,6 +1381,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             self._active_turn_id = None
             self.last_is_tool_call = False
             self._text_trailing_newlines = 1
+            self._text_msg_id = None
             self.session.start_loading()
         elif message.type == "user_message_id":
             content = message.content if isinstance(message.content, dict) else {}
@@ -1362,7 +1394,10 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             self.ensure_trailing_newline()
             self.session.stop_loading()
             self.last_is_tool_call = False
-            self._text_trailing_newlines = 1
+            self._text_trailing_newlines = max(1, self._text_trailing_newlines)
+            # Keep ``_text_msg_id``: a background shell often resumes with a
+            # new assistant message after the stop, which must get its own
+            # paragraph instead of joining the previous one.
             if self._plan_text:
                 plan_text = self._plan_text
                 self._plan_text = ""
@@ -1376,6 +1411,34 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                         0,
                     )
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
+
+    def _handle_shell_finished(self, message):
+        """Render an OpenCode background shell completion notice."""
+        content = message.content if isinstance(message.content, dict) else {}
+        command = str(content.get("command") or "").strip()
+        if not command:
+            return
+        failed = bool(content.get("failed"))
+        output = content.get("output")
+        output_text = output if isinstance(output, str) else ""
+        tool_key = content.get("tool_key")
+        if tool_key and self.has_tool_call(tool_key):
+            # Finish the row that was left in the background state.  The
+            # shell notice carries the output because the tool result was
+            # stored before the shell actually finished.
+            self.append_tool_call({
+                "name": "command_execution",
+                "command": command,
+                "output": output_text,
+                "status": "failed" if failed else "completed",
+                "exitCode": content.get("exit"),
+            }, key=tool_key)
+        if not self._ends_with_newline:
+            self.append_content("\n", is_tool=True)
+        self.append_content(
+            self.format_shell_finished(command, failed) + "\n", is_tool=True)
+        self._text_trailing_newlines = 1
+        self.last_is_tool_call = False
 
     def _format_tool_block(self, block):
         name = block.get("name")
@@ -1615,7 +1678,7 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                         else:
                             self.append_tool_call(
                                 block,
-                                key=block.get("id") or getattr(message, "msg_id", None),
+                                key=block.get("id") or self.message_key(message),
                             )
 
         elif message.type == "system":

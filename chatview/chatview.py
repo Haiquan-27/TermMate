@@ -2470,6 +2470,16 @@ class ChatSession:
                 block = event.get("block")
                 if isinstance(block, dict):
                     self._replay_tool_event(block)
+            elif kind == "shell":
+                command = event.get("command")
+                processor = self.message_processor
+                if command and processor is not None:
+                    line = processor.format_shell_finished(
+                        command, bool(event.get("failed")))
+                    self.chat_view.run_command(
+                        "term_chat_output_append",
+                        {"text": f"\n{line}\n", "is_tool": True},
+                    )
 
     def _replay_tool_event(self, block):
         """Render one historical tool call with its collapsed/expanded output."""

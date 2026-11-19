@@ -628,6 +628,26 @@ class TestToolCallPhase(unittest.TestCase):
         })
         self.assertEqual(phantoms[0]["status"], "background")
 
+    def test_background_flag_marks_running_state(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm run dev",
+            "status": "running",
+            "background": True,
+        })
+        self.assertEqual(phantoms[0]["status"], "background")
+
+    def test_background_flag_does_not_hide_completion(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm run dev",
+            "status": "completed",
+            "background": True,
+            "output": "done",
+        })
+        self.assertNotIn("status", phantoms[0])
+        self.assertIn("success", phantoms[0]["output"]["summary"])
+
     def test_completed_with_output_is_terminal(self):
         _, phantoms = self.processor.format_tool_call({
             "name": "command_execution",

@@ -386,6 +386,127 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.processor.handle_message(Message("tool_use", {"name": "edit"}))
         self.assertEqual(appended, ["Let's use the edit tool.\n\n", "⏺ edit\n"])
 
+    def test_running_command_updates_one_phantom_in_place(self):
+        seen = {}
+        self.session.tool_outputs = SimpleNamespace(
+            find=lambda key: seen.get(key),
+        )
+        calls = []
+
+        def append(text, flush=False, is_tool=False, tool_phantoms=None):
+            calls.append((text, tool_phantoms))
+            for phantom in tool_phantoms or []:
+                seen[phantom["key"]] = {"key": phantom["key"]}
+
+        self.processor.append_content = append
+        self.processor.handle_message(Message(
+            "tool_use",
+            {"name": "command_execution", "command": "npm test",
+             "status": "running"},
+            msg_id="part_1",
+        ))
+        self.processor.handle_message(Message(
+            "tool_use",
+            {"name": "command_execution", "command": "npm test",
+             "status": "completed", "output": "ok\n"},
+            msg_id="part_1",
+        ))
+
+        phantom_calls = [c for c in calls if c[1]]
+        self.assertEqual(len(phantom_calls), 2)
+        first = phantom_calls[0][1][0]
+        self.assertEqual(first["status"], "running")
+        self.assertNotIn("update", first)
+        second = phantom_calls[1][1][0]
+        self.assertTrue(second["update"])
+        self.assertEqual(second["key"], "part_1")
+        self.assertEqual(second["output"]["summary"], "1 line success")
+
+    def test_background_flag_marks_running_command(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm run dev",
+            "status": "running",
+            "background": True,
+        })
+
+        self.assertEqual(phantoms[0]["status"], "background")
+
+    def test_separate_assistant_messages_get_a_blank_line(self):
+        appended = []
+        self.processor.append_content = (
+            lambda text, **kw: appended.append(text))
+        self.processor.handle_message(
+            Message("text", "我会把结果带回来。", msg_id="msg_a"))
+        self.processor.handle_message(
+            Message("text", "后台任务已完成 ✅", msg_id="msg_b"))
+
+        self.assertEqual(
+            appended, ["我会把结果带回来。", "\n\n后台任务已完成 ✅"])
+
+    def test_same_assistant_message_deltas_stay_joined(self):
+        appended = []
+        self.processor.append_content = (
+            lambda text, **kw: appended.append(text))
+        self.processor.handle_message(Message("text", "后台任务", msg_id="msg_a"))
+        self.processor.handle_message(Message("text", "已完成", msg_id="msg_a"))
+
+        self.assertEqual(appended, ["后台任务", "已完成"])
+
+    def test_message_after_stop_gets_a_blank_line(self):
+        appended = []
+        self.session.append_markdown = (
+            lambda text, flush=False, **kw: appended.append(text))
+        self.processor.handle_message(
+            Message("text", "我会把结果带回来。", msg_id="msg_a"))
+        self.processor.handle_message(Message("stop"))
+        self.processor.handle_message(
+            Message("text", "后台任务已完成 ✅", msg_id="msg_b"))
+
+        self.assertEqual(
+            "".join(appended), "我会把结果带回来。\n\n后台任务已完成 ✅")
+
+    def test_shell_finished_updates_row_and_adds_notice(self):
+        seen = {"call_bg": {"key": "call_bg"}}
+        self.session.tool_outputs = SimpleNamespace(
+            find=lambda key: seen.get(key),
+        )
+        calls = []
+
+        def append(text, flush=False, is_tool=False, tool_phantoms=None):
+            calls.append((text, tool_phantoms))
+
+        self.processor.append_content = append
+        self.processor.handle_message(Message("shell_finished", {
+            "tool_key": "call_bg",
+            "command": "npm run dev",
+            "output": "server ready\n",
+            "state": "completed",
+            "exit": 0,
+            "failed": False,
+        }))
+
+        self.assertEqual(len(calls), 2)
+        update = calls[0][1][0]
+        self.assertTrue(update["update"])
+        self.assertEqual(update["output"]["summary"], "1 line success")
+        self.assertEqual(update["output"]["detail"], "server ready")
+        self.assertEqual(calls[1][0], "↳ Shell finished · npm run dev\n")
+
+    def test_shell_failed_notice(self):
+        self.session.tool_outputs = SimpleNamespace(find=lambda key: None)
+        appended = []
+        self.processor.append_content = (
+            lambda text, **kw: appended.append(text))
+        self.processor.handle_message(Message("shell_finished", {
+            "tool_key": "call_missing",
+            "command": "npm run build",
+            "output": "boom",
+            "failed": True,
+        }))
+
+        self.assertEqual(appended, ["↳ Shell failed · npm run build\n"])
+
 
 class TestModelFormatting(unittest.TestCase):
 
