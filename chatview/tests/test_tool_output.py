@@ -452,14 +452,21 @@ class TestFormatToolCall(unittest.TestCase):
         self.assertTrue(summary.endswith("…"))
         self.assertEqual(phantoms[0]["command"]["detail"], command)
 
-    def test_short_output_stays_inline(self):
+    def test_short_output_also_collapses_for_commands(self):
         text, phantoms = self._call(
             command="git status", output="ok\ndone", status="completed"
         )
-        self.assertIn("```text", text)
-        self.assertIn("ok\ndone", text)
+        self.assertEqual(text, "")
         self.assertEqual([p["kind"] for p in phantoms], ["tool_call"])
-        self.assertIsNone(phantoms[0]["output"])
+        self.assertEqual(phantoms[0]["output"]["summary"], "2 lines success")
+        self.assertEqual(phantoms[0]["output"]["detail"], "ok\ndone")
+
+    def test_short_failed_output_keeps_failed_row(self):
+        text, phantoms = self._call(
+            command="false", output="boom", error="boom", status="error"
+        )
+        self.assertEqual(text, "")
+        self.assertEqual(phantoms[0]["output"]["summary"], "1 line failed")
 
     def test_long_output_joins_the_command_phantom(self):
         output = "\n".join(f"line {i}" for i in range(10))
