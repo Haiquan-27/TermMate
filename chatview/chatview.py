@@ -3190,9 +3190,7 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
         if tool_phantoms and session:
             start_row = self.view.rowcol(insert_at)[0]
             for item in tool_phantoms:
-                detail = item.get("detail")
-                if not detail:
-                    continue
+                kind = item.get("kind") or "output"
                 row = int(item.get("line") or 0)
                 if row < 0:
                     # Phantom-only row: anchor on the line preceding the
@@ -3201,13 +3199,19 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                 else:
                     row_start = self.view.text_point(start_row + row, 0)
                     anchor_point = self.view.line(row_start).end()
-                session.tool_outputs.add(
-                    sublime.Region(anchor_point, anchor_point),
-                    item.get("summary"),
-                    detail,
-                    kind=item.get("kind") or "output",
-                    heading=item.get("heading") or "",
-                )
+                anchor = sublime.Region(anchor_point, anchor_point)
+                if kind == "tool_call":
+                    command = item.get("command") or {}
+                    if not command.get("detail"):
+                        continue
+                    session.tool_outputs.add_tool_call(
+                        anchor, command, item.get("output"))
+                else:
+                    detail = item.get("detail")
+                    if not detail:
+                        continue
+                    session.tool_outputs.add(
+                        anchor, item.get("summary"), detail)
 
         if not is_tool:
             quick_popup_manager.append(self.view.id(), text)
@@ -3217,12 +3221,12 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
 class TermChatToolOutputToggleCommand(sublime_plugin.TextCommand):
     """Expand or collapse a tool-output phantom row."""
 
-    def run(self, edit, key):
+    def run(self, edit, key, section=None):
         session = chatview_sessions.get(self.view.id())
         if session and session.tool_outputs:
-            session.tool_outputs.toggle(edit, key)
+            session.tool_outputs.toggle(edit, key, section)
 
-    def is_enabled(self, key=None):
+    def is_enabled(self, key=None, section=None):
         return True
 
 
