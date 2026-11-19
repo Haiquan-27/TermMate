@@ -77,11 +77,26 @@ class FakeView:
         return sublime.Region(start, end)
 
     def insert(self, edit, point, text):
+        count = len(text)
         self.text = self.text[:point] + text + self.text[point:]
-        return len(text)
+        self._shift_regions(point, count)
+        return count
 
     def erase(self, edit, region):
-        self.text = self.text[:region.begin()] + self.text[region.end():]
+        begin, end = region.begin(), region.end()
+        self.text = self.text[:begin] + self.text[end:]
+        self._shift_regions(begin, begin - end)
+
+    def _shift_regions(self, point, delta):
+        if not delta:
+            return
+        for key, regions in self.regions.items():
+            shifted = []
+            for region in regions:
+                begin = region.begin() + delta if region.begin() >= point else region.begin()
+                end = region.end() + delta if region.end() >= point else region.end()
+                shifted.append(sublime.Region(max(0, begin), max(0, end)))
+            self.regions[key] = shifted
 
     def run_command(self, name, args=None):
         self.commands.append((name, args))
@@ -162,18 +177,25 @@ class TestClassifyToolOutput(unittest.TestCase):
 
 
 class TestToolOutputManager(unittest.TestCase):
+    INPUT_KEY = "test_input_anchor"
+
     def setUp(self):
         # Mirrors the live buffer: tool header, then the blank line before the
         # input line. CHAT_INPUT_START points at the final newline.
         self.view = FakeView("⏺ Bash ls\n\n")
-        self.input_start = {"pos": 10}
+        self.view.add_regions(self.INPUT_KEY, [sublime.Region(10, 11)])
         self.manager = ToolOutputManager(
             self.view,
-            lambda view, default=None: self.input_start["pos"],
-            lambda view, pos: self.input_start.__setitem__("pos", pos),
+            lambda view, default=None: view.get_regions(self.INPUT_KEY)[0].begin(),
+            lambda view, pos: view.add_regions(
+                self.INPUT_KEY, [sublime.Region(pos, pos + 1)]
+            ),
         )
         # Anchor on the last character of the header line.
         self.anchor = sublime.Region(8, 8)
+
+    def input_pos(self):
+        return self.view.get_regions(self.INPUT_KEY)[0].begin()
 
     def test_add_registers_anchor_and_phantom(self):
         entry = self.manager.add(self.anchor, "42 lines", "line1\nline2")
@@ -199,12 +221,12 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertTrue(entry["expanded"])
         self.assertIn("```text", self.view.text)
         self.assertIn("line1\nline2", self.view.text)
-        self.assertGreater(self.input_start["pos"], 10)
+        self.assertGreater(self.input_pos(), 10)
 
         self.manager.toggle(None, entry["key"])
         self.assertFalse(entry["expanded"])
         self.assertEqual(self.view.text, original)
-        self.assertEqual(self.input_start["pos"], 10)
+        self.assertEqual(self.input_pos(), 10)
 
     def test_expand_toggles_label_to_hide(self):
         entry = self.manager.add(self.anchor, "42 lines", "out")
@@ -222,6 +244,31 @@ class TestToolOutputManager(unittest.TestCase):
         status.assert_called_once()
         self.assertIn("2 lines", status.call_args[0][0])
         self.assertFalse(entry["expanded"])
+
+    def test_links_are_separated_by_non_breaking_spaces(self):
+        entry = self.manager.add(self.anchor, "42 lines", "out")
+        html = self.manager._row_html(entry)
+        self.assertIn("</span>&nbsp;&nbsp;<a", html)
+        self.assertIn("</a>&nbsp;&nbsp;<a", html)
+        self.assertNotIn("margin-left", html)
+
+    def test_command_row_has_heading_and_no_copy(self):
+        entry = self.manager.add(
+            self.anchor, "$exe = 'x'", "line1", kind="command", heading="⏺ command"
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn("⏺ command ($exe = &#x27;x&#x27;)", html)
+        self.assertIn(">show<", html)
+        self.assertNotIn(">copy<", html)
+        self.assertIn("termmate-command-row", html)
+
+    def test_command_row_expands_fenced_block(self):
+        entry = self.manager.add(
+            self.anchor, "$exe", "line1\nline2", kind="command", heading="⏺ command"
+        )
+        self.manager.toggle(None, entry["key"])
+        self.assertIn("```text\nline1\nline2\n```", self.view.text)
+        self.assertEqual(entry["kind"], "command")
 
     def test_copy_missing_entry_is_noop(self):
         with patch("sublime.set_clipboard") as clipboard, \
@@ -242,7 +289,8 @@ class TestToolOutputManager(unittest.TestCase):
         self.manager.add(self.anchor, "1 line", "a")
         self.manager.clear()
         self.assertEqual(self.manager.entries, [])
-        self.assertFalse(self.view.regions)
+        tool_keys = [k for k in self.view.regions if k.startswith("term_chat_tool_output_")]
+        self.assertEqual(tool_keys, [])
         self.manager.phantom_set.update.assert_called_with([])
 
 
@@ -310,6 +358,92 @@ class TestFormatToolResult(unittest.TestCase):
         self.assertIn("green", inline)
         self.assertNotIn("\x1b", inline)
         self.assertEqual(detail, "")
+
+
+class TestFormatToolCall(unittest.TestCase):
+    """Command tool calls become phantom-only rows."""
+
+    def setUp(self):
+        from chatview.chatprocessor import OpenCodeMessageProcessor
+
+        self.session = MagicMock()
+        self.session.agent_thread.cwd = "/workspace"
+        self.session.get_setting.side_effect = (
+            lambda key, default=None: {
+                "tool_output_inline_lines": 3,
+                "tool_output_inline_max_chars": 400,
+            }.get(key, default)
+        )
+        self.processor = OpenCodeMessageProcessor(self.session)
+
+    def _call(self, **block):
+        block.setdefault("name", "command_execution")
+        return self.processor.format_tool_call(block)
+
+    def test_command_never_writes_buffer_text(self):
+        text, phantoms = self._call(command="python3 -m unittest")
+        self.assertEqual(text, "")
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["kind"], "command")
+        self.assertEqual(phantoms[0]["line"], -1)
+        self.assertEqual(phantoms[0]["summary"], "python3 -m unittest")
+        self.assertEqual(phantoms[0]["detail"], "python3 -m unittest")
+
+    def test_multiline_preview_gets_ellipsis(self):
+        _, phantoms = self._call(command="echo first\necho second")
+        self.assertEqual(phantoms[0]["summary"], "echo first …")
+        self.assertEqual(phantoms[0]["detail"], "echo first\necho second")
+
+    def test_long_preview_is_truncated(self):
+        command = "x" * 500
+        _, phantoms = self._call(command=command)
+        summary = phantoms[0]["summary"]
+        self.assertLessEqual(len(summary), 120)
+        self.assertTrue(summary.endswith("…"))
+        self.assertEqual(phantoms[0]["detail"], command)
+
+    def test_short_output_stays_inline(self):
+        text, phantoms = self._call(
+            command="git status", output="ok\ndone", status="completed"
+        )
+        self.assertIn("```text", text)
+        self.assertIn("ok\ndone", text)
+        self.assertEqual([p["kind"] for p in phantoms], ["command"])
+
+    def test_long_output_adds_second_phantom_row(self):
+        output = "\n".join(f"line {i}" for i in range(10))
+        text, phantoms = self._call(
+            command="npm test", output=output, status="completed"
+        )
+        self.assertEqual(text, "")
+        self.assertEqual([p["kind"] for p in phantoms], ["command", "output"])
+        self.assertEqual(phantoms[1]["summary"], "10 lines")
+        self.assertEqual(phantoms[1]["detail"], output)
+        self.assertEqual(phantoms[1]["line"], -1)
+
+    def test_edit_tool_output_is_not_duplicated(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "edit",
+            "input": {"path": "a.py"},
+            "output": "Edited a.py",
+            "metadata": {"diff": "@@ -1 +1 @@"},
+            "status": "completed",
+        })
+        self.assertTrue(text.startswith("⏺ edit"))
+        self.assertEqual(phantoms, [])
+
+    def test_read_with_long_output_keeps_header_row(self):
+        output = "\n".join(f"line {i}" for i in range(10))
+        text, phantoms = self.processor.format_tool_call({
+            "name": "read",
+            "input": {"path": "a.py"},
+            "output": output,
+            "status": "completed",
+        })
+        self.assertTrue(text.startswith("⏺ read a.py"))
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["kind"], "output")
+        self.assertEqual(phantoms[0]["line"], text.count("\n"))
 
 
 if __name__ == "__main__":

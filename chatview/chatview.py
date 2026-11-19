@@ -1683,7 +1683,7 @@ class ChatSession:
             pass
         return None
 
-    def append_markdown(self, text, flush=False, is_tool=False, tool_outputs=None):
+    def append_markdown(self, text, flush=False, is_tool=False, tool_phantoms=None):
         """Format and append Markdown content to the chat view."""
         if self.pending_response_separator and text:
             self.pending_response_separator = False
@@ -1691,11 +1691,11 @@ class ChatSession:
             text = f"{AGENT_SEPARATOR}\n\n{clean}" if clean else f"{AGENT_SEPARATOR}\n\n"
         formatted_text = self.markdown_formatter.format(text, flush=flush)
         html_tables = self.markdown_formatter.take_html_tables()
-        if formatted_text:
+        if formatted_text or tool_phantoms:
             sublime.set_timeout(
-                lambda ft=formatted_text, ht=html_tables, it=is_tool, to=tool_outputs: self.chat_view.run_command(
+                lambda ft=formatted_text, ht=html_tables, it=is_tool, tp=tool_phantoms: self.chat_view.run_command(
                     "term_chat_output_append",
-                    {"text": ft, "html_tables": ht, "is_tool": it, "tool_outputs": to},
+                    {"text": ft, "html_tables": ht, "is_tool": it, "tool_phantoms": tp},
                 ),
                 0,
             )
@@ -2476,21 +2476,11 @@ class ChatSession:
         processor = self.message_processor
         if processor is None:
             return
-        rendered = processor._format_tool_block(block)
-        inline_text, summary, detail = processor.format_tool_result(block)
-        tool_outputs = None
-        if inline_text:
-            rendered = f"{rendered}\n{inline_text}"
-        elif detail:
-            tool_outputs = [{
-                "line": rendered.count("\n"),
-                "summary": summary,
-                "detail": detail,
-            }]
+        rendered, phantoms = processor.format_tool_call(block)
         self.chat_view.run_command("term_chat_output_append", {
-            "text": rendered + "\n",
+            "text": (rendered + "\n") if rendered else "",
             "is_tool": True,
-            "tool_outputs": tool_outputs,
+            "tool_phantoms": phantoms or None,
         })
 
     def update_plan_mode(self, plan_mode):
@@ -3167,8 +3157,12 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
             _, y = self.view.viewport_position()
             self.view.settings().set(CHAT_LAST_Y, y)
 
-    def run(self, edit, text, html_tables=None, is_tool=False, tool_outputs=None):
+    def run(self, edit, text="", html_tables=None, is_tool=False, tool_phantoms=None):
         follow = self._should_follow()
+
+        # A phantom-only tool call still needs its own line to anchor on.
+        if not text and tool_phantoms:
+            text = "\n"
 
         insert_at = get_input_start(self.view, 0) - 1
         inserted = self.view.insert(edit, insert_at, text)
@@ -3193,19 +3187,26 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
             if end > start:
                 self.view.fold(sublime.Region(insert_at + start, insert_at + end))
 
-        if tool_outputs and session:
+        if tool_phantoms and session:
             start_row = self.view.rowcol(insert_at)[0]
-            for item in tool_outputs:
+            for item in tool_phantoms:
                 detail = item.get("detail")
                 if not detail:
                     continue
-                row = start_row + int(item.get("line") or 0)
-                row_start = self.view.text_point(row, 0)
-                anchor_point = self.view.line(row_start).end()
+                row = int(item.get("line") or 0)
+                if row < 0:
+                    # Phantom-only row: anchor on the line preceding the
+                    # appended text so an expanded block lands below it.
+                    anchor_point = max(0, insert_at - 1)
+                else:
+                    row_start = self.view.text_point(start_row + row, 0)
+                    anchor_point = self.view.line(row_start).end()
                 session.tool_outputs.add(
                     sublime.Region(anchor_point, anchor_point),
                     item.get("summary"),
                     detail,
+                    kind=item.get("kind") or "output",
+                    heading=item.get("heading") or "",
                 )
 
         if not is_tool:
