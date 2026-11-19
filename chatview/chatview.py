@@ -2441,6 +2441,9 @@ class ChatSession:
     def _replay_turn_events(self, turn):
         """Replay one structured turn (user text, assistant text, tool calls)."""
         separator_pending = False
+        # shellID -> tool row key, so a later shell event can finish the row
+        # that was replayed in its background state.
+        background_rows = {}
         for event in turn.get("events") or []:
             kind = event.get("kind")
             if kind == "user":
@@ -2469,24 +2472,33 @@ class ChatSession:
             elif kind == "tool":
                 block = event.get("block")
                 if isinstance(block, dict):
-                    self._replay_tool_event(block)
+                    key = event.get("id")
+                    self._replay_tool_event(block, key=key)
+                    shell_id = event.get("shell_id")
+                    if shell_id and key:
+                        background_rows[shell_id] = key
             elif kind == "shell":
                 command = event.get("command")
                 processor = self.message_processor
                 if command and processor is not None:
-                    line = processor.format_shell_finished(
-                        command, bool(event.get("failed")))
-                    self.chat_view.run_command(
-                        "term_chat_output_append",
-                        {"text": f"\n{line}\n", "is_tool": True},
+                    line = processor.apply_shell_finished(
+                        command,
+                        bool(event.get("failed")),
+                        output=event.get("output") or "",
+                        tool_key=background_rows.get(event.get("shell_id")),
                     )
+                    if line:
+                        self.chat_view.run_command(
+                            "term_chat_output_append",
+                            {"text": f"\n{line}\n", "is_tool": True},
+                        )
 
-    def _replay_tool_event(self, block):
+    def _replay_tool_event(self, block, key=None):
         """Render one historical tool call with its collapsed/expanded output."""
         processor = self.message_processor
         if processor is None:
             return
-        rendered, phantoms = processor.format_tool_call(block)
+        rendered, phantoms = processor.format_tool_call(block, key=key)
         self.chat_view.run_command("term_chat_output_append", {
             "text": (rendered + "\n") if rendered else "",
             "is_tool": True,

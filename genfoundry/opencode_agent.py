@@ -846,6 +846,10 @@ class OpenCodeAgent(BaseAgent):
         self._sse_response_lock = threading.Lock()
 
         self._text_cache: Dict[str, str] = {}
+        # [v2] Text accumulated per (assistantMessageID, ordinal).  Used to
+        # recover text from ``session.text.ended`` when deltas were lost
+        # (for example during an SSE reconnect) without duplicating it.
+        self._v2_text_cache: Dict[Any, str] = {}
         self._part_types: Dict[str, str] = {}
         self._message_roles: Dict[str, str] = {}
         self._user_message_ids = set()
@@ -856,6 +860,11 @@ class OpenCodeAgent(BaseAgent):
         self._shell_commands: Dict[str, str] = {}
         self._finished_shells = set()
         self._tool_calls: Dict[str, Dict[str, Any]] = {}
+        # A background shell resumes the session after the prompt's turn has
+        # already stopped.  Track whether the view was already told to stop
+        # loading for the current execution chain so each idle event emits
+        # one stop (and duplicates do not emit more).
+        self._idle_announced = False
         self._permission_sessions: Dict[str, str] = {}
         self._seen_permissions = set()
         self._diff_cache: Dict[str, Any] = {}
@@ -1453,7 +1462,35 @@ class OpenCodeAgent(BaseAgent):
                 properties.get("assistantMessageID") or properties.get("partID") or ""
             )
             if delta:
+                key = (msg_id, properties.get("ordinal", 0))
+                self._v2_text_cache[key] = (
+                    self._v2_text_cache.get(key, "") + delta)
                 await self._emit_text_delta(delta, msg_id)
+            return
+
+        # [v2] A new text part starts; reset the accumulator for that part.
+        if event_type == "session.text.started":
+            msg_id = str(
+                properties.get("assistantMessageID") or properties.get("partID") or ""
+            )
+            self._v2_text_cache[(msg_id, properties.get("ordinal", 0))] = ""
+            return
+
+        # [v2] Final text of a part.  Deltas are the live path, but a lost
+        # delta (SSE gap) would silently truncate the message, so emit the
+        # part that was not streamed yet.
+        if event_type == "session.text.ended":
+            msg_id = str(
+                properties.get("assistantMessageID") or properties.get("partID") or ""
+            )
+            full_text = properties.get("text", "")
+            if isinstance(full_text, str) and full_text:
+                key = (msg_id, properties.get("ordinal", 0))
+                streamed = self._v2_text_cache.get(key, "")
+                remainder = self._unstreamed_text(streamed, full_text)
+                self._v2_text_cache[key] = full_text
+                if remainder:
+                    await self._emit_text_delta(remainder, msg_id)
             return
 
         # [v2] Assistant streaming reasoning / thought delta
@@ -1515,6 +1552,14 @@ class OpenCodeAgent(BaseAgent):
                 command = str(shell.get("command") or "")
                 if shell_id and command:
                     self._shell_commands[shell_id] = command
+                metadata = shell.get("metadata")
+                if (shell_id and isinstance(metadata, dict)
+                        and metadata.get("background") is True):
+                    # The shell itself says it was backgrounded.  Keep a
+                    # placeholder until the matching tool call reports its id;
+                    # this also lets ``session.shell.ended`` act as a fallback
+                    # when the tool result never carried a shellID.
+                    self._background_shells.setdefault(shell_id, "")
             return
         if event_type == "session.shell.ended":
             await self._handle_shell_ended_v2(properties)
@@ -1536,15 +1581,27 @@ class OpenCodeAgent(BaseAgent):
             await self._handle_tool_terminal_v2(properties, "error")
             return
 
-        # [v2] Turn execution completed (succeeded or interrupted)
-        if event_type in ("session.execution.succeeded", "session.execution.interrupted"):
-            if self._turn_active:
-                LOG.info(
-                    "OpenCode conversation finished [session_id=%s, type=%s]",
-                    self._session_id,
-                    event_type,
-                )
-            await self._finish_turn()
+        # [v2] A new execution started.  A background shell resumes the
+        # session after the prompt turn already stopped, so re-arm the idle
+        # notice for the continuation's terminal event.
+        if self.version >= 2 and event_type == "session.execution.started":
+            self._idle_announced = False
+            return
+
+        # [v2] Turn execution completed (succeeded or interrupted).  The
+        # status event is a fallback for a missed execution event.  v1 uses
+        # ``session.status``/legacy ``session.idle`` further below.
+        if self.version >= 2 and event_type in (
+            "session.execution.succeeded",
+            "session.execution.interrupted",
+            "session.idle",
+        ):
+            await self._handle_idle_v2(event_type)
+            return
+        if self.version >= 2 and event_type == "session.status":
+            status = properties.get("status")
+            if isinstance(status, dict) and status.get("type") == "idle":
+                await self._handle_idle_v2(event_type)
             return
 
         # [v2] Turn execution failed with error
@@ -1560,6 +1617,7 @@ class OpenCodeAgent(BaseAgent):
             await self._message_queue.put(Message(
                 MessageType.ERROR.value, content=error_text
             ))
+            self._idle_announced = True
             self._turn_active = False
             self._turn_plan_mode = False
             self._awaiting_user_message_id = False
@@ -1675,6 +1733,29 @@ class OpenCodeAgent(BaseAgent):
             await self._handle_permission(properties)
             return
 
+    async def _handle_idle_v2(self, event_type: str) -> None:
+        """Stop the view's loading state for the prompt turn or a resume.
+
+        OpenCode runs another execution when a background shell completes.
+        The prompt turn has already stopped by then, but the view started a
+        fresh loading animation for the continuation's assistant text, so a
+        second stop is required.  ``_idle_announced`` keeps duplicate
+        execution/idle events from emitting more than one.
+        """
+        if self._idle_announced and not self._turn_active:
+            return
+        if self._turn_active and event_type != "session.idle":
+            LOG.info(
+                "OpenCode conversation finished [session_id=%s, type=%s]",
+                self._session_id,
+                event_type,
+            )
+        self._idle_announced = True
+        if self._turn_active:
+            await self._finish_turn()
+            return
+        await self._message_queue.put(Message(MessageType.STOP.value))
+
     async def _finish_turn(self) -> None:
         # _finish_turn can be triggered either by the SSE event stream
         # (session.execution.succeeded / session.execution.interrupted) or by the interrupt
@@ -1761,6 +1842,23 @@ class OpenCodeAgent(BaseAgent):
             MessageType.TOOL_USE.value, content=content, msg_id=part_id
         ))
 
+    @staticmethod
+    def _unstreamed_text(streamed: str, full_text: str) -> str:
+        """Return the part of ``full_text`` that deltas did not deliver."""
+        if not streamed:
+            return full_text
+        if full_text.startswith(streamed):
+            return full_text[len(streamed):]
+        if streamed.startswith(full_text):
+            return ""
+        # Deltas were reordered or a middle chunk was lost.  Keep the common
+        # prefix and append the rest so the transcript is never truncated.
+        limit = min(len(streamed), len(full_text))
+        prefix = 0
+        while prefix < limit and streamed[prefix] == full_text[prefix]:
+            prefix += 1
+        return full_text[prefix:]
+
     async def _emit_text_delta(self, delta: str, msg_id: Optional[str]) -> None:
         if not delta:
             return
@@ -1807,9 +1905,11 @@ class OpenCodeAgent(BaseAgent):
         shell_id = str(properties.get("id") or "")
         if not shell_id:
             return
-        tool_id = self._background_shells.get(shell_id)
-        if tool_id is None:
+        tool_id = self._background_shells.get(shell_id) or self._tool_id_for_shell(
+            shell_id)
+        if not tool_id:
             return
+        self._background_shells[shell_id] = tool_id
         cached = self._tool_calls.get(tool_id, {})
         input_data = cached.get("input")
         if not isinstance(input_data, dict):
@@ -1873,7 +1973,10 @@ class OpenCodeAgent(BaseAgent):
         # Foreground tools already rendered their own result; only shells that
         # outlived their tool call need a completion line.
         if shell_id not in self._background_shells:
-            return
+            tool_id = self._tool_id_for_shell(shell_id)
+            if not tool_id:
+                return
+            self._background_shells[shell_id] = tool_id
         command = str(shell.get("command") or "").strip()
         if not command:
             command = self._shell_commands.get(shell_id, "")
@@ -1891,6 +1994,23 @@ class OpenCodeAgent(BaseAgent):
             shell.get("exit"),
         )
 
+    def _tool_id_for_shell(self, shell_id: str) -> Optional[str]:
+        """Find the background tool call that owns ``shell_id``.
+
+        ``session.tool.success`` normally registers the mapping, but the
+        shell events may arrive before the tool result (or the result may
+        omit ``metadata.shellID``).  The cached tool input/metadata still
+        identifies the call.
+        """
+        if not shell_id:
+            return None
+        for tool_id, cached in self._tool_calls.items():
+            metadata = cached.get("metadata")
+            if (isinstance(metadata, dict)
+                    and str(metadata.get("shellID") or "") == shell_id):
+                return tool_id
+        return None
+
     async def _emit_shell_finished_v2(
         self,
         shell_id: str,
@@ -1902,6 +2022,11 @@ class OpenCodeAgent(BaseAgent):
         if not command or shell_id in self._finished_shells:
             return
         self._finished_shells.add(shell_id)
+        tool_key = self._background_shells.get(shell_id)
+        if not tool_key:
+            tool_key = self._tool_id_for_shell(shell_id)
+            if tool_key:
+                self._background_shells[shell_id] = tool_key
         lowered = state.strip().lower()
         succeeded = lowered in ("exited", "completed", "success", "succeeded")
         if exit_code is not None:
@@ -1913,7 +2038,7 @@ class OpenCodeAgent(BaseAgent):
             "shell_finished",
             content={
                 "shell_id": shell_id,
-                "tool_key": self._background_shells.get(shell_id),
+                "tool_key": tool_key,
                 "command": command,
                 "output": output,
                 "state": state,
@@ -1932,7 +2057,8 @@ class OpenCodeAgent(BaseAgent):
         if tool_id:
             self._terminal_tools.add(tool_id)
 
-        cached = self._tool_calls.get(tool_id, {})
+        cached = (self._tool_calls.setdefault(tool_id, {})
+                  if tool_id else {})
         raw_name = str(properties.get("name") or cached.get("name") or "tool")
         input_data = cached.get("input") or properties.get("input", {})
         if not isinstance(input_data, dict):
@@ -1954,8 +2080,16 @@ class OpenCodeAgent(BaseAgent):
             "status": status,
         }
         metadata = state["metadata"]
+        if tool_id:
+            # Keep the merged metadata so later shell events can map the shell
+            # back to this row even if they arrive before/after the result.
+            cached["metadata"] = metadata
         shell_id = metadata.get("shellID")
-        if shell_id and str(metadata.get("status") or "").lower() == "running":
+        background = bool(
+            (isinstance(input_data, dict) and input_data.get("background"))
+            or str(metadata.get("status") or "").lower() == "running"
+        )
+        if shell_id and background:
             # Backgrounded command: the tool returned, the shell keeps going.
             self._background_shells[str(shell_id)] = tool_id
         content = _tool_content_from_state(raw_name, state)
@@ -2350,6 +2484,7 @@ class OpenCodeAgent(BaseAgent):
         self._plan_text = ""
         self._turn_plan_mode = agent_name == "plan"
         self._turn_active = True
+        self._idle_announced = False
         self._turn_done.clear()
         self._awaiting_user_message_id = True
         await self._message_queue.put(Message(
@@ -2466,7 +2601,9 @@ class OpenCodeAgent(BaseAgent):
         self._turn_done.set()
         self._uses_session_status = False
         self._awaiting_user_message_id = False
+        self._idle_announced = False
         self._text_cache.clear()
+        self._v2_text_cache.clear()
         self._part_types.clear()
         self._message_roles.clear()
         self._user_message_ids.clear()
@@ -2516,8 +2653,10 @@ class OpenCodeAgent(BaseAgent):
         self._turn_active = False
         self._turn_plan_mode = False
         self._awaiting_user_message_id = False
+        self._idle_announced = False
         self._turn_done.set()
         self._text_cache.clear()
+        self._v2_text_cache.clear()
         self._part_types.clear()
         self._message_roles.clear()
         self._user_message_ids.clear()
@@ -3238,12 +3377,20 @@ def get_opencode_session_info(
                             continue
                         if state.get("status") not in ("completed", "error"):
                             continue
-                        turn["events"].append({
+                        block = _tool_content_from_state(
+                            str(part.get("tool") or "tool"), state
+                        )
+                        event = {
                             "kind": "tool",
-                            "block": _tool_content_from_state(
-                                str(part.get("tool") or "tool"), state
-                            ),
-                        })
+                            "id": part.get("id"),
+                            "block": block,
+                        }
+                        metadata = block.get("metadata")
+                        if isinstance(metadata, dict) and metadata.get("shellID"):
+                            # Lets the replay update this row when the shell
+                            # completion event is replayed later in the turn.
+                            event["shell_id"] = str(metadata["shellID"])
+                        turn["events"].append(event)
 
             for entry in entries:
                 if not isinstance(entry, dict):
@@ -3287,6 +3434,9 @@ def get_opencode_session_info(
                                 failed = True
                         current["events"].append({
                             "kind": "shell",
+                            "shell_id": str(
+                                metadata.get("shellID")
+                                or metadata.get("jobID") or ""),
                             "command": str(
                                 entry.get("description")
                                 or info.get("description") or ""),

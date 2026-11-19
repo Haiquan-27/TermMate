@@ -1089,6 +1089,207 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(finished), 1)
         self.assertEqual(finished[0].content["command"], "npm run dev")
 
+    async def test_v2_text_ended_recovers_text_lost_with_deltas(self):
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "delta": "Hello",
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "text": "Hello world",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.content for m in messages], ["Hello", " world"])
+        self.assertEqual(messages[0].id, "msg_v2_1")
+        self.assertEqual(messages[1].id, "msg_v2_1")
+
+    async def test_v2_text_ended_is_ignored_when_deltas_were_complete(self):
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "delta": "Hello world",
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "text": "Hello world",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.content for m in messages], ["Hello world"])
+
+    async def test_v2_text_ended_without_any_delta_emits_full_text(self):
+        await self.agent._dispatch_event({
+            "type": "session.text.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "text": "后台任务已完成 ✅",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.content for m in messages], ["后台任务已完成 ✅"])
+
+    async def test_v2_text_started_resets_part_accumulator(self):
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 0,
+                "delta": "abc",
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.started",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 1,
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "ordinal": 1,
+                "text": "def",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.content for m in messages], ["abc", "def"])
+
+    async def test_v2_background_resume_stops_loading_again(self):
+        # The prompt turn already stopped, then a background shell resumed
+        # the session with new assistant text.
+        self.agent._turn_active = False
+        self.agent._idle_announced = True
+        await self.agent._dispatch_event({
+            "type": "session.execution.started",
+            "data": {"sessionID": "ses_v2"},
+        })
+        await self.agent._dispatch_event({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses_v2"},
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.type for m in messages], ["stop"])
+        self.assertFalse(self.agent._turn_active)
+
+    async def test_v2_duplicate_idle_events_emit_one_stop(self):
+        self.agent._turn_active = False
+        self.agent._idle_announced = True
+        await self.agent._dispatch_event({
+            "type": "session.execution.started",
+            "data": {"sessionID": "ses_v2"},
+        })
+        for event_type in (
+            "session.execution.succeeded",
+            "session.idle",
+            "session.execution.succeeded",
+        ):
+            await self.agent._dispatch_event({
+                "type": event_type,
+                "data": {"sessionID": "ses_v2"},
+            })
+
+        messages = await self._messages()
+        self.assertEqual([m.type for m in messages], ["stop"])
+
+    async def test_v2_shell_started_background_enables_ended_fallback(self):
+        await self.agent._dispatch_event({
+            "type": "session.shell.started",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {
+                    "id": "sh_bg",
+                    "command": "npm run dev",
+                    "status": "running",
+                    "metadata": {"background": True},
+                },
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {"id": "sh_bg", "status": "exited", "exit": 0},
+                "output": {"output": "ready", "truncated": False},
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].content["command"], "npm run dev")
+        self.assertEqual(finished[0].content["output"], "ready")
+        self.assertFalse(finished[0].content["tool_key"])
+
+    async def test_v2_background_shell_registered_from_input_flag(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "name": "shell",
+                "input": {"command": "npm run dev", "background": True},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "metadata": {"shellID": "sh_bg"},
+            },
+        })
+
+        self.assertEqual(self.agent._background_shells.get("sh_bg"), "call_v2_bg")
+
+    async def test_v2_shell_finished_recovers_tool_key_from_cache(self):
+        await self._start_background_shell()
+        # Simulate a lost tool-success registration (or event ordering).
+        self.agent._background_shells.clear()
+
+        await self.agent._dispatch_event({
+            "type": "session.synthetic",
+            "data": {
+                "sessionID": "ses_v2",
+                "text": '<shell id="sh_bg" state="completed">\nready\n</shell>',
+                "description": "npm run dev",
+                "metadata": {"source": "shell", "shellID": "sh_bg", "exit": 0},
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].content["tool_key"], "call_v2_bg")
+
     async def test_v2_tool_failed(self):
         await self.agent._dispatch_event({
             "type": "session.tool.called",
