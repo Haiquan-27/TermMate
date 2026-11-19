@@ -680,6 +680,14 @@ class AntigravityAgent(BaseAgent):
                     or tool_info.get("error")
                 )
 
+                state_norm = str(state or "").upper()
+                if state_norm == "ACTIVE":
+                    status = "running"
+                elif error:
+                    status = "failed"
+                else:
+                    status = "completed"
+
                 messages.append(
                     Message(
                         "tool_use",
@@ -691,6 +699,7 @@ class AntigravityAgent(BaseAgent):
                             "error": error,
                             "tool_info": tool_info,
                             "state": state,
+                            "status": status,
                         },
                         msg_id=msg_id,
                         raw_data=step_update,

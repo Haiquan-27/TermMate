@@ -124,7 +124,7 @@ class TestOpenCodeAgentEvents(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(await self._messages(), [])
 
-    async def test_tool_is_emitted_only_once_at_terminal_state(self):
+    async def test_tool_is_emitted_once_at_terminal_state(self):
         base_part = {
             "id": "tool_1",
             "sessionID": "ses_test",
@@ -147,9 +147,13 @@ class TestOpenCodeAgentEvents(unittest.IsolatedAsyncioTestCase):
 
         messages = await self._messages()
         tools = [message for message in messages if message.type == "tool_use"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].content["status"], "completed")
-        self.assertEqual(tools[0].content["command"], "pwd")
+        # Running is surfaced once. Both events share the part id so the view
+        # updates one row, and a repeated completed event is ignored.
+        self.assertEqual(len(tools), 2)
+        self.assertEqual([t.id for t in tools], ["tool_1", "tool_1"])
+        self.assertEqual(tools[0].content["status"], "running")
+        self.assertEqual(tools[1].content["status"], "completed")
+        self.assertEqual(tools[1].content["command"], "pwd")
 
     async def test_plan_text_is_flushed_when_session_becomes_idle(self):
         self.agent._turn_plan_mode = True
@@ -717,11 +721,14 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
 
         messages = await self._messages()
         tools = [m for m in messages if m.type == "tool_use"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].content["name"], "command_execution")
+        self.assertEqual(len(tools), 2)
+        self.assertEqual([t.id for t in tools], ["call_v2_1", "call_v2_1"])
+        self.assertEqual(tools[0].content["status"], "running")
         self.assertEqual(tools[0].content["command"], "ls -la")
-        self.assertEqual(tools[0].content["output"], "file1.txt\nfile2.txt")
-        self.assertEqual(tools[0].content["status"], "completed")
+        self.assertEqual(tools[1].content["name"], "command_execution")
+        self.assertEqual(tools[1].content["command"], "ls -la")
+        self.assertEqual(tools[1].content["output"], "file1.txt\nfile2.txt")
+        self.assertEqual(tools[1].content["status"], "completed")
 
     async def test_v2_tool_lifecycle_input_started_and_patch(self):
         # Realistic OpenCode v2 flow: name is in input.started, not in called or success
@@ -799,10 +806,95 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
 
         messages = await self._messages()
         tools = [m for m in messages if m.type == "tool_use"]
-        self.assertEqual(len(tools), 1)
-        self.assertEqual(tools[0].content["name"], "command_execution")
-        self.assertEqual(tools[0].content["command"], "git diff")
-        self.assertEqual(tools[0].content["output"], "diff output")
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(tools[0].content["status"], "running")
+        self.assertEqual(tools[1].content["name"], "command_execution")
+        self.assertEqual(tools[1].content["command"], "git diff")
+        self.assertEqual(tools[1].content["output"], "diff output")
+
+    async def test_v2_non_command_tool_has_no_running_row(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_read",
+                "name": "read",
+                "input": {"path": "a.py"},
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.type for m in messages], [])
+
+    async def test_v2_background_shell_resolved_by_shell_exited(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "name": "shell",
+                "input": {"command": "npm run dev", "background": True},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "metadata": {"status": "running", "shellID": "sh_bg"},
+            },
+        })
+
+        messages = await self._messages()
+        tools = [m for m in messages if m.type == "tool_use"]
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(tools[1].content["status"], "completed")
+        self.assertEqual(
+            tools[1].content["metadata"], {"status": "running", "shellID": "sh_bg"})
+        # The view turns this into "running in background".
+        self.assertEqual(self.agent._background_shells.get("sh_bg"), "call_v2_bg")
+
+        await self.agent._dispatch_event({
+            "type": "shell.exited",
+            "data": {"id": "sh_bg", "status": "exited", "exit": 0},
+        })
+
+        messages = await self._messages()
+        exited = [m for m in messages if m.type == "tool_use"]
+        self.assertEqual(len(exited), 1)
+        self.assertEqual(exited[0].id, "call_v2_bg")
+        self.assertEqual(exited[0].content["name"], "command_execution")
+        self.assertEqual(exited[0].content["command"], "npm run dev")
+        self.assertEqual(exited[0].content["status"], "completed")
+        self.assertNotIn("sh_bg", self.agent._background_shells)
+
+    async def test_v2_background_shell_killed_is_failed(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "name": "shell",
+                "input": {"command": "npm run dev"},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "metadata": {"status": "running", "shellID": "sh_bg"},
+            },
+        })
+        await self._messages()
+        await self.agent._dispatch_event({
+            "type": "shell.exited",
+            "data": {"id": "sh_bg", "status": "killed", "exit": None},
+        })
+
+        messages = await self._messages()
+        exited = [m for m in messages if m.type == "tool_use"]
+        self.assertEqual(exited[0].content["status"], "failed")
 
     async def test_v2_tool_failed(self):
         await self.agent._dispatch_event({

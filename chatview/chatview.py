@@ -3159,16 +3159,22 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
 
     def run(self, edit, text="", html_tables=None, is_tool=False, tool_phantoms=None):
         follow = self._should_follow()
+        tool_phantoms = tool_phantoms or []
 
-        # A phantom-only tool call still needs its own line to anchor on.
-        if not text and tool_phantoms:
+        # A new phantom-only tool call still needs its own line to anchor on;
+        # an update of an existing row must not insert anything.
+        needs_line = any(not item.get("update") for item in tool_phantoms)
+        if not text and needs_line:
             text = "\n"
 
         insert_at = get_input_start(self.view, 0) - 1
-        inserted = self.view.insert(edit, insert_at, text)
-        # The anchor region shifts with the insert; re-set to keep the
-        # settings value in sync (and re-anchor if the anchor was missing).
-        set_input_start(self.view, insert_at + inserted + 1)
+        if text:
+            inserted = self.view.insert(edit, insert_at, text)
+            # The anchor region shifts with the insert; re-set to keep the
+            # settings value in sync (and re-anchor if the anchor was missing).
+            set_input_start(self.view, insert_at + inserted + 1)
+        else:
+            inserted = 0
         session = chatview_sessions.get(self.view.id())
         if html_tables and session:
             for table in html_tables:
@@ -3205,7 +3211,13 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                     if not command.get("detail"):
                         continue
                     session.tool_outputs.add_tool_call(
-                        anchor, command, item.get("output"))
+                        anchor,
+                        command,
+                        item.get("output"),
+                        key=item.get("key"),
+                        status=item.get("status"),
+                        edit=edit,
+                    )
                 else:
                     detail = item.get("detail")
                     if not detail:

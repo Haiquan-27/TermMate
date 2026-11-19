@@ -610,7 +610,7 @@ class TestCodexTwoTurns(unittest.IsolatedAsyncioTestCase):
                 await agent.disconnect()
 
     async def test_command_execution_handling(self):
-        """Verify that command execution extracts clean command and avoids duplication."""
+        """Verify the running and completed events share one row key."""
         fake_proc = FakeProcess()
         opts = AgentOptions(cli_path="/usr/bin/true")
         agent = CodexAgent(options=opts)
@@ -650,7 +650,9 @@ class TestCodexTwoTurns(unittest.IsolatedAsyncioTestCase):
                                 "type": "commandExecution",
                                 "id": "cmd-1",
                                 "command": "/bin/zsh -lc 'ls'",
-                                "status": "completed"
+                                "status": "completed",
+                                "aggregatedOutput": "a\nb",
+                                "exitCode": 0
                             }
                         }
                     })
@@ -666,12 +668,23 @@ class TestCodexTwoTurns(unittest.IsolatedAsyncioTestCase):
                 # Filter for TOOL_USE messages
                 tool_use_msgs = [m for m in messages if getattr(m, "type", None) == MessageType.TOOL_USE.value]
 
-                # Should only have ONE ToolUse message for the command
-                self.assertEqual(len(tool_use_msgs), 1, "Should only have one TOOL_USE message for commandExecution")
+                # Started and completed both report the same item so the view
+                # can replay running -> finished on a single phantom row.
+                self.assertEqual(len(tool_use_msgs), 2)
+                self.assertEqual(
+                    [m.id for m in tool_use_msgs], ["cmd-1", "cmd-1"])
+
+                running, completed = tool_use_msgs
+                self.assertEqual(running.content["status"], "running")
+                self.assertNotIn("output", running.content)
+                self.assertEqual(completed.content["status"], "completed")
+                self.assertEqual(completed.content["output"], "a\nb")
+                self.assertEqual(completed.content["exitCode"], 0)
 
                 # The command should be the clean one from commandActions
-                self.assertEqual(tool_use_msgs[0].content["command"], "ls")
-                self.assertEqual(tool_use_msgs[0].content["name"], "command_execution")
+                for msg in tool_use_msgs:
+                    self.assertEqual(msg.content["command"], "ls")
+                    self.assertEqual(msg.content["name"], "command_execution")
 
             finally:
                 await agent.disconnect()

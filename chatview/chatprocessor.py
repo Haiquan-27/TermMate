@@ -242,6 +242,32 @@ _REASONING_EFFORT_DESCRIPTIONS = {
 }
 
 
+_TOOL_RUNNING_STATES = frozenset(
+    ("running", "in_progress", "inprogress", "pending", "active", "started")
+)
+
+
+def _tool_call_phase(block):
+    """Return ``"running"`` / ``"background"`` for unfinished calls, else ``None``.
+
+    OpenCode reports a tool that was moved to the background as ``completed``
+    while its shell keeps running: the tool state says ``completed`` but its
+    metadata still says ``status: running`` and carries a ``shellID``.
+    """
+    status = str(block.get("status") or "").strip().lower()
+    metadata = block.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    meta_status = str(metadata.get("status") or "").strip().lower()
+    shell_id = metadata.get("shellID") or metadata.get("shell_id")
+    if status in _TOOL_RUNNING_STATES:
+        return "running"
+    if status in ("completed", "success", "succeeded", ""):
+        if meta_status in _TOOL_RUNNING_STATES and (shell_id or meta_status == "running"):
+            return "background"
+    return None
+
+
 def _tool_result_status(block):
     """Return ``"success"`` or ``"failed"`` for a finished tool result."""
     status = str(block.get("status") or "").strip().lower()
@@ -418,6 +444,10 @@ class BaseChatMessageProcessor:
                 return
             if message.type == "turn_started":
                 self._ends_with_newline = True
+            if message.type in ("stop", "result"):
+                outputs = getattr(self.session, "tool_outputs", None)
+                if outputs is not None:
+                    outputs.finish_running()
             self._handle_typed_message(message)
 
     def _handle_typed_message(self, message):
@@ -543,7 +573,7 @@ class BaseChatMessageProcessor:
             first = f"{first} …"
         return first or "…"
 
-    def format_tool_call(self, block):
+    def format_tool_call(self, block, key=None):
         """Return ``(text, phantoms)`` for one tool call.
 
         ``text`` is the buffer text to append (empty when the call is
@@ -553,23 +583,26 @@ class BaseChatMessageProcessor:
             {"line": int, "kind": "output",
              "summary": str, "detail": str}
 
-            {"line": int, "kind": "tool_call",
+            {"line": int, "kind": "tool_call", "key": str | None,
+             "status": "running" | "background" | None,
              "command": {"heading", "summary", "detail"},
              "output": {"summary", "detail"} | None}
 
         ``line`` is a row offset inside ``text``; ``-1`` anchors the row on
         the line preceding the appended text. Command calls use a single
         composite phantom so the command row and the output row can never
-        swap places.
+        swap places. A repeated ``key`` updates that phantom in place.
         """
         if not isinstance(block, dict):
             return "", []
 
         command = self._command_text(block)
         if command is not None:
+            phase = _tool_call_phase(block)
             call = {
                 "line": -1,
                 "kind": "tool_call",
+                "key": key,
                 "command": {
                     "heading": self._command_heading(block),
                     "summary": self._command_preview(command),
@@ -577,10 +610,21 @@ class BaseChatMessageProcessor:
                 },
                 "output": None,
             }
-            _, summary, detail = self.format_tool_result(
-                block, force_collapse=True)
-            if detail:
-                call["output"] = {"summary": summary, "detail": detail}
+            if phase:
+                call["status"] = phase
+            else:
+                _, summary, detail = self.format_tool_result(
+                    block, force_collapse=True)
+                if detail:
+                    call["output"] = {"summary": summary, "detail": detail}
+                elif any(k in block for k in ("output", "error", "exitCode")):
+                    # A finished command that printed nothing still needs a
+                    # row: otherwise "running…" would simply vanish when it
+                    # completes.
+                    call["output"] = {
+                        "summary": f"0 lines {_tool_result_status(block)}",
+                        "detail": "",
+                    }
             return "", [call]
 
         text = self._format_tool_block(block)
@@ -620,6 +664,35 @@ class BaseChatMessageProcessor:
         if not self._ends_with_newline:
             self.append_content("\n")
             self._ends_with_newline = True
+
+    def has_tool_call(self, key):
+        """Return True when a phantom row was already rendered for ``key``."""
+        outputs = getattr(self.session, "tool_outputs", None)
+        return bool(key and outputs and outputs.find(key) is not None)
+
+    def append_tool_call(self, block, key=None):
+        """Append one tool call, or update its existing phantom row.
+
+        A repeated ``key`` means the same tool was reported again (for
+        example ``running`` followed by ``completed``). Updating keeps the
+        row's position and, when the row is expanded, refreshes the visible
+        ``Command`` / ``Return`` blocks.
+        """
+        is_update = self.has_tool_call(key)
+        rendered, phantoms = self.format_tool_call(block, key=key)
+        if is_update and phantoms:
+            for item in phantoms:
+                item["update"] = True
+            self.append_content("", is_tool=True, tool_phantoms=phantoms)
+            return
+        if not self.last_is_tool_call:
+            self.append_content("\n", is_tool=True)
+        self.last_is_tool_call = True
+        self.append_content(
+            (rendered + "\n") if rendered else "",
+            is_tool=True,
+            tool_phantoms=phantoms or None,
+        )
 
     def append_error(self, error_msg):
         """Append error message to chat view."""
@@ -1006,14 +1079,9 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
 
         elif message.type == "tool_use":
             self.session.start_loading()
-            if not self.last_is_tool_call:
-                self.append_content("\n", is_tool=True)
-            self.last_is_tool_call = True
-            rendered, phantoms = self.format_tool_call(message.content)
-            self.append_content(
-                (rendered + "\n") if rendered else "",
-                is_tool=True,
-                tool_phantoms=phantoms or None,
+            self.append_tool_call(
+                message.content,
+                key=getattr(message, "msg_id", None),
             )
             if message.content.get("name") == "fileChange":
                 self._record_file_changes(message.content)
@@ -1545,16 +1613,10 @@ class PiMessageProcessor(BaseChatMessageProcessor):
 
                             # defer to toolResult
                         else:
-                            if not self.last_is_tool_call:
-                                self.append_content("\n", is_tool=True)
-                            self.last_is_tool_call = True
-                            content, phantoms = self.format_tool_call(block)
-                            if content or phantoms:
-                                self.append_content(
-                                    (content + "\n") if content else "",
-                                    is_tool=True,
-                                    tool_phantoms=phantoms or None,
-                                )
+                            self.append_tool_call(
+                                block,
+                                key=block.get("id") or getattr(message, "msg_id", None),
+                            )
 
         elif message.type == "system":
             if hasattr(message, "content") and isinstance(message.content, dict):
@@ -1976,6 +2038,18 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
             if state == "ACTIVE":
                 if tool_id and content_data.get("parameters"):
                     self._pending_tool_params[tool_id] = content_data["parameters"]
+                # Only command-like calls get a running row, and only when the
+                # id is stable. Falling back to the turn id would merge every
+                # command of the same turn into one row.
+                stable_id = content_data.get("id")
+                if (
+                    stable_id
+                    and stable_id != getattr(message, "msg_id", None)
+                    and content_data.get("status") == "running"
+                    and self._command_text(content_data)
+                ):
+                    self.session.start_loading()
+                    self.append_tool_call(content_data, key=str(stable_id))
                 return
 
             if tool_id and not content_data.get("parameters"):
@@ -1985,15 +2059,11 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
             elif tool_id:
                 self._pending_tool_params.pop(tool_id, None)
 
-            if not self.last_is_tool_call:
-                self.append_content("\n", is_tool=True)
-            self.last_is_tool_call = True
-            rendered, phantoms = self.format_tool_call(content_data)
-            self.append_content(
-                (rendered + "\n") if rendered else "",
-                is_tool=True,
-                tool_phantoms=phantoms or None,
-            )
+            call_key = content_data.get("id")
+            if not call_key or call_key == getattr(message, "msg_id", None):
+                call_key = None
+            self.append_tool_call(
+                content_data, key=str(call_key) if call_key else None)
 
             if self._is_user_artifact(content_data):
                 params = content_data.get("parameters") or {}

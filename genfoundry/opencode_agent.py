@@ -851,6 +851,8 @@ class OpenCodeAgent(BaseAgent):
         self._user_message_ids = set()
         self._awaiting_user_message_id = False
         self._terminal_tools = set()
+        self._running_tools = set()
+        self._background_shells: Dict[str, str] = {}
         self._tool_calls: Dict[str, Dict[str, Any]] = {}
         self._permission_sessions: Dict[str, str] = {}
         self._seen_permissions = set()
@@ -1492,7 +1494,14 @@ class OpenCodeAgent(BaseAgent):
         ):
             tool_id = str(properties.get("id") or "")
             if tool_id:
-                self._tool_calls.setdefault(tool_id, {}).update(properties)
+                cached = self._tool_calls.setdefault(tool_id, {})
+                cached.update(properties)
+                await self._emit_running_tool_v2(tool_id, cached)
+            return
+
+        # [v2] A shell process finished (foreground or background)
+        if event_type == "shell.exited":
+            await self._handle_shell_exited_v2(properties)
             return
 
         # [v2] Tool terminal completion (success)
@@ -1703,12 +1712,32 @@ class OpenCodeAgent(BaseAgent):
             state = part.get("state", {})
             if not isinstance(state, dict):
                 return
-            status = state.get("status")
-            # Running and pending tool states are intentionally not surfaced.
+            status = str(state.get("status") or "").lower()
+            if status in ("running", "pending"):
+                await self._emit_running_tool_v1(part_id, part, state)
+                return
             if status not in ("completed", "error") or part_id in self._terminal_tools:
                 return
             self._terminal_tools.add(part_id)
             await self._emit_completed_tool(part, state)
+
+    async def _emit_running_tool_v1(
+        self, part_id: str, part: Dict[str, Any], state: Dict[str, Any]
+    ) -> None:
+        """[OpenCode v1] Surface a command that is still running."""
+        if part_id in self._running_tools or part_id in self._terminal_tools:
+            return
+        raw_name = str(part.get("tool") or "tool")
+        content = _tool_content_from_state(
+            raw_name, {**state, "status": "running"})
+        if content.get("name") != "command_execution":
+            return
+        if not content.get("command"):
+            return
+        self._running_tools.add(part_id)
+        await self._message_queue.put(Message(
+            MessageType.TOOL_USE.value, content=content, msg_id=part_id
+        ))
 
     async def _emit_text_delta(self, delta: str, msg_id: Optional[str]) -> None:
         if not delta:
@@ -1728,6 +1757,64 @@ class OpenCodeAgent(BaseAgent):
         content = _tool_content_from_state(raw_name, state)
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=part.get("id")
+        ))
+
+    async def _emit_running_tool_v2(
+        self, tool_id: str, cached: Dict[str, Any]
+    ) -> None:
+        """[OpenCode v2] Emit a running command row once, as soon as it is known."""
+        if tool_id in self._running_tools or tool_id in self._terminal_tools:
+            return
+        raw_name = str(cached.get("name") or cached.get("tool") or "tool")
+        input_data = cached.get("input")
+        if not isinstance(input_data, dict) or not input_data:
+            return
+        content = _tool_content_from_state(
+            raw_name, {"input": input_data, "status": "running"})
+        if content.get("name") != "command_execution":
+            return
+        if not content.get("command"):
+            return
+        self._running_tools.add(tool_id)
+        await self._message_queue.put(Message(
+            MessageType.TOOL_USE.value, content=content, msg_id=tool_id
+        ))
+
+    async def _handle_shell_exited_v2(self, properties: Dict[str, Any]) -> None:
+        """[OpenCode v2] Close the row of a command that ran in the background."""
+        shell_id = str(properties.get("id") or "")
+        if not shell_id:
+            return
+        tool_id = self._background_shells.pop(shell_id, None)
+        if tool_id is None:
+            return
+        cached = self._tool_calls.get(tool_id, {})
+        input_data = cached.get("input")
+        if not isinstance(input_data, dict):
+            input_data = {}
+        command = input_data.get("command") or input_data.get("cmd")
+        if not command:
+            return
+        status = str(properties.get("status") or "").lower()
+        exit_code = properties.get("exit")
+        if status == "killed":
+            result = "failed"
+        else:
+            try:
+                result = "completed" if int(exit_code or 0) == 0 else "failed"
+            except (TypeError, ValueError):
+                result = "completed"
+        await self._message_queue.put(Message(
+            MessageType.TOOL_USE.value,
+            content={
+                "name": "command_execution",
+                "command": command,
+                "output": "",
+                "status": result,
+                "exitCode": exit_code,
+                "metadata": {"shellID": shell_id, "status": result},
+            },
+            msg_id=tool_id,
         ))
 
     async def _handle_tool_terminal_v2(
@@ -1761,6 +1848,11 @@ class OpenCodeAgent(BaseAgent):
             },
             "status": status,
         }
+        metadata = state["metadata"]
+        shell_id = metadata.get("shellID")
+        if shell_id and str(metadata.get("status") or "").lower() == "running":
+            # Backgrounded command: the tool returned, the shell keeps going.
+            self._background_shells[str(shell_id)] = tool_id
         content = _tool_content_from_state(raw_name, state)
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=tool_id
@@ -2874,6 +2966,9 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
     error_text = _error_text_value(error_data) if error_data else None
 
     if normalized in ("bash", "shell", "command"):
+        exit_code = metadata.get("exit")
+        if exit_code is None:
+            exit_code = metadata.get("exit_code", metadata.get("exitCode"))
         return {
             "name": "command_execution",
             "command": (
@@ -2883,6 +2978,8 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
             ),
             "output": output_text or error_text,
             "status": status,
+            "metadata": metadata,
+            "exitCode": exit_code,
         }
     return {
         "name": raw_name,

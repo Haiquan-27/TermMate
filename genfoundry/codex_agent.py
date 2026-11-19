@@ -176,6 +176,10 @@ class CodexAgent(BaseAgent):
         self._pending_approvals: Dict[str, asyncio.Future] = {}
         # Cache item data from item/started, keyed by itemId
         self._item_cache: Dict[str, Dict[str, Any]] = {}
+        # Clean command text of a running command item, keyed by itemId.
+        # The completed item may omit commandActions, and the row must not
+        # change its command text when the run finishes.
+        self._command_calls: Dict[str, str] = {}
         # Plan mode: mutable at runtime (separate from options.plan_mode snapshot)
         self.plan_mode: bool = self.options.plan_mode
         # Accumulates item/plan/delta content in plan mode
@@ -981,22 +985,29 @@ class CodexAgent(BaseAgent):
                 self._subagent_thread_ids.add(agent_t_id)
 
         if item_type == "commandExecution":
-            # Extract cleaner command from commandActions if available
-            command = item.get("command")
-            actions = item.get("commandActions", [])
-            if actions and isinstance(actions, list) and actions[0].get("command"):
-                command = actions[0].get("command")
+            command = self._clean_command(item)
+            if item_id and command:
+                self._command_calls[item_id] = command
 
             tool_msg = Message(
                 MessageType.TOOL_USE.value,
                 content={
                     "name": "command_execution",
                     "command": command,
-                    "status": "in_progress",
+                    "status": "running",
                 },
-                msg_id=item.get("id"),
+                msg_id=item_id,
             )
             await self._message_queue.put(tool_msg)
+
+    @staticmethod
+    def _clean_command(item: Dict[str, Any]) -> Optional[str]:
+        """Prefer the shell-free command from commandActions when present."""
+        command = item.get("command")
+        actions = item.get("commandActions")
+        if actions and isinstance(actions, list) and actions[0].get("command"):
+            command = actions[0].get("command")
+        return command
 
     async def _handle_item_completed(self, params: Dict[str, Any]) -> None:
         item = params.get("item", {})
@@ -1010,12 +1021,26 @@ class CodexAgent(BaseAgent):
                 await self._message_queue.put(msg)
 
         elif item_type == "commandExecution":
-            # Just mark as completed if we want to update UI state,
-            # but we've already displayed the command in _handle_item_started.
-            # BaseAgent/ChatView might expect a message to know it's done.
-            # However, ChatView doesn't seem to have a special handler for command result yet.
-            # To avoid "duplication" reported by user, we skip sending another TOOL_USE here.
-            pass
+            # Same id as the started item, so the chat view updates the
+            # existing phantom row instead of appending a second one.
+            item_id = item.get("id")
+            command = self._clean_command(item)
+            if not item.get("commandActions") and item_id:
+                command = self._command_calls.pop(item_id, command)
+            status = item.get("status")
+            if status == "declined":
+                status = "failed"
+            await self._message_queue.put(Message(
+                MessageType.TOOL_USE.value,
+                content={
+                    "name": "command_execution",
+                    "command": command,
+                    "output": item.get("aggregatedOutput") or "",
+                    "exitCode": item.get("exitCode"),
+                    "status": status,
+                },
+                msg_id=item_id,
+            ))
 
         elif item_type == "fileChange":
             changes = item.get("changes", [])
