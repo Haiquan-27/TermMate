@@ -7,13 +7,24 @@ single phantom row is anchored below the tool header:
     ⎿ 42 lines success                            [show]
 
 Command tool calls (``command_execution`` / ``run_command``) are phantom-only:
-the command text never enters the buffer while collapsed.
+the command text never enters the buffer while collapsed. A single ``show``
+button reveals both blocks:
 
-    ⏺ command (npm test -- --watch …)             [show]
+    ⏺ command (npm test -- --watch …)
     ⎿ 42 lines success                            [show]
 
-Clicking ``show`` inserts the full text as a fenced code block right after the
-anchor line (and toggles the link to ``hide``).
+    Command
+    ```bash
+    npm test -- --watch
+    ```
+
+    Return
+    ```text
+    ...
+    ```
+
+Clicking ``show`` inserts both blocks right after the anchor line and toggles
+the link to ``hide``.
 """
 
 import html
@@ -92,8 +103,7 @@ class ToolOutputManager:
                 "detail": command["detail"],
             },
             "output": None,
-            "show_command": False,
-            "show_output": False,
+            "expanded": False,
         }
         if output and output.get("detail"):
             entry["output"] = {
@@ -107,14 +117,14 @@ class ToolOutputManager:
     def toggle(self, edit, key, section=None):
         """Expand or collapse the row identified by ``key``.
 
-        ``section`` selects a half of a composite command tool call
-        (``"command"`` or ``"output"``); it is ignored by output rows.
+        ``section`` is accepted for compatibility with older phantom links;
+        composite command calls share a single show/hide state.
         """
         entry = self._find(key)
         if entry is None:
             return
         if entry["kind"] == "tool_call":
-            self._toggle_tool_call(edit, entry, section)
+            self._toggle_tool_call(edit, entry)
             return
         if entry["expanded"]:
             self._collapse(edit, entry)
@@ -130,11 +140,7 @@ class ToolOutputManager:
             if regions and regions[0].begin() < cut_point:
                 detail = self.view.get_regions(entry["detail_key"])
                 if detail and detail[0].end() <= cut_point:
-                    if entry["kind"] == "tool_call":
-                        entry["show_command"] = False
-                        entry["show_output"] = False
-                    else:
-                        entry["expanded"] = False
+                    entry["expanded"] = False
                 kept.append(entry)
             else:
                 self.view.erase_regions(entry["region_key"])
@@ -194,32 +200,29 @@ class ToolOutputManager:
         self.view.erase_regions(entry["detail_key"])
         entry["expanded"] = False
 
-    def _toggle_tool_call(self, edit, entry, section):
-        if section == "output":
-            if not entry.get("output"):
-                return
-            entry["show_output"] = not entry["show_output"]
-        elif section == "command":
-            entry["show_command"] = not entry["show_command"]
-        else:
-            field = "show_output" if entry.get("output") else "show_command"
-            entry[field] = not entry[field]
+    def _toggle_tool_call(self, edit, entry):
+        entry["expanded"] = not entry["expanded"]
         self._render_tool_call_detail(edit, entry)
         self._update()
 
     def _render_tool_call_detail(self, edit, entry):
         """Re-render the shared detail block for a composite tool call.
 
-        Both expanded fences live in one hidden region, in a fixed order
-        (command first, output second), so toggling either half never moves
-        the other. The region is erased and re-inserted at the same point.
+        The command and its output are inserted as one hidden region in a
+        fixed order, so the two rows can never swap or drift apart.
         """
-        blocks = []
-        if entry["show_command"]:
-            blocks.append(format_fenced_output(entry["command"]["detail"]))
-        if entry.get("output") and entry["show_output"]:
-            blocks.append(format_fenced_output(entry["output"]["detail"]))
-        text = "\n".join(block for block in blocks if block)
+        sections = []
+        if entry["expanded"]:
+            command_block = format_fenced_output(
+                entry["command"]["detail"], info="bash")
+            if command_block:
+                sections.append(f"Command\n{command_block}")
+            output = entry.get("output")
+            if output:
+                output_block = format_fenced_output(output["detail"])
+                if output_block:
+                    sections.append(f"Return\n{output_block}")
+        text = "\n".join(sections)
 
         old_regions = self.view.get_regions(entry["detail_key"])
         old = old_regions[0] if old_regions else None
@@ -289,21 +292,23 @@ class ToolOutputManager:
     def _tool_call_rows_html(self, entry):
         key = entry["key"]
         command = entry["command"]
-        command_label = "hide" if entry["show_command"] else "show"
+        label = "hide" if entry["expanded"] else "show"
+        output = entry.get("output")
+        command_links = ""
+        if not output:
+            command_links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
         rows = [
             "<div class='termmate-command-row'>"
             f"<span>{html.escape(command['heading'])} "
             f"({html.escape(command['summary'])})</span>"
-            f"&nbsp;&nbsp;<a href='toggle:{key}:command'>{command_label}</a>"
+            f"{command_links}"
             "</div>"
         ]
-        output = entry.get("output")
         if output:
-            output_label = "hide" if entry["show_output"] else "show"
             rows.append(
                 "<div class='termmate-tool-row'>"
                 f"<span>⎿ {html.escape(output['summary'])}</span>"
-                f"&nbsp;&nbsp;<a href='toggle:{key}:output'>{output_label}</a>"
+                f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
                 "</div>"
             )
         return "".join(rows)

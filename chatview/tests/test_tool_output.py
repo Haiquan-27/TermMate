@@ -253,11 +253,11 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("⎿ 8 lines", html)
         self.assertLess(
             html.index("termmate-command-row"), html.index("⎿ 8 lines"))
-        self.assertIn(f"toggle:{entry['key']}:command", html)
-        self.assertIn(f"toggle:{entry['key']}:output", html)
+        self.assertEqual(html.count("<a "), 1)
+        self.assertIn(f"toggle:{entry['key']}", html)
         self.assertNotIn("copy", html)
 
-    def test_tool_call_without_output_has_one_row(self):
+    def test_tool_call_without_output_keeps_show_on_command_row(self):
         entry = self.manager.add_tool_call(
             self.anchor,
             {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
@@ -265,47 +265,41 @@ class TestToolOutputManager(unittest.TestCase):
         html = self.manager._row_html(entry)
         self.assertIn("npm test", html)
         self.assertNotIn("⎿", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
         self.assertNotIn("copy", html)
 
-    def test_command_toggle_keeps_output_row_in_place(self):
+    def test_single_toggle_renders_command_and_return(self):
         entry = self.manager.add_tool_call(
             self.anchor,
             {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
             {"summary": "8 lines", "detail": "out line"},
         )
-        self.manager.toggle(None, entry["key"], "command")
-        self.assertTrue(entry["show_command"])
-        self.assertFalse(entry["show_output"])
-        self.assertIn("```text\nnpm test\n```", self.view.text)
-        html = self.manager._row_html(entry)
-        self.assertLess(
-            html.index("termmate-command-row"), html.index("⎿ 8 lines"))
-
-        self.manager.toggle(None, entry["key"], "command")
-        self.assertFalse(entry["show_command"])
-        self.assertEqual(self.view.text, "⏺ Bash ls\n\n")
-
-    def test_output_toggle_places_both_fences_in_fixed_order(self):
-        entry = self.manager.add_tool_call(
-            self.anchor,
-            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
-            {"summary": "8 lines", "detail": "out line"},
-        )
-        self.manager.toggle(None, entry["key"], "output")
-        self.assertTrue(entry["show_output"])
-        self.assertIn("```text\nout line\n```", self.view.text)
-        self.assertNotIn("npm test", self.view.text)
-
-        self.manager.toggle(None, entry["key"], "command")
+        self.manager.toggle(None, entry["key"])
+        self.assertTrue(entry["expanded"])
         text = self.view.text
-        self.assertLess(text.index("npm test"), text.index("out line"))
+        command_block = "Command\n```bash\nnpm test\n```\n"
+        return_block = "Return\n```text\nout line\n```\n"
+        self.assertIn(command_block, text)
+        self.assertIn(return_block, text)
+        self.assertLess(text.index(command_block), text.index(return_block))
+        self.assertEqual(self.input_pos(), 10 + len(command_block) + 1 + len(return_block))
+        html = self.manager._row_html(entry)
+        self.assertIn(">hide<", html)
+        self.assertNotIn(">show<", html)
 
-        self.manager.toggle(None, entry["key"], "output")
-        self.assertFalse(entry["show_output"])
-        command_fence = "```text\nnpm test\n```\n"
-        self.assertIn(command_fence, self.view.text)
-        self.assertNotIn("out line", self.view.text)
-        self.assertEqual(self.input_pos(), 10 + len(command_fence))
+        self.manager.toggle(None, entry["key"])
+        self.assertFalse(entry["expanded"])
+        self.assertEqual(self.view.text, "⏺ Bash ls\n\n")
+        self.assertEqual(self.input_pos(), 10)
+
+    def test_toggle_without_output_renders_command_only(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+        )
+        self.manager.toggle(None, entry["key"])
+        self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
+        self.assertNotIn("Return", self.view.text)
 
     def test_truncate_drops_rows_at_or_after_cut_point(self):
         first = self.manager.add(sublime.Region(2, 2), "1 line", "a")
