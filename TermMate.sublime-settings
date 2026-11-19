@@ -66,6 +66,12 @@
     // Set to 0 to load the full conversation history.
     "session_history_limit": 50,
 
+    // Tool output at or below this many lines (and characters) is written
+    // directly into the transcript. Longer output is hidden behind a
+    // [show] button on a phantom row; click it to expand the full output.
+    "tool_output_inline_lines": 3,
+    "tool_output_inline_max_chars": 400,
+
     // Whether to display the agent and model status indicator in the status bar (e.g. "▣ claude(default)").
     "show_status_indicator": true,
 
