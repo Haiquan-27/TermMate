@@ -853,6 +853,8 @@ class OpenCodeAgent(BaseAgent):
         self._terminal_tools = set()
         self._running_tools = set()
         self._background_shells: Dict[str, str] = {}
+        self._shell_commands: Dict[str, str] = {}
+        self._finished_shells = set()
         self._tool_calls: Dict[str, Dict[str, Any]] = {}
         self._permission_sessions: Dict[str, str] = {}
         self._seen_permissions = set()
@@ -1504,6 +1506,26 @@ class OpenCodeAgent(BaseAgent):
             await self._handle_shell_exited_v2(properties)
             return
 
+        # [v2] Shell lifecycle.  ``started`` only records the command so the
+        # completion notice can name the shell even when the event omits it.
+        if event_type == "session.shell.started":
+            shell = properties.get("shell")
+            if isinstance(shell, dict):
+                shell_id = str(shell.get("id") or "")
+                command = str(shell.get("command") or "")
+                if shell_id and command:
+                    self._shell_commands[shell_id] = command
+            return
+        if event_type == "session.shell.ended":
+            await self._handle_shell_ended_v2(properties)
+            return
+
+        # [v2] Synthetic message; shell completions are surfaced as
+        # ``↳ Shell finished · <command>`` once the background job reports.
+        if event_type == "session.synthetic":
+            await self._handle_synthetic_v2(properties)
+            return
+
         # [v2] Tool terminal completion (success)
         if event_type == "session.tool.success":
             await self._handle_tool_terminal_v2(properties, "completed")
@@ -1785,7 +1807,7 @@ class OpenCodeAgent(BaseAgent):
         shell_id = str(properties.get("id") or "")
         if not shell_id:
             return
-        tool_id = self._background_shells.pop(shell_id, None)
+        tool_id = self._background_shells.get(shell_id)
         if tool_id is None:
             return
         cached = self._tool_calls.get(tool_id, {})
@@ -1815,6 +1837,89 @@ class OpenCodeAgent(BaseAgent):
                 "metadata": {"shellID": shell_id, "status": result},
             },
             msg_id=tool_id,
+        ))
+
+    async def _handle_synthetic_v2(self, properties: Dict[str, Any]) -> None:
+        """[OpenCode v2] Turn a shell completion notice into a chat line."""
+        metadata = properties.get("metadata")
+        if not isinstance(metadata, dict):
+            return
+        if str(metadata.get("source") or "").lower() != "shell":
+            return
+        shell_id = str(
+            metadata.get("shellID") or metadata.get("jobID") or "")
+        if not shell_id:
+            return
+        text = str(properties.get("text") or "")
+        command = str(properties.get("description") or "").strip()
+        if not command:
+            command = self._shell_commands.get(shell_id, "")
+        await self._emit_shell_finished_v2(
+            shell_id,
+            command,
+            _shell_synthetic_output(text),
+            str(metadata.get("state") or ""),
+            metadata.get("exit"),
+        )
+
+    async def _handle_shell_ended_v2(self, properties: Dict[str, Any]) -> None:
+        """[OpenCode v2] Fallback notice when no synthetic message follows."""
+        shell = properties.get("shell")
+        if not isinstance(shell, dict):
+            return
+        shell_id = str(shell.get("id") or "")
+        if not shell_id:
+            return
+        # Foreground tools already rendered their own result; only shells that
+        # outlived their tool call need a completion line.
+        if shell_id not in self._background_shells:
+            return
+        command = str(shell.get("command") or "").strip()
+        if not command:
+            command = self._shell_commands.get(shell_id, "")
+        output = properties.get("output")
+        if isinstance(output, dict):
+            # ``session.shell.ended`` wraps the captured output in a
+            # truncation envelope: {output, truncated, cursor, size}.
+            output = output.get("output")
+        output_text = _tool_output_text(output) or ""
+        await self._emit_shell_finished_v2(
+            shell_id,
+            command,
+            output_text,
+            str(shell.get("status") or ""),
+            shell.get("exit"),
+        )
+
+    async def _emit_shell_finished_v2(
+        self,
+        shell_id: str,
+        command: str,
+        output: str,
+        state: str,
+        exit_code: Any,
+    ) -> None:
+        if not command or shell_id in self._finished_shells:
+            return
+        self._finished_shells.add(shell_id)
+        lowered = state.strip().lower()
+        succeeded = lowered in ("exited", "completed", "success", "succeeded")
+        if exit_code is not None:
+            try:
+                succeeded = succeeded and int(exit_code) == 0
+            except (TypeError, ValueError):
+                succeeded = False
+        await self._message_queue.put(Message(
+            "shell_finished",
+            content={
+                "shell_id": shell_id,
+                "tool_key": self._background_shells.get(shell_id),
+                "command": command,
+                "output": output,
+                "state": state,
+                "exit": exit_code,
+                "failed": not succeeded,
+            },
         ))
 
     async def _handle_tool_terminal_v2(
@@ -2939,6 +3044,31 @@ def _tool_output_text(value: Any) -> Optional[str]:
     return str(value)
 
 
+def _shell_synthetic_output(text: str) -> str:
+    """Extract the output body from a ``<shell …>output</shell>`` notice."""
+    if not text:
+        return ""
+    end = text.rfind("</shell>")
+    if end <= 0:
+        return text
+    # Find the end of the opening tag, ignoring ``>`` inside quoted
+    # attributes (commands may contain redirections).
+    quote = None
+    start = -1
+    for index, char in enumerate(text[:end]):
+        if quote:
+            if char == quote:
+                quote = None
+        elif char in ("'", '"'):
+            quote = char
+        elif char == ">":
+            start = index
+            break
+    if start < 0:
+        return text
+    return text[start + 1:end].lstrip("\r\n").rstrip()
+
+
 def _tool_content_from_state(raw_name: str, state: dict) -> dict:
     """Build the TOOL_USE content dict shared by live events and history replay.
 
@@ -2969,7 +3099,7 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
         exit_code = metadata.get("exit")
         if exit_code is None:
             exit_code = metadata.get("exit_code", metadata.get("exitCode"))
-        return {
+        content = {
             "name": "command_execution",
             "command": (
                 input_data.get("command")
@@ -2981,6 +3111,12 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
             "metadata": metadata,
             "exitCode": exit_code,
         }
+        if input_data.get("background") and str(status or "").strip().lower() in (
+                "running", "pending", "in_progress", "inprogress", "active", "started"):
+            # Keep the row in the background state instead of letting turn
+            # teardown mark it interrupted.
+            content["background"] = True
+        return content
     return {
         "name": raw_name,
         "input": input_data,
@@ -3131,6 +3267,34 @@ def get_opencode_session_info(
                 elif role == "assistant" and current is not None:
                     # Assistant message without text (tool-only): still replay tools.
                     _append_assistant_events(current, entry)
+                elif role == "synthetic" and current is not None:
+                    info = entry.get("info")
+                    if not isinstance(info, dict):
+                        info = {}
+                    metadata = entry.get("metadata")
+                    if not isinstance(metadata, dict):
+                        metadata = info.get("metadata") or {}
+                    if (isinstance(metadata, dict)
+                            and str(metadata.get("source") or "") == "shell"):
+                        state = str(metadata.get("state") or "").strip().lower()
+                        exit_code = metadata.get("exit")
+                        failed = state not in (
+                            "", "exited", "completed", "success", "succeeded")
+                        if exit_code is not None:
+                            try:
+                                failed = failed or int(exit_code) != 0
+                            except (TypeError, ValueError):
+                                failed = True
+                        current["events"].append({
+                            "kind": "shell",
+                            "command": str(
+                                entry.get("description")
+                                or info.get("description") or ""),
+                            "output": _shell_synthetic_output(
+                                str(entry.get("text")
+                                    or info.get("text") or "")),
+                            "failed": failed,
+                        })
 
             if current is not None:
                 turns.append(current)

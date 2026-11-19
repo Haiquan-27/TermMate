@@ -10,6 +10,7 @@ from genfoundry.base_agent import AgentOptions
 from genfoundry.opencode_agent import (
     OpenCodeAgent,
     OpenCodeHTTPError,
+    _shell_synthetic_output,
     detect_opencode_version,
     detect_opencode_version_info,
     find_opencode_cli,
@@ -20,6 +21,25 @@ from genfoundry.opencode_agent import (
     parse_opencode_version_output,
     probe_opencode_service,
 )
+
+
+class TestShellSyntheticOutput(unittest.TestCase):
+    def test_extracts_body_and_strips_framing_newlines(self):
+        text = (
+            '<shell id="sh_1" state="completed" command="npm run dev">\n'
+            "server ready\r\n\n</shell>"
+        )
+        self.assertEqual(_shell_synthetic_output(text), "server ready")
+
+    def test_ignores_redirection_inside_command_attribute(self):
+        text = (
+            '<shell id="sh_1" command="echo done > out.txt">\n'
+            "done\n</shell>"
+        )
+        self.assertEqual(_shell_synthetic_output(text), "done")
+
+    def test_non_shell_text_is_returned_unchanged(self):
+        self.assertEqual(_shell_synthetic_output("plain"), "plain")
 
 
 class TestFindOpenCodeCLI(unittest.TestCase):
@@ -848,6 +868,7 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         messages = await self._messages()
         tools = [m for m in messages if m.type == "tool_use"]
         self.assertEqual(len(tools), 2)
+        self.assertTrue(tools[0].content.get("background"))
         self.assertEqual(tools[1].content["status"], "completed")
         self.assertEqual(
             tools[1].content["metadata"], {"status": "running", "shellID": "sh_bg"})
@@ -866,7 +887,8 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exited[0].content["name"], "command_execution")
         self.assertEqual(exited[0].content["command"], "npm run dev")
         self.assertEqual(exited[0].content["status"], "completed")
-        self.assertNotIn("sh_bg", self.agent._background_shells)
+        # The mapping is kept so a later synthetic notice can still update it.
+        self.assertEqual(self.agent._background_shells.get("sh_bg"), "call_v2_bg")
 
     async def test_v2_background_shell_killed_is_failed(self):
         await self.agent._dispatch_event({
@@ -895,6 +917,177 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         messages = await self._messages()
         exited = [m for m in messages if m.type == "tool_use"]
         self.assertEqual(exited[0].content["status"], "failed")
+
+    async def _start_background_shell(self):
+        """Feed the events that precede a background shell completion."""
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "name": "shell",
+                "input": {"command": "npm run dev", "background": True},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_bg",
+                "metadata": {"status": "running", "shellID": "sh_bg"},
+            },
+        })
+        await self._messages()
+
+    async def test_v2_synthetic_shell_notice_emits_shell_finished(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.synthetic",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "msg_syn",
+                "text": (
+                    '<shell id="sh_bg" state="completed" '
+                    'command="npm run dev">\nserver ready\r\n\n</shell>'
+                ),
+                "description": "npm run dev",
+                "metadata": {
+                    "source": "shell",
+                    "shellID": "sh_bg",
+                    "state": "completed",
+                    "exit": 0,
+                },
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        content = finished[0].content
+        self.assertEqual(content["tool_key"], "call_v2_bg")
+        self.assertEqual(content["command"], "npm run dev")
+        self.assertEqual(content["output"], "server ready")
+        self.assertFalse(content["failed"])
+
+    async def test_v2_synthetic_non_shell_message_is_ignored(self):
+        await self.agent._dispatch_event({
+            "type": "session.synthetic",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "msg_syn",
+                "text": "embedded context",
+                "description": "ACP embedded context",
+                "metadata": {"source": "acp"},
+            },
+        })
+
+        self.assertEqual(
+            [m for m in await self._messages() if m.type == "shell_finished"], [])
+
+    async def test_v2_shell_ended_is_a_fallback_and_deduped(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {
+                    "id": "sh_bg",
+                    "command": "npm run dev",
+                    "status": "exited",
+                    "exit": 0,
+                },
+                "output": {"output": "server ready", "truncated": False,
+                           "cursor": 12, "size": 12},
+            },
+        })
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].content["output"], "server ready")
+        self.assertFalse(finished[0].content["failed"])
+
+        # The synthetic notice for the same shell must not add a second line.
+        await self.agent._dispatch_event({
+            "type": "session.synthetic",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "msg_syn",
+                "text": '<shell id="sh_bg" state="completed">\nserver ready\n</shell>',
+                "description": "npm run dev",
+                "metadata": {"source": "shell", "shellID": "sh_bg", "exit": 0},
+            },
+        })
+        messages = await self._messages()
+        self.assertEqual(
+            [m for m in messages if m.type == "shell_finished"], [])
+
+    async def test_v2_shell_ended_ignores_foreground_shells(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "call_v2_fg",
+                "name": "shell",
+                "input": {"command": "git status"},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {"id": "sh_fg", "command": "git status", "status": "exited"},
+                "output": "clean",
+            },
+        })
+
+        self.assertEqual(
+            [m for m in await self._messages() if m.type == "shell_finished"], [])
+
+    async def test_v2_shell_ended_failure_is_marked(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {
+                    "id": "sh_bg",
+                    "command": "npm run dev",
+                    "status": "exited",
+                    "exit": 1,
+                },
+                "output": "boom",
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertTrue(finished[0].content["failed"])
+
+    async def test_v2_shell_started_records_command_for_notice(self):
+        await self._start_background_shell()
+        await self.agent._dispatch_event({
+            "type": "session.shell.started",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {"id": "sh_bg", "command": "npm run dev"},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {"id": "sh_bg", "status": "exited", "exit": 0},
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].content["command"], "npm run dev")
 
     async def test_v2_tool_failed(self):
         await self.agent._dispatch_event({
