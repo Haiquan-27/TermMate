@@ -301,6 +301,103 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
         self.assertNotIn("Return", self.view.text)
 
+    def test_running_tool_call_shows_status_row(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            key="tool-1",
+            status="running",
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn("⎿ running…", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+        self.assertEqual(html.count("<a "), 1)
+
+    def test_background_tool_call_shows_background_label(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm run dev", "detail": "npm run dev"},
+            key="tool-1",
+            status="background",
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn("⎿ running in background", html)
+
+    def test_update_by_key_replaces_running_with_result(self):
+        command = {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"}
+        entry = self.manager.add_tool_call(
+            self.anchor, command, key="tool-1", status="running")
+        same = self.manager.add_tool_call(
+            self.anchor,
+            command,
+            {"summary": "2 lines success", "detail": "a\nb"},
+            key="tool-1",
+        )
+        self.assertIs(same, entry)
+        self.assertEqual(len(self.manager.entries), 1)
+        html = self.manager._row_html(entry)
+        self.assertNotIn("running…", html)
+        self.assertIn("⎿ 2 lines success", html)
+
+    def test_update_refreshes_expanded_detail(self):
+        command = {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"}
+        entry = self.manager.add_tool_call(
+            self.anchor, command, key="tool-1", status="running")
+        self.manager.toggle(None, entry["key"])
+        self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
+        self.assertNotIn("Return", self.view.text)
+
+        self.manager.add_tool_call(
+            self.anchor,
+            command,
+            {"summary": "1 line success", "detail": "out line"},
+            key="tool-1",
+            edit=object(),
+        )
+        text = self.view.text
+        self.assertIn("Command\n```bash\nnpm test\n```\n", text)
+        self.assertIn("Return\n```text\nout line\n```\n", text)
+        self.assertLess(text.index("Command"), text.index("Return"))
+        self.assertEqual(len(self.view.get_regions(entry["detail_key"])), 1)
+        self.assertTrue(entry["expanded"])
+
+    def test_finish_running_marks_interrupted(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            key="tool-1",
+            status="running",
+        )
+        self.manager.finish_running()
+        self.assertEqual(entry["status"], "interrupted")
+        self.assertIn("⎿ interrupted", self.manager._row_html(entry))
+
+    def test_finish_running_leaves_background_alone(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm run dev", "detail": "npm run dev"},
+            key="tool-1",
+            status="background",
+        )
+        self.manager.finish_running()
+        self.assertEqual(entry["status"], "background")
+
+    def test_background_completion_keeps_a_status_row(self):
+        command = {"heading": "⏺ command", "summary": "npm run dev",
+                   "detail": "npm run dev"}
+        entry = self.manager.add_tool_call(
+            self.anchor, command, key="tool-1", status="background")
+        self.manager.add_tool_call(
+            self.anchor,
+            command,
+            {"summary": "0 lines success", "detail": ""},
+            key="tool-1",
+        )
+        self.assertIsNone(entry["status"])
+        html = self.manager._row_html(entry)
+        self.assertNotIn("running in background", html)
+        self.assertIn("⎿ 0 lines success", html)
+
     def test_truncate_drops_rows_at_or_after_cut_point(self):
         first = self.manager.add(sublime.Region(2, 2), "1 line", "a")
         second = self.manager.add(sublime.Region(8, 8), "2 lines", "b")
@@ -498,6 +595,85 @@ class TestFormatToolCall(unittest.TestCase):
         self.assertEqual(len(phantoms), 1)
         self.assertEqual(phantoms[0]["kind"], "output")
         self.assertEqual(phantoms[0]["line"], text.count("\n"))
+
+
+class TestToolCallPhase(unittest.TestCase):
+    def setUp(self):
+        from chatview.chatprocessor import OpenCodeMessageProcessor
+
+        self.session = MagicMock()
+        self.session.agent_thread.cwd = "/workspace"
+        self.session.get_setting.side_effect = (
+            lambda key, default=None: {
+                "tool_output_inline_lines": 3,
+                "tool_output_inline_max_chars": 400,
+            }.get(key, default)
+        )
+        self.processor = OpenCodeMessageProcessor(self.session)
+
+    def test_running_state_is_running(self):
+        _, phantoms = self.processor.format_tool_call(
+            {"name": "command_execution", "command": "npm test", "status": "running"},
+            key="tool-1",
+        )
+        self.assertEqual(phantoms[0]["status"], "running")
+        self.assertIsNone(phantoms[0]["output"])
+
+    def test_background_is_detected_from_metadata(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm run dev",
+            "status": "completed",
+            "metadata": {"status": "running", "shellID": "sh_1"},
+        })
+        self.assertEqual(phantoms[0]["status"], "background")
+
+    def test_completed_with_output_is_terminal(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm test",
+            "status": "completed",
+            "output": "a\nb\nc\nd",
+        })
+        self.assertNotIn("status", phantoms[0])
+        self.assertIn("success", phantoms[0]["output"]["summary"])
+
+    def test_key_survives_into_phantom(self):
+        _, phantoms = self.processor.format_tool_call(
+            {"name": "command_execution", "command": "npm test",
+             "status": "running"},
+            key="tool-9",
+        )
+        self.assertEqual(phantoms[0]["key"], "tool-9")
+
+    def test_failed_exit_code_marks_failure(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "npm test",
+            "status": "completed",
+            "exitCode": 1,
+            "output": "boom",
+        })
+        self.assertIn("failed", phantoms[0]["output"]["summary"])
+
+    def test_silent_completed_command_keeps_status_row(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "touch out.txt",
+            "status": "completed",
+            "output": "",
+            "exitCode": 0,
+        })
+        self.assertEqual(phantoms[0]["output"]["summary"], "0 lines success")
+        self.assertEqual(phantoms[0]["output"]["detail"], "")
+
+    def test_running_without_result_has_no_output(self):
+        _, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "sleep 5",
+            "status": "running",
+        })
+        self.assertIsNone(phantoms[0]["output"])
 
 
 if __name__ == "__main__":

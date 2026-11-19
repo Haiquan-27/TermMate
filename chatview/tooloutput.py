@@ -36,6 +36,13 @@ from .utils import format_fenced_output
 
 LOG = logging.getLogger("TermMate")
 
+#: Status row text for command calls that have not finished yet.
+STATUS_LABELS = {
+    "running": "running…",
+    "background": "running in background",
+    "interrupted": "interrupted",
+}
+
 
 class ToolOutputManager:
     """Own collapsed tool rows and their show/hide phantoms."""
@@ -74,19 +81,30 @@ class ToolOutputManager:
         self._update()
         return entry
 
-    def add_tool_call(self, anchor, command, output=None, key=None):
-        """Register a command tool call as one composite phantom.
+    def add_tool_call(self, anchor, command, output=None, key=None,
+                      status=None, edit=None):
+        """Register or update a command tool call as one composite phantom.
 
         A single phantom holds both the command preview row and the output
         summary row. Keeping them in one phantom is what makes their order
         stable: phantoms anchored at the same point have no defined order.
 
         ``command`` is ``{"heading", "summary", "detail"}``; ``output`` is
-        ``{"summary", "detail"}`` or ``None``.
+        ``{"summary", "detail"}`` or ``None``; ``status`` is ``"running"``,
+        ``"background"`` or ``None``.
+
+        When ``key`` already exists the existing row is updated in place
+        instead of creating a second phantom. That is how ``running…`` turns
+        into ``N lines success`` without the row moving on screen.
         """
         command = command or {}
         if not command.get("detail"):
             return None
+        if key is not None:
+            existing = self.find(key)
+            if existing is not None:
+                return self._update_tool_call(
+                    existing, command, output, status, edit)
         if key is None:
             key = self.REGION_PREFIX + str(self.next_id)
             self.next_id += 1
@@ -103,16 +121,36 @@ class ToolOutputManager:
                 "detail": command["detail"],
             },
             "output": None,
+            "status": status,
             "expanded": False,
         }
-        if output and output.get("detail"):
-            entry["output"] = {
-                "summary": output.get("summary") or "",
-                "detail": output["detail"],
-            }
+        if output:
+            summary = output.get("summary") or ""
+            detail = output.get("detail") or ""
+            if detail:
+                entry["output"] = {"summary": summary, "detail": detail}
+            elif summary:
+                entry["output"] = {"summary": summary, "detail": ""}
         self.entries.append(entry)
         self._update()
         return entry
+
+    def find(self, key):
+        """Return the entry registered under ``key``, if any."""
+        for entry in self.entries:
+            if entry["key"] == key:
+                return entry
+        return None
+
+    def finish_running(self):
+        """Mark commands still running when their turn ended as interrupted."""
+        changed = False
+        for entry in self.entries:
+            if entry["kind"] == "tool_call" and entry.get("status") == "running":
+                entry["status"] = "interrupted"
+                changed = True
+        if changed:
+            self._update()
 
     def toggle(self, edit, key, section=None):
         """Expand or collapse the row identified by ``key``.
@@ -158,10 +196,28 @@ class ToolOutputManager:
     # --------------------------------------------------------------- internal
 
     def _find(self, key):
-        for entry in self.entries:
-            if entry["key"] == key:
-                return entry
-        return None
+        return self.find(key)
+
+    def _update_tool_call(self, entry, command, output, status, edit):
+        """Apply a later event to an existing command row in place."""
+        if command.get("detail"):
+            entry["command"] = {
+                "heading": command.get("heading") or entry["command"]["heading"],
+                "summary": command.get("summary") or "",
+                "detail": command["detail"],
+            }
+        if output is not None:
+            summary = output.get("summary") or ""
+            detail = output.get("detail") or ""
+            if detail:
+                entry["output"] = {"summary": summary, "detail": detail}
+            elif summary and not entry.get("output"):
+                entry["output"] = {"summary": summary, "detail": ""}
+        entry["status"] = status
+        if edit is not None and entry["expanded"]:
+            self._render_tool_call_detail(edit, entry)
+        self._update()
+        return entry
 
     def _anchor(self, entry):
         regions = self.view.get_regions(entry["region_key"])
@@ -294,8 +350,13 @@ class ToolOutputManager:
         command = entry["command"]
         label = "hide" if entry["expanded"] else "show"
         output = entry.get("output")
+        row_summary = ""
+        if output:
+            row_summary = output.get("summary") or ""
+        elif entry.get("status") in STATUS_LABELS:
+            row_summary = STATUS_LABELS[entry["status"]]
         command_links = ""
-        if not output:
+        if not row_summary:
             command_links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
         rows = [
             "<div class='termmate-command-row'>"
@@ -304,10 +365,10 @@ class ToolOutputManager:
             f"{command_links}"
             "</div>"
         ]
-        if output:
+        if row_summary:
             rows.append(
                 "<div class='termmate-tool-row'>"
-                f"<span>⎿ {html.escape(output['summary'])}</span>"
+                f"<span>⎿ {html.escape(row_summary)}</span>"
                 f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
                 "</div>"
             )
