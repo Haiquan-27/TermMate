@@ -1303,14 +1303,7 @@ class OpenCodeAgent(BaseAgent):
 
     @staticmethod
     def _error_text(error: Any) -> str:
-        if isinstance(error, str):
-            return error
-        if isinstance(error, dict):
-            data = error.get("data")
-            if isinstance(data, dict) and data.get("message"):
-                return str(data["message"])
-            return str(error.get("message") or error.get("name") or error)
-        return str(error)
+        return _error_text_value(error)
 
     def _start_sse_thread(self, env: Dict[str, str]) -> None:
         self._sse_stop.clear()
@@ -1732,28 +1725,7 @@ class OpenCodeAgent(BaseAgent):
     ) -> None:
         """[OpenCode v1] Convert completed tool part into MessageType.TOOL_USE."""
         raw_name = str(part.get("tool") or "tool")
-        normalized = raw_name.lower()
-        input_data = state.get("input", {})
-        if not isinstance(input_data, dict):
-            input_data = {"value": input_data}
-
-        if normalized in ("bash", "shell", "command"):
-            content = {
-                "name": "command_execution",
-                "command": input_data.get("command") or input_data.get("cmd") or state.get("title"),
-                "output": state.get("output") or state.get("error"),
-                "status": state.get("status"),
-            }
-        else:
-            content = {
-                "name": raw_name,
-                "input": input_data,
-                "title": state.get("title"),
-                "output": state.get("output"),
-                "error": state.get("error"),
-                "metadata": state.get("metadata", {}),
-                "status": state.get("status"),
-            }
+        content = _tool_content_from_state(raw_name, state)
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=part.get("id")
         ))
@@ -1770,55 +1742,26 @@ class OpenCodeAgent(BaseAgent):
 
         cached = self._tool_calls.get(tool_id, {})
         raw_name = str(properties.get("name") or cached.get("name") or "tool")
-        normalized = raw_name.lower()
         input_data = cached.get("input") or properties.get("input", {})
         if not isinstance(input_data, dict):
             input_data = {"value": input_data}
 
         output_text = properties.get("output")
         if output_text is None and isinstance(properties.get("content"), list):
-            output_parts = []
-            for item in properties["content"]:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    output_parts.append(item.get("text", ""))
-                elif isinstance(item, str):
-                    output_parts.append(item)
-            output_text = "\n".join(output_parts) if output_parts else None
+            output_text = properties["content"]
 
-        error_data = properties.get("error")
-        error_text = self._error_text(error_data) if error_data else None
-
-        metadata = {
-            **(cached.get("metadata") or {}),
-            **(properties.get("metadata") or {}),
+        state = {
+            "input": input_data,
+            "title": properties.get("title"),
+            "output": output_text,
+            "error": properties.get("error"),
+            "metadata": {
+                **(cached.get("metadata") or {}),
+                **(properties.get("metadata") or {}),
+            },
+            "status": status,
         }
-        files = metadata.get("files")
-        if isinstance(files, list) and files:
-            first = files[0]
-            if isinstance(first, dict) and first.get("patch"):
-                metadata.setdefault("diff", first["patch"])
-
-        if normalized in ("bash", "shell", "command"):
-            content = {
-                "name": "command_execution",
-                "command": (
-                    input_data.get("command")
-                    or input_data.get("cmd")
-                    or properties.get("title")
-                ),
-                "output": output_text or error_text,
-                "status": status,
-            }
-        else:
-            content = {
-                "name": raw_name,
-                "input": input_data,
-                "title": properties.get("title"),
-                "output": output_text,
-                "error": error_text,
-                "metadata": metadata,
-                "status": status,
-            }
+        content = _tool_content_from_state(raw_name, state)
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=tool_id
         ))
@@ -2874,6 +2817,84 @@ def list_opencode_sessions(
         return []
 
 
+def _error_text_value(error: Any) -> str:
+    """Normalise a tool error payload to plain text."""
+    if isinstance(error, str):
+        return error
+    if isinstance(error, dict):
+        data = error.get("data")
+        if isinstance(data, dict) and data.get("message"):
+            return str(data["message"])
+        return str(error.get("message") or error.get("name") or error)
+    return str(error)
+
+
+def _tool_output_text(value: Any) -> Optional[str]:
+    """Normalise tool output to plain text (v2 may deliver content block lists)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            if isinstance(item, dict) and item.get("type") == "text":
+                parts.append(str(item.get("text") or ""))
+            elif isinstance(item, str):
+                parts.append(item)
+        joined = "\n".join(part for part in parts if part)
+        return joined or None
+    return str(value)
+
+
+def _tool_content_from_state(raw_name: str, state: dict) -> dict:
+    """Build the TOOL_USE content dict shared by live events and history replay.
+
+    Keeping one builder guarantees the resumed transcript renders exactly like
+    the live transcript.
+    """
+    normalized = str(raw_name or "tool").lower()
+    input_data = state.get("input", {})
+    if not isinstance(input_data, dict):
+        input_data = {"value": input_data}
+
+    metadata = state.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    files = metadata.get("files")
+    if isinstance(files, list) and files:
+        first = files[0]
+        if isinstance(first, dict) and first.get("patch"):
+            metadata = {**metadata}
+            metadata.setdefault("diff", first["patch"])
+
+    status = state.get("status")
+    output_text = _tool_output_text(state.get("output"))
+    error_data = state.get("error")
+    error_text = _error_text_value(error_data) if error_data else None
+
+    if normalized in ("bash", "shell", "command"):
+        return {
+            "name": "command_execution",
+            "command": (
+                input_data.get("command")
+                or input_data.get("cmd")
+                or state.get("title")
+            ),
+            "output": output_text or error_text,
+            "status": status,
+        }
+    return {
+        "name": raw_name,
+        "input": input_data,
+        "title": state.get("title"),
+        "output": output_text,
+        "error": error_text,
+        "metadata": metadata,
+        "status": status,
+    }
+
+
 def get_opencode_session_info(
     session_id: str,
     cwd: Optional[str] = None,
@@ -2940,38 +2961,79 @@ def get_opencode_session_info(
 
             entries = sorted(entries, key=_entry_time)
 
-            for entry in entries:
-                if not isinstance(entry, dict):
-                    continue
-                info = entry.get("info") or {}
-                role = info.get("role") or entry.get("type")
-                text = ""
+            def _text_from_entry(entry: dict) -> str:
                 if entry.get("parts") and isinstance(entry["parts"], list):
-                    text = "".join(
+                    return "".join(
                         part.get("text", "")
                         for part in entry["parts"]
                         if isinstance(part, dict)
                         and part.get("type") == "text"
                         and not part.get("ignored")
                     ).strip()
-                elif entry.get("content") and isinstance(entry["content"], list):
-                    text = "\n\n".join(
+                if entry.get("content") and isinstance(entry["content"], list):
+                    return "\n\n".join(
                         part.get("text", "")
                         for part in entry["content"]
                         if isinstance(part, dict)
                         and part.get("type") == "text"
                         and part.get("text")
                     ).strip()
-                elif isinstance(entry.get("text"), str):
-                    text = entry["text"].strip()
+                if isinstance(entry.get("text"), str):
+                    return entry["text"].strip()
+                return ""
+
+            def _append_assistant_events(turn: dict, entry: dict) -> None:
+                """Record assistant text and completed tool calls in source order."""
+                parts = entry.get("parts")
+                if not isinstance(parts, list):
+                    parts = entry.get("content")
+                if not isinstance(parts, list):
+                    return
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    part_type = part.get("type")
+                    if part_type == "text":
+                        if part.get("ignored"):
+                            continue
+                        text = str(part.get("text") or "")
+                        if text.strip():
+                            turn["events"].append({"kind": "assistant", "text": text})
+                    elif part_type == "tool":
+                        state = part.get("state")
+                        if not isinstance(state, dict):
+                            continue
+                        if state.get("status") not in ("completed", "error"):
+                            continue
+                        turn["events"].append({
+                            "kind": "tool",
+                            "block": _tool_content_from_state(
+                                str(part.get("tool") or "tool"), state
+                            ),
+                        })
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                info = entry.get("info") or {}
+                role = info.get("role") or entry.get("type")
+                text = _text_from_entry(entry)
 
                 if role == "user" and text:
                     if current is not None:
                         turns.append(current)
-                    current = {"prompt": text, "response": None}
+                    current = {
+                        "prompt": text,
+                        "response": None,
+                        "events": [{"kind": "user", "text": text}],
+                    }
                 elif role == "assistant" and text and current is not None:
                     response = current["response"]
                     current["response"] = f"{response}\n\n{text}" if response else text
+                    _append_assistant_events(current, entry)
+                elif role == "assistant" and current is not None:
+                    # Assistant message without text (tool-only): still replay tools.
+                    _append_assistant_events(current, entry)
 
             if current is not None:
                 turns.append(current)

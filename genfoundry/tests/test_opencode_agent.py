@@ -1373,6 +1373,150 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
         self.assertEqual(info["turns"][0]["prompt"], "V1 prompt")
         self.assertEqual(info["turns"][0]["response"], "V1 response")
 
+    def test_get_opencode_session_info_includes_tool_events(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")
+        session = {"id": "ses_tools", "title": "Tools", "time": {"updated": 1600000020000}}
+        messages = [
+            {
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": "List files"}],
+            },
+            {
+                "info": {"role": "assistant"},
+                "parts": [
+                    {"type": "reasoning", "text": "thinking..."},
+                    {"type": "text", "text": "I'll list them."},
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "ls"},
+                            "output": "a\nb\n",
+                            "title": "ls",
+                        },
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "read",
+                        "state": {"status": "running", "input": {"path": "a.txt"}},
+                    },
+                    {
+                        "type": "tool",
+                        "tool": "edit",
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "a.txt"},
+                            "metadata": {
+                                "files": [{"patch": "@@ -1 +1 @@\n-old\n+new"}]
+                            },
+                        },
+                    },
+                    {"type": "text", "text": "hidden", "ignored": True},
+                ],
+            },
+        ]
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            if path == "/session/ses_tools":
+                return session
+            if path == "/session/ses_tools/message":
+                return messages
+            return None
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            with patch(
+                "genfoundry.opencode_agent._sync_request", side_effect=fake_request
+            ):
+                info = get_opencode_session_info("ses_tools", cwd="/workspace")
+
+        self.assertIsNotNone(info)
+        self.assertEqual(info["turns"][0]["response"], "I'll list them.")
+        events = info["turns"][0]["events"]
+        self.assertEqual([e["kind"] for e in events], ["user", "assistant", "tool", "tool"])
+        self.assertEqual(events[0]["text"], "List files")
+        self.assertEqual(events[1]["text"], "I'll list them.")
+
+        bash_block = events[2]["block"]
+        self.assertEqual(bash_block["name"], "command_execution")
+        self.assertEqual(bash_block["command"], "ls")
+        self.assertEqual(bash_block["output"], "a\nb\n")
+        self.assertEqual(bash_block["status"], "completed")
+
+        edit_block = events[3]["block"]
+        self.assertEqual(edit_block["name"], "edit")
+        self.assertEqual(edit_block["metadata"]["diff"], "@@ -1 +1 @@\n-old\n+new")
+        self.assertNotIn("error", [e["kind"] for e in events])
+
+    def test_session_info_tool_events_respect_history_limit(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")
+        session = {"id": "ses_limit", "title": "Limit", "time": {"updated": 1600000030000}}
+        messages = []
+        for index in range(3):
+            messages.append({
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": f"prompt {index}"}],
+            })
+            messages.append({
+                "info": {"role": "assistant"},
+                "parts": [
+                    {"type": "text", "text": f"response {index}"},
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": f"echo {index}"},
+                            "output": f"{index}\n",
+                        },
+                    },
+                ],
+            })
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            if path == "/session/ses_limit":
+                return session
+            if path == "/session/ses_limit/message":
+                return messages
+            return None
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            with patch(
+                "genfoundry.opencode_agent._sync_request", side_effect=fake_request
+            ):
+                info = get_opencode_session_info(
+                    "ses_limit", cwd="/workspace", history_limit=1
+                )
+
+        self.assertIsNotNone(info)
+        self.assertEqual(len(info["turns"]), 1)
+        turn = info["turns"][0]
+        self.assertEqual(turn["prompt"], "prompt 2")
+        self.assertEqual([e["kind"] for e in turn["events"]], ["user", "assistant", "tool"])
+        self.assertEqual(turn["events"][2]["block"]["output"], "2\n")
+
+    def test_tool_content_from_state_normalises_errors(self):
+        from genfoundry.opencode_agent import _tool_content_from_state
+
+        block = _tool_content_from_state("read", {
+            "status": "error",
+            "input": {"path": "missing.txt"},
+            "error": {"data": {"message": "file not found"}},
+        })
+        self.assertEqual(block["name"], "read")
+        self.assertEqual(block["error"], "file not found")
+        self.assertEqual(block["status"], "error")
+
+        bash = _tool_content_from_state("bash", {
+            "status": "error",
+            "input": {"command": "false"},
+            "error": "boom",
+        })
+        self.assertEqual(bash["name"], "command_execution")
+        self.assertEqual(bash["output"], "boom")
+
     def test_probe_opencode_service(self):
         class _MockContext:
             def __enter__(self):
