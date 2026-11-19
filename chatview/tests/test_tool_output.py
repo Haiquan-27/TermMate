@@ -252,23 +252,84 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("</a>&nbsp;&nbsp;<a", html)
         self.assertNotIn("margin-left", html)
 
-    def test_command_row_has_heading_and_no_copy(self):
-        entry = self.manager.add(
-            self.anchor, "$exe = 'x'", "line1", kind="command", heading="⏺ command"
+    def test_tool_call_renders_both_rows_in_one_phantom(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            {"summary": "8 lines", "detail": "line\nline"},
+        )
+        phantoms = self.manager.phantom_set.update.call_args[0][0]
+        self.assertEqual(len(phantoms), 1)
+        html = self.manager._row_html(entry)
+        self.assertIn("⏺ command (npm test)", html)
+        self.assertIn("⎿ 8 lines", html)
+        self.assertLess(
+            html.index("termmate-command-row"), html.index("⎿ 8 lines"))
+        self.assertIn(f"toggle:{entry['key']}:command", html)
+        self.assertIn(f"toggle:{entry['key']}:output", html)
+        self.assertIn(f"copy:{entry['key']}:output", html)
+
+    def test_tool_call_without_output_has_one_row(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
         )
         html = self.manager._row_html(entry)
-        self.assertIn("⏺ command ($exe = &#x27;x&#x27;)", html)
-        self.assertIn(">show<", html)
+        self.assertIn("npm test", html)
+        self.assertNotIn("⎿", html)
         self.assertNotIn(">copy<", html)
-        self.assertIn("termmate-command-row", html)
 
-    def test_command_row_expands_fenced_block(self):
-        entry = self.manager.add(
-            self.anchor, "$exe", "line1\nline2", kind="command", heading="⏺ command"
+    def test_command_toggle_keeps_output_row_in_place(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            {"summary": "8 lines", "detail": "out line"},
         )
-        self.manager.toggle(None, entry["key"])
-        self.assertIn("```text\nline1\nline2\n```", self.view.text)
-        self.assertEqual(entry["kind"], "command")
+        self.manager.toggle(None, entry["key"], "command")
+        self.assertTrue(entry["show_command"])
+        self.assertFalse(entry["show_output"])
+        self.assertIn("```text\nnpm test\n```", self.view.text)
+        html = self.manager._row_html(entry)
+        self.assertLess(
+            html.index("termmate-command-row"), html.index("⎿ 8 lines"))
+
+        self.manager.toggle(None, entry["key"], "command")
+        self.assertFalse(entry["show_command"])
+        self.assertEqual(self.view.text, "⏺ Bash ls\n\n")
+
+    def test_output_toggle_places_both_fences_in_fixed_order(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            {"summary": "8 lines", "detail": "out line"},
+        )
+        self.manager.toggle(None, entry["key"], "output")
+        self.assertTrue(entry["show_output"])
+        self.assertIn("```text\nout line\n```", self.view.text)
+        self.assertNotIn("npm test", self.view.text)
+
+        self.manager.toggle(None, entry["key"], "command")
+        text = self.view.text
+        self.assertLess(text.index("npm test"), text.index("out line"))
+
+        self.manager.toggle(None, entry["key"], "output")
+        self.assertFalse(entry["show_output"])
+        command_fence = "```text\nnpm test\n```\n"
+        self.assertIn(command_fence, self.view.text)
+        self.assertNotIn("out line", self.view.text)
+        self.assertEqual(self.input_pos(), 10 + len(command_fence))
+
+    def test_tool_call_copy_uses_output_detail(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
+            {"summary": "2 lines", "detail": "out\nsecond"},
+        )
+        with patch("sublime.set_clipboard") as clipboard, \
+                patch("sublime.status_message") as status:
+            self.manager.copy(entry["key"], "output")
+        clipboard.assert_called_once_with("out\nsecond")
+        self.assertIn("2 lines", status.call_args[0][0])
 
     def test_copy_missing_entry_is_noop(self):
         with patch("sublime.set_clipboard") as clipboard, \
@@ -384,23 +445,26 @@ class TestFormatToolCall(unittest.TestCase):
         text, phantoms = self._call(command="python3 -m unittest")
         self.assertEqual(text, "")
         self.assertEqual(len(phantoms), 1)
-        self.assertEqual(phantoms[0]["kind"], "command")
-        self.assertEqual(phantoms[0]["line"], -1)
-        self.assertEqual(phantoms[0]["summary"], "python3 -m unittest")
-        self.assertEqual(phantoms[0]["detail"], "python3 -m unittest")
+        call = phantoms[0]
+        self.assertEqual(call["kind"], "tool_call")
+        self.assertEqual(call["line"], -1)
+        self.assertEqual(call["command"]["summary"], "python3 -m unittest")
+        self.assertEqual(call["command"]["detail"], "python3 -m unittest")
+        self.assertIsNone(call["output"])
 
     def test_multiline_preview_gets_ellipsis(self):
         _, phantoms = self._call(command="echo first\necho second")
-        self.assertEqual(phantoms[0]["summary"], "echo first …")
-        self.assertEqual(phantoms[0]["detail"], "echo first\necho second")
+        self.assertEqual(phantoms[0]["command"]["summary"], "echo first …")
+        self.assertEqual(
+            phantoms[0]["command"]["detail"], "echo first\necho second")
 
     def test_long_preview_is_truncated(self):
         command = "x" * 500
         _, phantoms = self._call(command=command)
-        summary = phantoms[0]["summary"]
+        summary = phantoms[0]["command"]["summary"]
         self.assertLessEqual(len(summary), 120)
         self.assertTrue(summary.endswith("…"))
-        self.assertEqual(phantoms[0]["detail"], command)
+        self.assertEqual(phantoms[0]["command"]["detail"], command)
 
     def test_short_output_stays_inline(self):
         text, phantoms = self._call(
@@ -408,18 +472,21 @@ class TestFormatToolCall(unittest.TestCase):
         )
         self.assertIn("```text", text)
         self.assertIn("ok\ndone", text)
-        self.assertEqual([p["kind"] for p in phantoms], ["command"])
+        self.assertEqual([p["kind"] for p in phantoms], ["tool_call"])
+        self.assertIsNone(phantoms[0]["output"])
 
-    def test_long_output_adds_second_phantom_row(self):
+    def test_long_output_joins_the_command_phantom(self):
         output = "\n".join(f"line {i}" for i in range(10))
         text, phantoms = self._call(
             command="npm test", output=output, status="completed"
         )
         self.assertEqual(text, "")
-        self.assertEqual([p["kind"] for p in phantoms], ["command", "output"])
-        self.assertEqual(phantoms[1]["summary"], "10 lines")
-        self.assertEqual(phantoms[1]["detail"], output)
-        self.assertEqual(phantoms[1]["line"], -1)
+        self.assertEqual(len(phantoms), 1)
+        call = phantoms[0]
+        self.assertEqual(call["kind"], "tool_call")
+        self.assertEqual(call["line"], -1)
+        self.assertEqual(call["output"]["summary"], "10 lines")
+        self.assertEqual(call["output"]["detail"], output)
 
     def test_edit_tool_output_is_not_duplicated(self):
         text, phantoms = self.processor.format_tool_call({

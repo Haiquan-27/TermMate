@@ -531,35 +531,39 @@ class BaseChatMessageProcessor:
         phantom-only). ``phantoms`` is a list of dicts consumed by
         ``term_chat_output_append``:
 
-            {"line": int, "kind": "output"|"command",
-             "heading": str, "summary": str, "detail": str}
+            {"line": int, "kind": "output",
+             "summary": str, "detail": str}
+
+            {"line": int, "kind": "tool_call",
+             "command": {"heading", "summary", "detail"},
+             "output": {"summary", "detail"} | None}
 
         ``line`` is a row offset inside ``text``; ``-1`` anchors the row on
-        the line preceding the appended text.
+        the line preceding the appended text. Command calls use a single
+        composite phantom so the command row and the output row can never
+        swap places.
         """
         if not isinstance(block, dict):
             return "", []
 
         command = self._command_text(block)
         if command is not None:
-            phantoms = [{
+            call = {
                 "line": -1,
-                "kind": "command",
-                "heading": self._command_heading(block),
-                "summary": self._command_preview(command),
-                "detail": command.rstrip("\n"),
-            }]
+                "kind": "tool_call",
+                "command": {
+                    "heading": self._command_heading(block),
+                    "summary": self._command_preview(command),
+                    "detail": command.rstrip("\n"),
+                },
+                "output": None,
+            }
             inline_text, summary, detail = self.format_tool_result(block)
             if inline_text:
-                return inline_text, phantoms
+                return inline_text, [call]
             if detail:
-                phantoms.append({
-                    "line": -1,
-                    "kind": "output",
-                    "summary": summary,
-                    "detail": detail,
-                })
-            return "", phantoms
+                call["output"] = {"summary": summary, "detail": detail}
+            return "", [call]
 
         text = self._format_tool_block(block)
         inline_text, summary, detail = self.format_tool_result(block)
