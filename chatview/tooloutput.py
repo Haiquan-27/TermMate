@@ -4,17 +4,16 @@ Long tool results are not written into the chat buffer by default. Instead a
 single phantom row is anchored below the tool header:
 
     ⏺ Bash npm test
-    ⎿ 42 lines                                  [show] [copy]
+    ⎿ 42 lines success                            [show]
 
 Command tool calls (``command_execution`` / ``run_command``) are phantom-only:
 the command text never enters the buffer while collapsed.
 
-    ⏺ command (npm test -- --watch …)           [show]
-    ⎿ 42 lines                                  [show] [copy]
+    ⏺ command (npm test -- --watch …)             [show]
+    ⎿ 42 lines success                            [show]
 
 Clicking ``show`` inserts the full text as a fenced code block right after the
-anchor line (and toggles the link to ``hide``). Clicking ``copy`` puts the raw
-output on the clipboard without changing the expanded state.
+anchor line (and toggles the link to ``hide``).
 """
 
 import html
@@ -28,7 +27,7 @@ LOG = logging.getLogger("TermMate")
 
 
 class ToolOutputManager:
-    """Own collapsed tool-output rows and their show/copy phantoms."""
+    """Own collapsed tool rows and their show/hide phantoms."""
 
     REGION_PREFIX = "term_chat_tool_output_"
 
@@ -59,7 +58,6 @@ class ToolOutputManager:
             "summary": summary,
             "detail": detail,
             "expanded": False,
-            "copied": False,
         }
         self.entries.append(entry)
         self._update()
@@ -96,7 +94,6 @@ class ToolOutputManager:
             "output": None,
             "show_command": False,
             "show_output": False,
-            "copied": False,
         }
         if output and output.get("detail"):
             entry["output"] = {
@@ -124,28 +121,6 @@ class ToolOutputManager:
         else:
             self._expand(edit, entry)
         self._update()
-
-    def copy(self, key, section=None):
-        """Copy the raw tool output to the clipboard."""
-        entry = self._find(key)
-        if entry is None:
-            sublime.status_message("Tool output is no longer available")
-            return
-        if entry["kind"] == "tool_call":
-            text = (entry.get("output") or {}).get("detail")
-        else:
-            text = entry["detail"]
-        if not text:
-            sublime.status_message("Tool output is no longer available")
-            return
-        sublime.set_clipboard(text)
-        line_count = len(text.splitlines())
-        sublime.status_message(
-            f"Copied {line_count} line{'s' if line_count != 1 else ''} to clipboard"
-        )
-        entry["copied"] = True
-        self._update()
-        sublime.set_timeout(lambda: self._clear_copied(key), 1200)
 
     def truncate(self, cut_point):
         """Drop rows that start at or after ``cut_point`` (rewind support)."""
@@ -181,12 +156,6 @@ class ToolOutputManager:
             if entry["key"] == key:
                 return entry
         return None
-
-    def _clear_copied(self, key):
-        entry = self._find(key)
-        if entry is not None:
-            entry["copied"] = False
-            self._update()
 
     def _anchor(self, entry):
         regions = self.view.get_regions(entry["region_key"])
@@ -308,9 +277,8 @@ class ToolOutputManager:
         action = parts[0]
         key = parts[1] if len(parts) > 1 else ""
         section = parts[2] if len(parts) > 2 else None
-        if action == "copy":
-            self.copy(key, section)
-        elif action == "toggle":
+        # ``copy:`` links from older phantoms are ignored.
+        if action == "toggle":
             view = self.view
             if view and view.is_valid():
                 view.run_command(
@@ -332,12 +300,10 @@ class ToolOutputManager:
         output = entry.get("output")
         if output:
             output_label = "hide" if entry["show_output"] else "show"
-            copy_label = "copied" if entry["copied"] else "copy"
             rows.append(
                 "<div class='termmate-tool-row'>"
                 f"<span>⎿ {html.escape(output['summary'])}</span>"
                 f"&nbsp;&nbsp;<a href='toggle:{key}:output'>{output_label}</a>"
-                f"&nbsp;&nbsp;<a href='copy:{key}:output'>{copy_label}</a>"
                 "</div>"
             )
         return "".join(rows)
@@ -345,11 +311,9 @@ class ToolOutputManager:
     def _output_row_html(self, entry):
         summary = html.escape(entry.get("summary") or "")
         toggle_label = "hide" if entry["expanded"] else "show"
-        copy_label = "copied" if entry["copied"] else "copy"
         key = entry["key"]
         body = f"<span>⎿ {summary}</span>"
         links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{toggle_label}</a>"
-        links += f"&nbsp;&nbsp;<a href='copy:{key}'>{copy_label}</a>"
         return f"<div class='termmate-tool-row'>{body}{links}</div>"
 
     def _row_html(self, entry):

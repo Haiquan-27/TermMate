@@ -242,6 +242,24 @@ _REASONING_EFFORT_DESCRIPTIONS = {
 }
 
 
+def _tool_result_status(block):
+    """Return ``"success"`` or ``"failed"`` for a finished tool result."""
+    status = str(block.get("status") or "").strip().lower()
+    if block.get("error") or status in ("error", "failed", "failure"):
+        return "failed"
+    exit_code = block.get("exit_code", block.get("exitCode"))
+    if exit_code is None:
+        metadata = block.get("metadata")
+        if isinstance(metadata, dict):
+            exit_code = metadata.get("exit_code", metadata.get("exitCode"))
+    if exit_code is not None:
+        try:
+            return "success" if int(exit_code) == 0 else "failed"
+        except (TypeError, ValueError):
+            pass
+    return "success"
+
+
 class BaseChatMessageProcessor:
     """
     Handles buffering, formatting, and displaying messages from the agent.
@@ -473,9 +491,7 @@ class BaseChatMessageProcessor:
 
         line_count = len(cleaned.splitlines())
         unit = "line" if line_count == 1 else "lines"
-        summary = f"{line_count} {unit}"
-        if block.get("error") or block.get("status") == "error":
-            summary = f"error · {summary}"
+        summary = f"{line_count} {unit} {_tool_result_status(block)}"
 
         if mode == "inline":
             return utils.format_fenced_output(cleaned), "", ""

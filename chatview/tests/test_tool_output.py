@@ -1,6 +1,6 @@
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 # Sublime Text supplies these modules at plugin runtime. Mocks keep this
 # test runnable with ordinary Python.
@@ -204,14 +204,13 @@ class TestToolOutputManager(unittest.TestCase):
         phantoms = self.manager.phantom_set.update.call_args[0][0]
         self.assertEqual(len(phantoms), 1)
 
-    def test_row_html_has_show_and_copy(self):
+    def test_row_html_has_show_and_no_copy(self):
         entry = self.manager.add(self.anchor, "42 lines", "out")
         html = self.manager._row_html(entry)
         self.assertIn(f"toggle:{entry['key']}", html)
-        self.assertIn(f"copy:{entry['key']}", html)
         self.assertIn(">show<", html)
-        self.assertIn(">copy<", html)
         self.assertIn("42 lines", html)
+        self.assertNotIn("copy", html)
 
     def test_toggle_expands_then_collapses(self):
         entry = self.manager.add(self.anchor, "42 lines", "line1\nline2")
@@ -235,21 +234,10 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn(">hide<", html)
         self.assertNotIn(">show<", html)
 
-    def test_copy_uses_raw_output(self):
-        entry = self.manager.add(self.anchor, "42 lines", "raw output\nsecond")
-        with patch("sublime.set_clipboard") as clipboard, \
-                patch("sublime.status_message") as status:
-            self.manager.copy(entry["key"])
-        clipboard.assert_called_once_with("raw output\nsecond")
-        status.assert_called_once()
-        self.assertIn("2 lines", status.call_args[0][0])
-        self.assertFalse(entry["expanded"])
-
     def test_links_are_separated_by_non_breaking_spaces(self):
         entry = self.manager.add(self.anchor, "42 lines", "out")
         html = self.manager._row_html(entry)
         self.assertIn("</span>&nbsp;&nbsp;<a", html)
-        self.assertIn("</a>&nbsp;&nbsp;<a", html)
         self.assertNotIn("margin-left", html)
 
     def test_tool_call_renders_both_rows_in_one_phantom(self):
@@ -267,7 +255,7 @@ class TestToolOutputManager(unittest.TestCase):
             html.index("termmate-command-row"), html.index("⎿ 8 lines"))
         self.assertIn(f"toggle:{entry['key']}:command", html)
         self.assertIn(f"toggle:{entry['key']}:output", html)
-        self.assertIn(f"copy:{entry['key']}:output", html)
+        self.assertNotIn("copy", html)
 
     def test_tool_call_without_output_has_one_row(self):
         entry = self.manager.add_tool_call(
@@ -277,7 +265,7 @@ class TestToolOutputManager(unittest.TestCase):
         html = self.manager._row_html(entry)
         self.assertIn("npm test", html)
         self.assertNotIn("⎿", html)
-        self.assertNotIn(">copy<", html)
+        self.assertNotIn("copy", html)
 
     def test_command_toggle_keeps_output_row_in_place(self):
         entry = self.manager.add_tool_call(
@@ -318,25 +306,6 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn(command_fence, self.view.text)
         self.assertNotIn("out line", self.view.text)
         self.assertEqual(self.input_pos(), 10 + len(command_fence))
-
-    def test_tool_call_copy_uses_output_detail(self):
-        entry = self.manager.add_tool_call(
-            self.anchor,
-            {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"},
-            {"summary": "2 lines", "detail": "out\nsecond"},
-        )
-        with patch("sublime.set_clipboard") as clipboard, \
-                patch("sublime.status_message") as status:
-            self.manager.copy(entry["key"], "output")
-        clipboard.assert_called_once_with("out\nsecond")
-        self.assertIn("2 lines", status.call_args[0][0])
-
-    def test_copy_missing_entry_is_noop(self):
-        with patch("sublime.set_clipboard") as clipboard, \
-                patch("sublime.status_message") as status:
-            self.manager.copy("missing")
-        clipboard.assert_not_called()
-        self.assertIn("no longer available", status.call_args[0][0])
 
     def test_truncate_drops_rows_at_or_after_cut_point(self):
         first = self.manager.add(sublime.Region(2, 2), "1 line", "a")
@@ -389,15 +358,32 @@ class TestFormatToolResult(unittest.TestCase):
             name="command_execution", output=output, status="completed"
         )
         self.assertEqual(inline, "")
-        self.assertEqual(summary, "10 lines")
+        self.assertEqual(summary, "10 lines success")
         self.assertEqual(detail, output)
 
-    def test_error_summary_is_marked(self):
+    def test_error_summary_is_marked_failed(self):
         output = "\n".join(f"err {i}" for i in range(6))
         _, summary, _ = self._result(
             name="command_execution", output="", error=output, status="error"
         )
-        self.assertTrue(summary.startswith("error · "))
+        self.assertEqual(summary, "6 lines failed")
+
+    def test_uppercase_error_status_is_failed(self):
+        output = "\n".join(f"err {i}" for i in range(6))
+        _, summary, _ = self._result(
+            name="command_execution", output=output, status="ERROR"
+        )
+        self.assertEqual(summary, "6 lines failed")
+
+    def test_nonzero_exit_code_is_failed(self):
+        output = "\n".join(f"line {i}" for i in range(6))
+        _, summary, _ = self._result(
+            name="command_execution",
+            output=output,
+            status="completed",
+            metadata={"exit_code": 2},
+        )
+        self.assertEqual(summary, "6 lines failed")
 
     def test_edit_tool_is_not_rendered_twice(self):
         inline, summary, detail = self._result(
@@ -485,7 +471,7 @@ class TestFormatToolCall(unittest.TestCase):
         call = phantoms[0]
         self.assertEqual(call["kind"], "tool_call")
         self.assertEqual(call["line"], -1)
-        self.assertEqual(call["output"]["summary"], "10 lines")
+        self.assertEqual(call["output"]["summary"], "10 lines success")
         self.assertEqual(call["output"]["detail"], output)
 
     def test_edit_tool_output_is_not_duplicated(self):
