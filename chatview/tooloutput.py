@@ -1,14 +1,20 @@
-"""Collapsed tool-output rows rendered as phantoms.
+"""Collapsed tool rows rendered as phantoms.
 
 Long tool results are not written into the chat buffer by default. Instead a
 single phantom row is anchored below the tool header:
 
     ⏺ Bash npm test
-    ⎿ 42 lines · completed                          [show] [copy]
+    ⎿ 42 lines                                  [show] [copy]
 
-Clicking ``show`` inserts the full output as a fenced code block right after
-the header line (and toggles the link to ``hide``). Clicking ``copy`` puts the
-raw output on the clipboard without changing the expanded state.
+Command tool calls (``command_execution`` / ``run_command``) are phantom-only:
+the command text never enters the buffer while collapsed.
+
+    ⏺ command (npm test -- --watch …)           [show]
+    ⎿ 42 lines                                  [show] [copy]
+
+Clicking ``show`` inserts the full text as a fenced code block right after the
+anchor line (and toggles the link to ``hide``). Clicking ``copy`` puts the raw
+output on the clipboard without changing the expanded state.
 """
 
 import html
@@ -36,8 +42,14 @@ class ToolOutputManager:
 
     # ---------------------------------------------------------------- public
 
-    def add(self, anchor, summary, detail, key=None):
-        """Register a collapsed output row anchored at ``anchor`` (a Region)."""
+    def add(self, anchor, summary, detail, key=None, kind="output", heading="",
+            show_copy=True):
+        """Register a collapsed row anchored at ``anchor`` (a Region).
+
+        ``kind`` is ``"output"`` (the ``⎿`` row) or ``"command"`` (the
+        phantom-only command preview). ``heading`` is the text placed before
+        the summary for command rows (e.g. ``⏺ command``).
+        """
         if not detail:
             return None
         if key is None:
@@ -49,8 +61,11 @@ class ToolOutputManager:
             "key": key,
             "region_key": region_key,
             "detail_key": key + "_detail",
+            "kind": kind,
+            "heading": heading,
             "summary": summary,
             "detail": detail,
+            "show_copy": show_copy and kind == "output",
             "expanded": False,
             "copied": False,
         }
@@ -135,6 +150,9 @@ class ToolOutputManager:
         if not text:
             return
         insert_at = self.view.full_line(anchor).end()
+        # Capture the input anchor before editing: regions shift with the
+        # insert, so adding the delta afterwards would double-count.
+        start_before = self._input_start()
         inserted = self.view.insert(edit, insert_at, text)
         self.view.add_regions(
             entry["detail_key"],
@@ -142,26 +160,25 @@ class ToolOutputManager:
             flags=sublime.HIDDEN,
         )
         entry["expanded"] = True
-        self._shift_input_start(insert_at, inserted)
+        if start_before is not None and insert_at <= start_before:
+            self._set_input_start(self.view, max(0, start_before + inserted))
 
     def _collapse(self, edit, entry):
         regions = self.view.get_regions(entry["detail_key"])
         if regions:
             region = regions[0]
             size = region.size()
+            start_before = self._input_start()
             self.view.erase(edit, region)
-            self._shift_input_start(region.begin(), -size)
+            if start_before is not None and region.begin() <= start_before:
+                self._set_input_start(self.view, max(0, start_before - size))
         self.view.erase_regions(entry["detail_key"])
         entry["expanded"] = False
 
-    def _shift_input_start(self, position, delta):
-        if not self._get_input_start or not self._set_input_start:
-            return
-        start = self._get_input_start(self.view, 0)
-        if start is None:
-            return
-        if position <= start:
-            self._set_input_start(self.view, max(0, start + delta))
+    def _input_start(self):
+        if not self._get_input_start:
+            return None
+        return self._get_input_start(self.view, 0)
 
     def _update(self):
         phantoms = []
@@ -193,20 +210,32 @@ class ToolOutputManager:
         toggle_label = "hide" if entry["expanded"] else "show"
         copy_label = "copied" if entry["copied"] else "copy"
         body_id = f"chatview-tool-output-{entry['key']}"
+        is_command = entry.get("kind") == "command"
+        row_class = "termmate-command-row" if is_command else "termmate-tool-row"
+        if is_command:
+            label = html.escape(entry.get("heading") or "⏺ command")
+            body = f"<span>{label} ({summary})</span>"
+            links = f"&nbsp;&nbsp;<a href='toggle:{entry['key']}'>{toggle_label}</a>"
+        else:
+            body = f"<span>⎿ {summary}</span>"
+            links = f"&nbsp;&nbsp;<a href='toggle:{entry['key']}'>{toggle_label}</a>"
+            if entry.get("show_copy"):
+                links += f"&nbsp;&nbsp;<a href='copy:{entry['key']}'>{copy_label}</a>"
         return (
             f"<body id='{body_id}' style='margin:0;padding:0;"
             "background-color:transparent;'>"
             "<style>"
             ".termmate-tool-row{font-family:var(--font-mono);font-size:0.88em;"
             "color:color(var(--foreground) alpha(0.55));padding:1px 0 3px 2px;}"
-            ".termmate-tool-row a{color:var(--bluish);text-decoration:none;"
-            "margin-left:12px;}"
-            ".termmate-tool-row a:hover{text-decoration:underline;}"
+            ".termmate-command-row{font-family:var(--font-mono);font-size:0.92em;"
+            "color:color(var(--foreground) alpha(0.85));padding:1px 0 3px 2px;}"
+            ".termmate-tool-row a,.termmate-command-row a{color:var(--bluish);"
+            "text-decoration:none;}"
+            ".termmate-tool-row a:hover,.termmate-command-row a:hover"
+            "{text-decoration:underline;}"
             "</style>"
-            "<div class='termmate-tool-row'>"
-            f"<span>⎿ {summary}</span>"
-            f"<a href='toggle:{entry['key']}'>{toggle_label}</a>"
-            f"<a href='copy:{entry['key']}'>{copy_label}</a>"
+            f"<div class='{row_class}'>"
+            f"{body}{links}"
             "</div>"
             "</body>"
         )

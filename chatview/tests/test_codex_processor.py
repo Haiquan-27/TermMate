@@ -350,13 +350,20 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         )
 
     def test_formats_completed_shell_tool(self):
-        output = self.processor._format_tool_block({
+        text, phantoms = self.processor.format_tool_call({
             "name": "command_execution",
             "command": "python3 -m unittest",
             "status": "completed",
         })
 
-        self.assertEqual(output, "⏺ command (python3 -m unittest)")
+        self.assertEqual(text, "")
+        self.assertEqual(len(phantoms), 1)
+        command_row = phantoms[0]
+        self.assertEqual(command_row["kind"], "command")
+        self.assertEqual(command_row["heading"], "⏺ command")
+        self.assertEqual(command_row["summary"], "python3 -m unittest")
+        self.assertEqual(command_row["detail"], "python3 -m unittest")
+        self.assertEqual(command_row["line"], -1)
 
     def test_tool_after_text_without_newline_ensures_blank_line(self):
         appended = []
@@ -545,17 +552,20 @@ class TestThinkPresets(unittest.TestCase):
 
         # run_command
         cmd_block = {"name": "run_command", "parameters": {"CommandLine": "git status"}}
-        self.assertEqual(processor._format_tool_block(cmd_block), "⏺ RunCommand (git status)")
+        text, phantoms = processor.format_tool_call(cmd_block)
+        self.assertEqual(text, "")
+        self.assertEqual(phantoms[0]["heading"], "⏺ RunCommand")
+        self.assertEqual(phantoms[0]["summary"], "git status")
 
         # run_command multiline
         multi_cmd = {
             "name": "run_command",
             "parameters": {"CommandLine": "echo first\necho second"},
         }
-        self.assertEqual(
-            processor._format_tool_block(multi_cmd),
-            "⏺ RunCommand (echo first)\n\n    echo second\n",
-        )
+        text, phantoms = processor.format_tool_call(multi_cmd)
+        self.assertEqual(text, "")
+        self.assertEqual(phantoms[0]["summary"], "echo first …")
+        self.assertEqual(phantoms[0]["detail"], "echo first\necho second")
 
         # view_file
         view_block = {"name": "view_file", "parameters": {"AbsolutePath": "/workspace/foo.py"}}

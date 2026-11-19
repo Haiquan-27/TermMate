@@ -14,6 +14,7 @@ LOG = logging.getLogger("TermMate")
 
 _WINDOWS_DRIVE_PATH_RE = re.compile(r'^[a-zA-Z]:[\\/]')
 _TOOL_ARGUMENTS_MAX_CHARS = 300
+_COMMAND_PREVIEW_MAX_CHARS = 120
 _DIFF_TOOL_NAMES = frozenset({
     "apply_patch",
     "edit",
@@ -480,7 +481,101 @@ class BaseChatMessageProcessor:
             return utils.format_fenced_output(cleaned), "", ""
         return "", summary, cleaned
 
-    def append_content(self, text, flush=False, is_tool=False, tool_outputs=None):
+    def _command_text(self, block):
+        """Return the raw command for command-like tools, else None."""
+        name = str(block.get("name") or "").lower()
+        if name == "command_execution":
+            value = block.get("command")
+        elif name in ("run_command", "runcommand"):
+            params = block.get("parameters")
+            if not isinstance(params, dict):
+                params = block.get("input")
+            if not isinstance(params, dict):
+                params = {}
+            value = (
+                params.get("CommandLine")
+                or params.get("command")
+                or params.get("cmd")
+                or block.get("command")
+            )
+        else:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            return None
+        return value.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _command_heading(self, block):
+        name = str(block.get("name") or "").lower()
+        label = "RunCommand" if name in ("run_command", "runcommand") else "command"
+        return f"⏺ {label}"
+
+    def _command_preview(self, command, limit=_COMMAND_PREVIEW_MAX_CHARS):
+        """One-line command preview, truncated with an ellipsis."""
+        lines = command.rstrip().splitlines() or [""]
+        first = lines[0].strip()
+        has_more = len(lines) > 1
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = _COMMAND_PREVIEW_MAX_CHARS
+        if len(first) > limit:
+            first = first[: max(1, limit - 1)].rstrip() + "…"
+        elif has_more:
+            first = f"{first} …"
+        return first or "…"
+
+    def format_tool_call(self, block):
+        """Return ``(text, phantoms)`` for one tool call.
+
+        ``text`` is the buffer text to append (empty when the call is
+        phantom-only). ``phantoms`` is a list of dicts consumed by
+        ``term_chat_output_append``:
+
+            {"line": int, "kind": "output"|"command",
+             "heading": str, "summary": str, "detail": str}
+
+        ``line`` is a row offset inside ``text``; ``-1`` anchors the row on
+        the line preceding the appended text.
+        """
+        if not isinstance(block, dict):
+            return "", []
+
+        command = self._command_text(block)
+        if command is not None:
+            phantoms = [{
+                "line": -1,
+                "kind": "command",
+                "heading": self._command_heading(block),
+                "summary": self._command_preview(command),
+                "detail": command.rstrip("\n"),
+            }]
+            inline_text, summary, detail = self.format_tool_result(block)
+            if inline_text:
+                return inline_text, phantoms
+            if detail:
+                phantoms.append({
+                    "line": -1,
+                    "kind": "output",
+                    "summary": summary,
+                    "detail": detail,
+                })
+            return "", phantoms
+
+        text = self._format_tool_block(block)
+        inline_text, summary, detail = self.format_tool_result(block)
+        phantoms = []
+        if inline_text:
+            text = f"{text}\n{inline_text}"
+        elif detail:
+            phantoms.append({
+                "line": text.count("\n"),
+                "kind": "output",
+                "summary": summary,
+                "detail": detail,
+            })
+        return text, phantoms
+
+    def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None):
         """Append Markdown content through the chat session."""
         if text:
             raw = text.replace("\r", "")
@@ -489,9 +584,9 @@ class BaseChatMessageProcessor:
         if not is_tool and text and text.strip().startswith("⏺"):
             is_tool = True
         if is_tool:
-            if tool_outputs:
+            if tool_phantoms:
                 self.session.append_markdown(
-                    text, flush=flush, is_tool=True, tool_outputs=tool_outputs
+                    text, flush=flush, is_tool=True, tool_phantoms=tool_phantoms
                 )
             else:
                 self.session.append_markdown(text, flush=flush, is_tool=True)
@@ -640,8 +735,11 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                             if not self.last_is_tool_call and need_newline:
                                 self.append_content("\n", is_tool=True)
                             self.last_is_tool_call = True
+                            rendered, phantoms = self.format_tool_call(block)
                             self.append_content(
-                                self._format_tool_block(block) + "\n", is_tool=True
+                                (rendered + "\n") if rendered else "",
+                                is_tool=True,
+                                tool_phantoms=phantoms or None,
                             )
 
             if text_content:
@@ -889,8 +987,11 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             if not self.last_is_tool_call:
                 self.append_content("\n", is_tool=True)
             self.last_is_tool_call = True
+            rendered, phantoms = self.format_tool_call(message.content)
             self.append_content(
-                self._format_tool_block(message.content) + "\n", is_tool=True
+                (rendered + "\n") if rendered else "",
+                is_tool=True,
+                tool_phantoms=phantoms or None,
             )
             if message.content.get("name") == "fileChange":
                 self._record_file_changes(message.content)
@@ -976,18 +1077,7 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
     def _format_tool_block(self, block):
         name = block.get("name")
 
-        if name == "command_execution":
-            command = block.get("command", "")
-            if command:
-                lines = command.rstrip().splitlines()
-                if len(lines) > 1:
-                    first_line = lines[0]
-                    indented_rest = "\n".join("    " + line for line in lines[1:])
-                    return f"⏺ command ({first_line})\n\n{indented_rest}\n"
-                elif len(lines) == 1:
-                    return f"⏺ command ({lines[0]})"
-            return "⏺ command"
-        elif name == "fileChange":
+        if name == "fileChange":
             changes = block.get("changes", [])
             cwd = (self.session.agent_thread.cwd
                    if self.session.agent_thread else self.session.cwd) or ""
@@ -1132,19 +1222,11 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             self.last_is_tool_call = True
             self._text_trailing_newlines = 0
             block = message.content if isinstance(message.content, dict) else {}
-            rendered = self._format_tool_block(block)
-            inline_text, summary, detail = self.format_tool_result(block)
-            tool_outputs = None
-            if inline_text:
-                rendered = f"{rendered}\n{inline_text}"
-            elif detail:
-                tool_outputs = [{
-                    "line": rendered.count("\n"),
-                    "summary": summary,
-                    "detail": detail,
-                }]
+            rendered, phantoms = self.format_tool_call(block)
             self.append_content(
-                rendered + "\n", is_tool=True, tool_outputs=tool_outputs
+                (rendered + "\n") if rendered else "",
+                is_tool=True,
+                tool_phantoms=phantoms or None,
             )
             if block.get("name") == "fileChange":
                 self._record_file_changes(block)
@@ -1207,18 +1289,6 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
 
     def _format_tool_block(self, block):
         name = block.get("name")
-        if name == "command_execution":
-            command = block.get("command", "")
-            if command:
-                lines = command.rstrip().splitlines()
-                if len(lines) > 1:
-                    first_line = lines[0]
-                    indented_rest = "\n".join("    " + line for line in lines[1:])
-                    return f"⏺ command ({first_line})\n\n{indented_rest}\n"
-                if len(lines) == 1:
-                    return f"⏺ command ({lines[0]})"
-            return "⏺ command"
-
         if name == "fileChange":
             changes = block.get("changes", [])
             cwd = (self.session.agent_thread.cwd
@@ -1456,9 +1526,13 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                             if not self.last_is_tool_call:
                                 self.append_content("\n", is_tool=True)
                             self.last_is_tool_call = True
-                            content = self._format_tool_block(block)
-                            if content:
-                                self.append_content(content + "\n", is_tool=True)
+                            content, phantoms = self.format_tool_call(block)
+                            if content or phantoms:
+                                self.append_content(
+                                    (content + "\n") if content else "",
+                                    is_tool=True,
+                                    tool_phantoms=phantoms or None,
+                                )
 
         elif message.type == "system":
             if hasattr(message, "content") and isinstance(message.content, dict):
@@ -1892,8 +1966,11 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
             if not self.last_is_tool_call:
                 self.append_content("\n", is_tool=True)
             self.last_is_tool_call = True
+            rendered, phantoms = self.format_tool_call(content_data)
             self.append_content(
-                self._format_tool_block(content_data) + "\n", is_tool=True
+                (rendered + "\n") if rendered else "",
+                is_tool=True,
+                tool_phantoms=phantoms or None,
             )
 
             if self._is_user_artifact(content_data):
@@ -1996,17 +2073,6 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
                 first_summary = summary.strip().splitlines()[0]
                 return f"⏺ CreateArtifact {name} ({first_summary})"
             return f"⏺ CreateArtifact {name}"
-
-        if name == "run_command":
-            cmd = params.get("CommandLine") or params.get("command") or ""
-            if cmd:
-                lines = cmd.rstrip().splitlines()
-                if len(lines) > 1:
-                    first_line = lines[0]
-                    indented_rest = "\n".join("    " + line for line in lines[1:])
-                    return f"⏺ {display_name} ({first_line})\n\n{indented_rest}\n"
-                return f"⏺ {display_name} ({lines[0]})"
-            return f"⏺ {display_name}"
 
         if name in ("view_file", "read_file"):
             file_path = (
