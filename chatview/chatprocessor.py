@@ -1443,6 +1443,11 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         TUI-style ``↳ Shell finished`` entry with its own ``show`` link.
         """
         command = str(command or "").strip()
+        utils.DIAG.info(
+            "apply_shell_finished command=%r failed=%r output_len=%d "
+            "tool_key=%r shell_id=%r has_tool_call=%r",
+            command, failed, len(output or ""), tool_key, shell_id,
+            self.has_tool_call(tool_key) if tool_key else None)
         if not command:
             return None
         if tool_key and self.has_tool_call(tool_key):
@@ -1460,6 +1465,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
     def _handle_shell_finished(self, message):
         """Render an OpenCode background shell completion row."""
         content = message.content if isinstance(message.content, dict) else {}
+        utils.DIAG.info("handle_shell_finished message.content=%r", content)
         phantom = self.apply_shell_finished(
             content.get("command"),
             bool(content.get("failed")),
@@ -1468,6 +1474,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             exit_code=content.get("exit"),
             shell_id=content.get("shell_id"),
         )
+        utils.DIAG.info("handle_shell_finished phantom=%r", phantom)
         if not phantom:
             return
         # The phantom-only append inserts the line it anchors on, so the
@@ -1475,6 +1482,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         self.last_is_tool_call = False
         self._text_trailing_newlines = 2
         self.append_content("", is_tool=True, tool_phantoms=[phantom])
+        utils.DIAG.info("handle_shell_finished append_content done")
 
     def _format_tool_block(self, block):
         name = block.get("name")

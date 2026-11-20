@@ -2480,6 +2480,7 @@ class ChatSession:
             elif kind == "shell":
                 command = event.get("command")
                 processor = self.message_processor
+                plugin.DIAG.info("replay shell event=%r", event)
                 if command and processor is not None:
                     phantom = processor.apply_shell_finished(
                         command,
@@ -3248,7 +3249,16 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                 elif kind == "shell_finished":
                     command = item.get("command") or {}
                     if not command.get("detail"):
+                        plugin.DIAG.info(
+                            "append command skipped shell_finished without "
+                            "command item=%r", item)
                         continue
+                    plugin.DIAG.info(
+                        "append command adding shell_finished key=%r "
+                        "anchor=%d text=%r summary=%r output_len=%d",
+                        item.get("key"), anchor_point,
+                        text[:20], item.get("summary"),
+                        len((item.get("output") or {}).get("detail") or ""))
                     session.tool_outputs.add_shell_finished(
                         anchor,
                         command.get("detail"),

@@ -1,10 +1,32 @@
 import logging
 import difflib
+import os
 import re
+import tempfile
+
 import sublime
 
 
 LOG = logging.getLogger("TermMate")
+
+#: TEMPORARY diagnostic channel for tool-row insertion.  Writes to
+#: ``%TEMP%/termmate-tool-rows.log`` regardless of the configured log level so
+#: a live run can be inspected without attaching a debugger.
+DIAG = logging.getLogger("TermMate.Diag")
+if not DIAG.handlers:
+    DIAG.setLevel(logging.DEBUG)
+    DIAG.propagate = False
+    try:
+        _diag_handler = logging.FileHandler(
+            os.path.join(tempfile.gettempdir(), "termmate-tool-rows.log"),
+            mode="w",
+            encoding="utf-8",
+        )
+        _diag_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s"))
+        DIAG.addHandler(_diag_handler)
+    except OSError:
+        DIAG.addHandler(logging.NullHandler())
 
 def get_log_level(level_name):
     """Maps log level names to logging constants."""
