@@ -33,6 +33,25 @@ from .base_agent import AgentOptions, BaseAgent, Message, MessageType
 
 LOG = logging.getLogger("TermMate")
 
+#: TEMPORARY diagnostic channel for tool-row insertion.  Shares the logger
+#: and file handler with ``chatview.utils`` (same name), so only the module
+#: imported first installs the handler.
+DIAG = logging.getLogger("TermMate.Diag")
+if not DIAG.handlers:
+    DIAG.setLevel(logging.DEBUG)
+    DIAG.propagate = False
+    try:
+        _diag_handler = logging.FileHandler(
+            os.path.join(tempfile.gettempdir(), "termmate-tool-rows.log"),
+            mode="w",
+            encoding="utf-8",
+        )
+        _diag_handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(message)s"))
+        DIAG.addHandler(_diag_handler)
+    except OSError:
+        DIAG.addHandler(logging.NullHandler())
+
 _SERVER_URL_RE = re.compile(
     r"(?:opencode\s+)?server listening on\s+(https?://[^\s]+)", re.IGNORECASE
 )
@@ -1346,6 +1365,7 @@ class OpenCodeAgent(BaseAgent):
                 with self._sse_response_lock:
                     self._sse_response = response
                 self._sse_ready.set()
+                DIAG.info("sse connected url=%s", url)
                 reconnect_delay = 0.25
                 self._consume_sse(response)
             except Exception as error:
@@ -1448,7 +1468,25 @@ class OpenCodeAgent(BaseAgent):
             )
             return
 
+        diag_events = (
+            "session.synthetic",
+            "session.shell.started",
+            "session.shell.ended",
+            "session.tool.success",
+            "session.tool.failed",
+            "session.execution.succeeded",
+            "session.execution.interrupted",
+            "session.idle",
+            "session.status",
+        )
+        if event_type in diag_events:
+            DIAG.info("event type=%s current_session=%r data=%s",
+                      event_type, self._session_id, str(properties)[:800])
+
         if not self._belongs_to_session(properties):
+            if event_type in diag_events:
+                DIAG.info("event ignored: not this session type=%s",
+                          event_type)
             return
 
         # =================================================================
@@ -1560,6 +1598,8 @@ class OpenCodeAgent(BaseAgent):
                     # this also lets ``session.shell.ended`` act as a fallback
                     # when the tool result never carried a shellID.
                     self._background_shells.setdefault(shell_id, "")
+                DIAG.info("shell started id=%r command=%r metadata=%r",
+                          shell_id, command, metadata)
             return
         if event_type == "session.shell.ended":
             await self._handle_shell_ended_v2(properties)
@@ -1942,9 +1982,14 @@ class OpenCodeAgent(BaseAgent):
     async def _handle_synthetic_v2(self, properties: Dict[str, Any]) -> None:
         """[OpenCode v2] Turn a shell completion notice into a chat line."""
         metadata = properties.get("metadata")
+        DIAG.info("synthetic metadata=%r description=%r text=%r",
+                  metadata, properties.get("description"),
+                  str(properties.get("text"))[:200])
         if not isinstance(metadata, dict):
+            DIAG.info("synthetic ignored: metadata not a dict")
             return
         if str(metadata.get("source") or "").lower() != "shell":
+            DIAG.info("synthetic ignored: source=%r", metadata.get("source"))
             return
         shell_id = str(
             metadata.get("shellID") or metadata.get("jobID") or "")
@@ -1965,6 +2010,8 @@ class OpenCodeAgent(BaseAgent):
     async def _handle_shell_ended_v2(self, properties: Dict[str, Any]) -> None:
         """[OpenCode v2] Fallback notice when no synthetic message follows."""
         shell = properties.get("shell")
+        DIAG.info("shell ended shell=%r background=%r",
+                  shell, dict(self._background_shells))
         if not isinstance(shell, dict):
             return
         shell_id = str(shell.get("id") or "")
@@ -1974,6 +2021,8 @@ class OpenCodeAgent(BaseAgent):
         # outlived their tool call need a completion line.
         if shell_id not in self._background_shells:
             tool_id = self._tool_id_for_shell(shell_id)
+            DIAG.info("shell ended lookup shell_id=%r tool_id=%r",
+                      shell_id, tool_id)
             if not tool_id:
                 return
             self._background_shells[shell_id] = tool_id
@@ -2019,7 +2068,12 @@ class OpenCodeAgent(BaseAgent):
         state: str,
         exit_code: Any,
     ) -> None:
+        DIAG.info(
+            "emit_shell_finished shell_id=%r command=%r output_len=%d state=%r "
+            "exit=%r already=%r", shell_id, command, len(output or ""), state,
+            exit_code, shell_id in self._finished_shells)
         if not command or shell_id in self._finished_shells:
+            DIAG.info("emit_shell_finished skipped shell_id=%r", shell_id)
             return
         self._finished_shells.add(shell_id)
         tool_key = self._background_shells.get(shell_id)
@@ -2027,6 +2081,9 @@ class OpenCodeAgent(BaseAgent):
             tool_key = self._tool_id_for_shell(shell_id)
             if tool_key:
                 self._background_shells[shell_id] = tool_key
+        DIAG.info("emit_shell_finished tool_key=%r background=%r cached=%r",
+                  tool_key, dict(self._background_shells),
+                  list(self._tool_calls)[:10])
         lowered = state.strip().lower()
         succeeded = lowered in ("exited", "completed", "success", "succeeded")
         if exit_code is not None:
@@ -2046,6 +2103,8 @@ class OpenCodeAgent(BaseAgent):
                 "failed": not succeeded,
             },
         ))
+        DIAG.info("emit_shell_finished queued shell_id=%r queue_size=%d",
+                  shell_id, self._message_queue.qsize())
 
     async def _handle_tool_terminal_v2(
         self, properties: Dict[str, Any], status: str
@@ -2092,6 +2151,10 @@ class OpenCodeAgent(BaseAgent):
         if shell_id and background:
             # Backgrounded command: the tool returned, the shell keeps going.
             self._background_shells[str(shell_id)] = tool_id
+        DIAG.info(
+            "tool terminal id=%r name=%r status=%r shell_id=%r background=%r "
+            "metadata=%r", tool_id, raw_name, status, shell_id, background,
+            metadata)
         content = _tool_content_from_state(raw_name, state)
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=tool_id

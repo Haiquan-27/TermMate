@@ -43,6 +43,7 @@ import sublime
 from .utils import format_fenced_output
 
 LOG = logging.getLogger("TermMate")
+DIAG = logging.getLogger("TermMate.Diag")
 
 #: Status row text for command calls that have not finished yet.
 STATUS_LABELS = {
@@ -154,10 +155,13 @@ class ToolOutputManager:
         """
         command = str(command or "").strip()
         if not command:
+            DIAG.info("add_shell_finished ignored empty command key=%r", key)
             return None
         if key is not None:
             existing = self.find(key)
             if existing is not None:
+                DIAG.info("add_shell_finished update key=%r output_len=%d",
+                          key, len(output or ""))
                 return self._update_shell_finished(
                     existing, command, output, failed, summary, edit=edit)
         if key is None:
@@ -178,6 +182,11 @@ class ToolOutputManager:
         }
         self.entries.append(entry)
         self._update()
+        DIAG.info(
+            "add_shell_finished created key=%r anchor=%d summary=%r "
+            "output_len=%d entries=%d",
+            key, anchor.begin(), entry["summary"], len(output or ""),
+            len(self.entries))
         return entry
 
     def find(self, key):
