@@ -10,6 +10,7 @@ from genfoundry.base_agent import AgentOptions
 from genfoundry.opencode_agent import (
     OpenCodeAgent,
     OpenCodeHTTPError,
+    _shell_command_from_text,
     _shell_synthetic_output,
     detect_opencode_version,
     detect_opencode_version_info,
@@ -40,6 +41,38 @@ class TestShellSyntheticOutput(unittest.TestCase):
 
     def test_non_shell_text_is_returned_unchanged(self):
         self.assertEqual(_shell_synthetic_output("plain"), "plain")
+
+
+class TestShellCommandFromText(unittest.TestCase):
+    def test_reads_command_attribute(self):
+        text = (
+            '<shell id="sh_1" state="completed" command="npm run dev">\n'
+            "ready\n</shell>"
+        )
+        self.assertEqual(_shell_command_from_text(text), "npm run dev")
+
+    def test_reads_command_with_quoted_arguments(self):
+        text = (
+            '<shell id="sh_1" state="completed" '
+            'command="Start-Sleep -Seconds 10; Write-Output "ok"">\n'
+            "ok\n</shell>"
+        )
+        self.assertEqual(
+            _shell_command_from_text(text),
+            'Start-Sleep -Seconds 10; Write-Output "ok"',
+        )
+
+    def test_reads_command_from_notification_prefix(self):
+        text = (
+            "The following shell command was executed by the user:\n"
+            '<shell id="sh_1" state="completed" command="ls -la">\n'
+            "a\n</shell>"
+        )
+        self.assertEqual(_shell_command_from_text(text), "ls -la")
+
+    def test_missing_command_returns_empty(self):
+        self.assertEqual(_shell_command_from_text("plain"), "")
+        self.assertEqual(_shell_command_from_text(""), "")
 
 
 class TestFindOpenCodeCLI(unittest.TestCase):
@@ -969,6 +1002,133 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content["command"], "npm run dev")
         self.assertEqual(content["output"], "server ready")
         self.assertFalse(content["failed"])
+
+    async def test_v2_inbox_synthetic_shell_notice_emits_shell_finished(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.inbox.enqueued",
+            "data": {
+                "sessionID": "ses_v2",
+                "inboxID": "msg_inbox",
+                "item": {
+                    "type": "synthetic",
+                    "payload": {
+                        "text": (
+                            "The following shell command was executed by the "
+                            "user:\n"
+                            '<shell id="sh_bg" state="completed" '
+                            'command="npm run dev">\nserver ready\r\n\n</shell>'
+                        ),
+                        "metadata": {
+                            "source": "shell",
+                            "shellID": "sh_bg",
+                            "state": "completed",
+                            "exit": 0,
+                        },
+                    },
+                    "delivery": "steer",
+                },
+            },
+        })
+
+        messages = await self._messages()
+        finished = [m for m in messages if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        content = finished[0].content
+        self.assertEqual(content["tool_key"], "call_v2_bg")
+        self.assertEqual(content["command"], "npm run dev")
+        self.assertEqual(content["output"], "server ready")
+        self.assertFalse(content["failed"])
+
+    async def test_v2_inbox_shell_notice_recovers_command_from_text(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.inbox.enqueued",
+            "data": {
+                "sessionID": "ses_v2",
+                "inboxID": "msg_inbox",
+                "item": {
+                    "type": "synthetic",
+                    "payload": {
+                        "text": (
+                            '<shell id="sh_bg" state="completed" '
+                            'command="npm run dev">\nserver ready\n</shell>'
+                        ),
+                        "metadata": {
+                            "source": "shell",
+                            "shellID": "sh_bg",
+                            "state": "completed",
+                            "exit": 0,
+                        },
+                    },
+                    "delivery": "steer",
+                },
+            },
+        })
+
+        finished = [
+            m for m in await self._messages() if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
+        self.assertEqual(finished[0].content["command"], "npm run dev")
+
+    async def test_v2_inbox_user_item_is_not_a_shell_notice(self):
+        await self.agent._dispatch_event({
+            "type": "session.inbox.enqueued",
+            "data": {
+                "sessionID": "ses_v2",
+                "inboxID": "msg_user",
+                "item": {"type": "user", "payload": {"text": "hello"}},
+            },
+        })
+
+        self.assertEqual(
+            [m for m in await self._messages() if m.type == "shell_finished"],
+            [])
+
+    async def test_v2_inbox_and_shell_ended_emit_once(self):
+        await self._start_background_shell()
+
+        await self.agent._dispatch_event({
+            "type": "session.inbox.enqueued",
+            "data": {
+                "sessionID": "ses_v2",
+                "inboxID": "msg_inbox",
+                "item": {
+                    "type": "synthetic",
+                    "payload": {
+                        "text": (
+                            '<shell id="sh_bg" state="completed" '
+                            'command="npm run dev">\nserver ready\n</shell>'
+                        ),
+                        "metadata": {
+                            "source": "shell",
+                            "shellID": "sh_bg",
+                            "state": "completed",
+                            "exit": 0,
+                        },
+                    },
+                },
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.shell.ended",
+            "data": {
+                "sessionID": "ses_v2",
+                "shell": {
+                    "id": "sh_bg",
+                    "command": "npm run dev",
+                    "status": "exited",
+                    "exit": 0,
+                },
+                "output": {"output": "server ready", "truncated": False},
+            },
+        })
+
+        finished = [
+            m for m in await self._messages() if m.type == "shell_finished"]
+        self.assertEqual(len(finished), 1)
 
     async def test_v2_synthetic_non_shell_message_is_ignored(self):
         await self.agent._dispatch_event({

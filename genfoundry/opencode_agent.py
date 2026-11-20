@@ -1470,6 +1470,7 @@ class OpenCodeAgent(BaseAgent):
 
         diag_events = (
             "session.synthetic",
+            "session.inbox.enqueued",
             "session.shell.started",
             "session.shell.ended",
             "session.tool.success",
@@ -1547,6 +1548,15 @@ class OpenCodeAgent(BaseAgent):
 
         # [v2] Prompt inbox lifecycle (resolves user message id)
         if event_type in ("session.inbox.enqueued", "session.inbox.delivered"):
+            item = properties.get("item")
+            if isinstance(item, dict) and str(
+                item.get("type") or ""
+            ).lower() == "synthetic":
+                # Background-shell completions are admitted as synthetic
+                # inbox items; this is the only public event that carries
+                # them.
+                await self._handle_inbox_synthetic_v2(item)
+                return
             message_id = str(
                 properties.get("inboxID")
                 or (properties.get("item") or {}).get("id")
@@ -1980,7 +1990,13 @@ class OpenCodeAgent(BaseAgent):
         ))
 
     async def _handle_synthetic_v2(self, properties: Dict[str, Any]) -> None:
-        """[OpenCode v2] Turn a shell completion notice into a chat line."""
+        """[OpenCode v2] Turn a shell completion notice into a chat line.
+
+        ``session.synthetic`` is not part of the public ``/api/event`` feed
+        (only a subset of event types is broadcast), so this is mostly a
+        compatibility path.  Live completions arrive through
+        ``_handle_inbox_synthetic_v2`` instead.
+        """
         metadata = properties.get("metadata")
         DIAG.info("synthetic metadata=%r description=%r text=%r",
                   metadata, properties.get("description"),
@@ -1991,6 +2007,35 @@ class OpenCodeAgent(BaseAgent):
         if str(metadata.get("source") or "").lower() != "shell":
             DIAG.info("synthetic ignored: source=%r", metadata.get("source"))
             return
+        await self._emit_shell_completion_v2(properties)
+
+    async def _handle_inbox_synthetic_v2(self, item: Dict[str, Any]) -> None:
+        """[OpenCode v2] Handle a synthetic shell item from the inbox.
+
+        The server admits background-shell completions as synthetic inbox
+        messages and broadcasts ``session.inbox.enqueued``; the
+        ``session.synthetic`` event itself never reaches ``/api/event``.
+        """
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            return
+        metadata = payload.get("metadata")
+        DIAG.info("inbox synthetic metadata=%r description=%r text=%r",
+                  metadata, payload.get("description"),
+                  str(payload.get("text"))[:200])
+        if not isinstance(metadata, dict):
+            return
+        if str(metadata.get("source") or "").lower() != "shell":
+            return
+        await self._emit_shell_completion_v2(payload)
+
+    async def _emit_shell_completion_v2(
+        self, properties: Dict[str, Any]
+    ) -> None:
+        """Emit ``shell_finished`` for a synthetic shell-completion payload."""
+        metadata = properties.get("metadata")
+        if not isinstance(metadata, dict):
+            return
         shell_id = str(
             metadata.get("shellID") or metadata.get("jobID") or "")
         if not shell_id:
@@ -1999,6 +2044,8 @@ class OpenCodeAgent(BaseAgent):
         command = str(properties.get("description") or "").strip()
         if not command:
             command = self._shell_commands.get(shell_id, "")
+        if not command:
+            command = _shell_command_from_text(text)
         await self._emit_shell_finished_v2(
             shell_id,
             command,
@@ -3246,17 +3293,16 @@ def _tool_output_text(value: Any) -> Optional[str]:
     return str(value)
 
 
-def _shell_synthetic_output(text: str) -> str:
-    """Extract the output body from a ``<shell …>output</shell>`` notice."""
+def _shell_opening_tag_end(text: str) -> int:
+    """Return the index of the ``>`` that closes a ``<shell ...>`` tag."""
     if not text:
-        return ""
+        return -1
     end = text.rfind("</shell>")
     if end <= 0:
-        return text
-    # Find the end of the opening tag, ignoring ``>`` inside quoted
-    # attributes (commands may contain redirections).
+        end = len(text)
+    # Ignore ``>`` inside quoted attributes (commands may contain
+    # redirections) and inside the command's own quoted arguments.
     quote = None
-    start = -1
     for index, char in enumerate(text[:end]):
         if quote:
             if char == quote:
@@ -3264,8 +3310,34 @@ def _shell_synthetic_output(text: str) -> str:
         elif char in ("'", '"'):
             quote = char
         elif char == ">":
-            start = index
-            break
+            return index
+    return -1
+
+
+def _shell_command_from_text(text: str) -> str:
+    """Extract the ``command`` attribute from a ``<shell ...>`` notice."""
+    tag_end = _shell_opening_tag_end(text)
+    if tag_end < 0:
+        return ""
+    tag = text[:tag_end]
+    marker = 'command="'
+    start = tag.find(marker)
+    if start < 0:
+        return ""
+    value = tag[start + len(marker):]
+    if value.endswith('"'):
+        value = value[:-1]
+    return value
+
+
+def _shell_synthetic_output(text: str) -> str:
+    """Extract the output body from a ``<shell …>output</shell>`` notice."""
+    if not text:
+        return ""
+    end = text.rfind("</shell>")
+    if end <= 0:
+        return text
+    start = _shell_opening_tag_end(text)
     if start < 0:
         return text
     return text[start + 1:end].lstrip("\r\n").rstrip()
