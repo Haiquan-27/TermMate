@@ -301,6 +301,44 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
         self.assertNotIn("Return", self.view.text)
 
+    def test_status_only_row_skips_header(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ read", "summary": "a.py",
+             "detail": "⏺ read a.py", "show_command": False},
+            {"summary": "10 lines success", "detail": "line\nline"},
+            status_only=True,
+        )
+        html = self.manager._row_html(entry)
+        self.assertNotIn("class='termmate-command-row'", html)
+        self.assertNotIn("⏺ read", html)
+        self.assertIn("⎿ 10 lines success", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+
+    def test_status_only_running_row_keeps_show(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ command", "summary": "npm test",
+             "detail": "npm test", "show_command": True},
+            status="running",
+            status_only=True,
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn("⎿ running…", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+
+    def test_status_only_expand_renders_only_return(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ read", "summary": "a.py",
+             "detail": "⏺ read a.py", "show_command": False},
+            {"summary": "2 lines success", "detail": "out line"},
+            status_only=True,
+        )
+        self.manager.toggle(None, entry["key"])
+        self.assertNotIn("Command", self.view.text)
+        self.assertIn("Return\n```text\nout line\n```\n", self.view.text)
+
     def test_shell_finished_row_has_no_toggle_and_is_blue(self):
         entry = self.manager.add_shell_finished(
             self.anchor,
@@ -572,15 +610,17 @@ class TestFormatToolCall(unittest.TestCase):
         block.setdefault("name", "command_execution")
         return self.processor.format_tool_call(block)
 
-    def test_command_never_writes_buffer_text(self):
+    def test_command_header_is_buffer_text(self):
         text, phantoms = self._call(command="python3 -m unittest")
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ command python3 -m unittest")
         self.assertEqual(len(phantoms), 1)
         call = phantoms[0]
         self.assertEqual(call["kind"], "tool_call")
-        self.assertEqual(call["line"], -1)
+        self.assertTrue(call["status_only"])
+        self.assertEqual(call["line"], 0)
         self.assertEqual(call["command"]["summary"], "python3 -m unittest")
         self.assertEqual(call["command"]["detail"], "python3 -m unittest")
+        self.assertTrue(call["command"]["show_command"])
         self.assertIsNone(call["output"])
 
     def test_multiline_preview_gets_ellipsis(self):
@@ -601,7 +641,7 @@ class TestFormatToolCall(unittest.TestCase):
         text, phantoms = self._call(
             command="git status", output="ok\ndone", status="completed"
         )
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ command git status")
         self.assertEqual([p["kind"] for p in phantoms], ["tool_call"])
         self.assertEqual(phantoms[0]["output"]["summary"], "2 lines success")
         self.assertEqual(phantoms[0]["output"]["detail"], "ok\ndone")
@@ -610,7 +650,7 @@ class TestFormatToolCall(unittest.TestCase):
         text, phantoms = self._call(
             command="false", output="boom", error="boom", status="error"
         )
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ command false")
         self.assertEqual(phantoms[0]["output"]["summary"], "1 line failed")
 
     def test_long_output_joins_the_command_phantom(self):
@@ -618,11 +658,12 @@ class TestFormatToolCall(unittest.TestCase):
         text, phantoms = self._call(
             command="npm test", output=output, status="completed"
         )
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ command npm test")
         self.assertEqual(len(phantoms), 1)
         call = phantoms[0]
         self.assertEqual(call["kind"], "tool_call")
-        self.assertEqual(call["line"], -1)
+        self.assertTrue(call["status_only"])
+        self.assertEqual(call["line"], 0)
         self.assertEqual(call["output"]["summary"], "10 lines success")
         self.assertEqual(call["output"]["detail"], output)
 
@@ -647,8 +688,15 @@ class TestFormatToolCall(unittest.TestCase):
         })
         self.assertTrue(text.startswith("⏺ read a.py"))
         self.assertEqual(len(phantoms), 1)
-        self.assertEqual(phantoms[0]["kind"], "output")
-        self.assertEqual(phantoms[0]["line"], text.count("\n"))
+        call = phantoms[0]
+        self.assertEqual(call["kind"], "tool_call")
+        self.assertTrue(call["status_only"])
+        self.assertEqual(call["line"], 0)
+        self.assertFalse(call["command"]["show_command"])
+        self.assertEqual(call["command"]["heading"], "⏺ read")
+        self.assertEqual(call["command"]["summary"], "a.py")
+        self.assertEqual(call["output"]["summary"], "10 lines success")
+        self.assertEqual(call["output"]["detail"], output)
 
 
 class TestToolCallPhase(unittest.TestCase):

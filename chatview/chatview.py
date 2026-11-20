@@ -3245,6 +3245,7 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                         key=item.get("key"),
                         status=item.get("status"),
                         edit=edit,
+                        status_only=bool(item.get("status_only")),
                     )
                 elif kind == "shell_finished":
                     command = item.get("command") or {}
