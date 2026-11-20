@@ -91,16 +91,17 @@ class ToolOutputManager:
         return entry
 
     def add_tool_call(self, anchor, command, output=None, key=None,
-                      status=None, edit=None):
-        """Register or update a command tool call as one composite phantom.
+                      status=None, edit=None, status_only=False):
+        """Register or update a tool call row.
 
-        A single phantom holds both the command preview row and the output
-        summary row. Keeping them in one phantom is what makes their order
-        stable: phantoms anchored at the same point have no defined order.
+        With ``status_only`` the header already lives in the buffer as real
+        text and this entry only renders the ``⎿`` status row. Without it the
+        phantom holds the header and the status row together (the older
+        command layout).
 
-        ``command`` is ``{"heading", "summary", "detail"}``; ``output`` is
-        ``{"summary", "detail"}`` or ``None``; ``status`` is ``"running"``,
-        ``"background"`` or ``None``.
+        ``command`` is ``{"heading", "summary", "detail", "show_command"}``;
+        ``output`` is ``{"summary", "detail"}`` or ``None``; ``status`` is
+        ``"running"``, ``"background"`` or ``None``.
 
         When ``key`` already exists the existing row is updated in place
         instead of creating a second phantom. That is how ``running…`` turns
@@ -113,7 +114,8 @@ class ToolOutputManager:
             existing = self.find(key)
             if existing is not None:
                 return self._update_tool_call(
-                    existing, command, output, status, edit)
+                    existing, command, output, status, edit,
+                    status_only=status_only)
         if key is None:
             key = self.REGION_PREFIX + str(self.next_id)
             self.next_id += 1
@@ -124,10 +126,12 @@ class ToolOutputManager:
             "region_key": region_key,
             "detail_key": key + "_detail",
             "kind": "tool_call",
+            "status_only": bool(status_only),
             "command": {
                 "heading": command.get("heading") or "⏺ command",
                 "summary": command.get("summary") or "",
                 "detail": command["detail"],
+                "show_command": command.get("show_command", True),
             },
             "output": None,
             "status": status,
@@ -255,13 +259,17 @@ class ToolOutputManager:
     def _find(self, key):
         return self.find(key)
 
-    def _update_tool_call(self, entry, command, output, status, edit):
-        """Apply a later event to an existing command row in place."""
+    def _update_tool_call(self, entry, command, output, status, edit,
+                          status_only=None):
+        """Apply a later event to an existing tool row in place."""
         if command.get("detail"):
             entry["command"] = {
                 "heading": command.get("heading") or entry["command"]["heading"],
                 "summary": command.get("summary") or "",
                 "detail": command["detail"],
+                "show_command": command.get(
+                    "show_command",
+                    entry["command"].get("show_command", True)),
             }
         if output is not None:
             summary = output.get("summary") or ""
@@ -270,6 +278,8 @@ class ToolOutputManager:
                 entry["output"] = {"summary": summary, "detail": detail}
             elif summary and not entry.get("output"):
                 entry["output"] = {"summary": summary, "detail": ""}
+        if status_only is not None:
+            entry["status_only"] = bool(status_only)
         entry["status"] = status
         if edit is not None and entry["expanded"]:
             self._render_tool_call_detail(edit, entry)
@@ -338,10 +348,11 @@ class ToolOutputManager:
         """
         sections = []
         if entry["expanded"]:
-            command_block = format_fenced_output(
-                entry["command"]["detail"], info="bash")
-            if command_block:
-                sections.append(f"Command\n{command_block}")
+            if entry["command"].get("show_command", True):
+                command_block = format_fenced_output(
+                    entry["command"]["detail"], info="bash")
+                if command_block:
+                    sections.append(f"Command\n{command_block}")
             output = entry.get("output")
             if output:
                 output_block = format_fenced_output(output["detail"])
@@ -420,7 +431,6 @@ class ToolOutputManager:
 
     def _tool_call_rows_html(self, entry):
         key = entry["key"]
-        command = entry["command"]
         label = "hide" if entry["expanded"] else "show"
         output = entry.get("output")
         row_summary = ""
@@ -428,9 +438,24 @@ class ToolOutputManager:
             row_summary = output.get("summary") or ""
         elif entry.get("status") in STATUS_LABELS:
             row_summary = STATUS_LABELS[entry["status"]]
-        command_links = ""
-        if not row_summary:
-            command_links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
+        command = entry["command"]
+        can_expand = bool(command.get("show_command")) or bool(
+            (output or {}).get("detail"))
+        links = (f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
+                 if can_expand else "")
+
+        if entry.get("status_only"):
+            if not row_summary:
+                return ""
+            return (
+                "<div class='termmate-tool-row'>"
+                f"<span>⎿ {html.escape(row_summary)}</span>"
+                f"{links}"
+                "</div>"
+            )
+
+        # Legacy composite row: header and status share one phantom.
+        command_links = "" if row_summary else links
         rows = [
             "<div class='termmate-command-row'>"
             f"<span>{html.escape(command['heading'])} "
@@ -442,7 +467,7 @@ class ToolOutputManager:
             rows.append(
                 "<div class='termmate-tool-row'>"
                 f"<span>⎿ {html.escape(row_summary)}</span>"
-                f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
+                f"{links}"
                 "</div>"
             )
         return "".join(rows)

@@ -577,25 +577,50 @@ class BaseChatMessageProcessor:
             first = f"{first} …"
         return first or "…"
 
+    @staticmethod
+    def _split_tool_header(line):
+        """Split ``⏺ read path`` into ``("⏺ read", "path")``."""
+        line = str(line or "").strip()
+        if not line.startswith("⏺"):
+            return "⏺ tool", line
+        body = line[1:].strip()
+        if not body:
+            return "⏺ tool", ""
+        name, _, rest = body.partition(" ")
+        rest = rest.strip()
+        # ``_format_tool_block`` renders generic tools as ``⏺ name (args)``;
+        # the status row only needs the arguments without the parentheses.
+        if rest.startswith("(") and rest.endswith(")"):
+            rest = rest[1:-1].strip()
+        return f"⏺ {name}", rest
+
+    def _is_diff_tool(self, block):
+        """Return True when the tool's body is an inline diff block."""
+        name = str(block.get("name") or "").lower()
+        if name in _DIFF_TOOL_NAMES:
+            return True
+        metadata = block.get("metadata")
+        return isinstance(metadata, dict) and bool(metadata.get("diff"))
+
     def format_tool_call(self, block, key=None):
         """Return ``(text, phantoms)`` for one tool call.
 
-        ``text`` is the buffer text to append (empty when the call is
-        phantom-only). ``phantoms`` is a list of dicts consumed by
+        The tool header (``⏺ name args``) stays real buffer text so it can be
+        selected, searched and double-clicked to open a file.  Only the
+        volatile status row (``⎿ running…`` / ``⎿ N lines success [show]``)
+        is a phantom, so it can update in place without touching the buffer.
+        ``phantoms`` is a list of dicts consumed by
         ``term_chat_output_append``:
 
-            {"line": int, "kind": "output",
-             "summary": str, "detail": str}
-
-            {"line": int, "kind": "tool_call", "key": str | None,
+            {"line": 0, "kind": "tool_call", "key": str | None,
+             "status_only": True,
              "status": "running" | "background" | None,
-             "command": {"heading", "summary", "detail"},
+             "command": {"heading", "summary", "detail", "show_command"},
              "output": {"summary", "detail"} | None}
 
-        ``line`` is a row offset inside ``text``; ``-1`` anchors the row on
-        the line preceding the appended text. Command calls use a single
-        composite phantom so the command row and the output row can never
-        swap places. A repeated ``key`` updates that phantom in place.
+        ``line`` is a row offset inside ``text``; ``0`` anchors the status row
+        on the appended header line so it renders directly below it. Diff
+        tools keep their body as inline text and do not get a status row.
         """
         if not isinstance(block, dict):
             return "", []
@@ -603,24 +628,29 @@ class BaseChatMessageProcessor:
         command = self._command_text(block)
         if command is not None:
             phase = _tool_call_phase(block)
+            heading = self._command_heading(block)
+            summary = self._command_preview(command)
             call = {
-                "line": -1,
+                "line": 0,
                 "kind": "tool_call",
                 "key": key,
+                "status_only": True,
                 "command": {
-                    "heading": self._command_heading(block),
-                    "summary": self._command_preview(command),
+                    "heading": heading,
+                    "summary": summary,
                     "detail": command.rstrip("\n"),
+                    "show_command": True,
                 },
                 "output": None,
             }
             if phase:
                 call["status"] = phase
             else:
-                _, summary, detail = self.format_tool_result(
+                _, out_summary, out_detail = self.format_tool_result(
                     block, force_collapse=True)
-                if detail:
-                    call["output"] = {"summary": summary, "detail": detail}
+                if out_detail:
+                    call["output"] = {
+                        "summary": out_summary, "detail": out_detail}
                 elif any(k in block for k in ("output", "error", "exitCode")):
                     # A finished command that printed nothing still needs a
                     # row: otherwise "running…" would simply vanish when it
@@ -629,21 +659,46 @@ class BaseChatMessageProcessor:
                         "summary": f"0 lines {_tool_result_status(block)}",
                         "detail": "",
                     }
-            return "", [call]
+            return f"{heading} {summary}".strip(), [call]
 
         text = self._format_tool_block(block)
-        inline_text, summary, detail = self.format_tool_result(block)
-        phantoms = []
-        if inline_text:
-            text = f"{text}\n{inline_text}"
-        elif detail:
-            phantoms.append({
-                "line": text.count("\n"),
-                "kind": "output",
+        if (self._is_diff_tool(block) or not text.startswith("⏺")
+                or text.count("⏺") != 1):
+            # Diff blocks are document-like and stay inline text. Multi-file
+            # blocks keep their per-file headers instead of collapsing into
+            # one row.
+            return text, []
+
+        header_line = text.partition("\n")[0]
+        heading, summary = self._split_tool_header(header_line)
+        phase = _tool_call_phase(block)
+        _, out_summary, out_detail = self.format_tool_result(
+            block, force_collapse=True)
+        call = {
+            "line": 0,
+            "kind": "tool_call",
+            "key": key,
+            "status_only": True,
+            "command": {
+                "heading": heading,
                 "summary": summary,
-                "detail": detail,
-            })
-        return text, phantoms
+                "detail": header_line,
+                "show_command": False,
+            },
+            "output": None,
+        }
+        if phase:
+            call["status"] = phase
+        elif out_detail:
+            call["output"] = {"summary": out_summary, "detail": out_detail}
+        elif any(k in block for k in ("output", "error", "exitCode")):
+            call["output"] = {
+                "summary": f"0 lines {_tool_result_status(block)}",
+                "detail": "",
+            }
+        else:
+            return text, []
+        return text, [call]
 
     def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None):
         """Append Markdown content through the chat session."""

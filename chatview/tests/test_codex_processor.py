@@ -356,14 +356,15 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             "status": "completed",
         })
 
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ command python3 -m unittest")
         self.assertEqual(len(phantoms), 1)
         command_row = phantoms[0]
         self.assertEqual(command_row["kind"], "tool_call")
+        self.assertTrue(command_row["status_only"])
         self.assertEqual(command_row["command"]["heading"], "⏺ command")
         self.assertEqual(command_row["command"]["summary"], "python3 -m unittest")
         self.assertEqual(command_row["command"]["detail"], "python3 -m unittest")
-        self.assertEqual(command_row["line"], -1)
+        self.assertEqual(command_row["line"], 0)
 
     def test_tool_after_text_without_newline_ensures_blank_line(self):
         appended = []
@@ -734,7 +735,7 @@ class TestThinkPresets(unittest.TestCase):
         # run_command
         cmd_block = {"name": "run_command", "parameters": {"CommandLine": "git status"}}
         text, phantoms = processor.format_tool_call(cmd_block)
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ RunCommand git status")
         self.assertEqual(phantoms[0]["command"]["heading"], "⏺ RunCommand")
         self.assertEqual(phantoms[0]["command"]["summary"], "git status")
 
@@ -744,7 +745,7 @@ class TestThinkPresets(unittest.TestCase):
             "parameters": {"CommandLine": "echo first\necho second"},
         }
         text, phantoms = processor.format_tool_call(multi_cmd)
-        self.assertEqual(text, "")
+        self.assertEqual(text, "⏺ RunCommand echo first …")
         self.assertEqual(phantoms[0]["command"]["summary"], "echo first …")
         self.assertEqual(
             phantoms[0]["command"]["detail"], "echo first\necho second")
