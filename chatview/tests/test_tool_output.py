@@ -301,7 +301,7 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
         self.assertNotIn("Return", self.view.text)
 
-    def test_shell_finished_row_has_show_and_expands_to_command_and_return(self):
+    def test_shell_finished_row_has_no_toggle_and_is_blue(self):
         entry = self.manager.add_shell_finished(
             self.anchor,
             "npm run dev",
@@ -310,35 +310,39 @@ class TestToolOutputManager(unittest.TestCase):
             key="shell_finished:sh_bg",
         )
         html = self.manager._row_html(entry)
-        self.assertIn("↳ Shell finished · npm run dev", html)
-        self.assertIn(f"toggle:{entry['key']}", html)
-        self.assertIn(">show<", html)
+        self.assertIn("↳ Shell finished", html)
+        self.assertIn("· npm run dev", html)
+        self.assertNotIn("toggle:", html)
+        self.assertNotIn(">show<", html)
+        self.assertNotIn(">hide<", html)
         self.assertNotIn("copy", html)
+        self.assertIn(".termmate-shell-finished{color:var(--bluish);}", html)
+        self.assertIn("class='termmate-shell-finished'", html)
         phantoms = self.manager.phantom_set.update.call_args[0][0]
         self.assertEqual(len(phantoms), 1)
 
+    def test_shell_finished_toggle_leaves_row_unchanged(self):
+        entry = self.manager.add_shell_finished(
+            self.anchor, "npm run dev", output="server ready\n",
+            summary="npm run dev")
+        before = self.view.text
         self.manager.toggle(None, entry["key"])
-        text = self.view.text
-        self.assertIn("Command\n```bash\nnpm run dev\n```\n", text)
-        self.assertIn("Return\n```text\nserver ready\n```\n", text)
-        self.assertLess(text.index("Command"), text.index("Return"))
-        self.assertIn(">hide<", self.manager._row_html(entry))
-
-        self.manager.toggle(None, entry["key"])
-        self.assertEqual(self.view.text, "⏺ Bash ls\n\n")
+        self.assertEqual(self.view.text, before)
 
     def test_shell_failed_row_uses_failed_label(self):
         entry = self.manager.add_shell_finished(
-            self.anchor, "npm run dev", output="boom", failed=True)
+            self.anchor, "npm run dev", output="boom", failed=True,
+            summary="npm run dev")
         html = self.manager._row_html(entry)
-        self.assertIn("↳ Shell failed · ", html)
+        self.assertIn("↳ Shell failed", html)
+        self.assertIn("· npm run dev", html)
 
-    def test_shell_finished_without_output_shows_empty_return(self):
+    def test_shell_finished_without_summary_renders_label_only(self):
         entry = self.manager.add_shell_finished(
-            self.anchor, "npm run dev", output="")
-        self.manager.toggle(None, entry["key"])
-        self.assertIn("Command\n```bash\nnpm run dev\n```\n", self.view.text)
-        self.assertIn("Return\n```text\n(no output)\n```", self.view.text)
+            self.anchor, "npm run dev", output="", summary="")
+        html = self.manager._row_html(entry)
+        self.assertIn("↳ Shell finished", html)
+        self.assertNotIn(" · ", html)
 
     def test_shell_finished_update_by_key_refreshes_output(self):
         entry = self.manager.add_shell_finished(

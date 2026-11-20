@@ -29,10 +29,10 @@ the link to ``hide``.
 Background shells get a second, standalone row when they finish (the TUI
 reports them as their own message):
 
-    ↳ Shell finished · npm run dev                  [show]
+    ↳ Shell finished · npm run dev
 
-Its ``show`` link reveals the original command and the output the shell
-produced after its tool call had already returned.
+The label is tinted blue and the row carries no links; the shell output
+stays available on the originating tool row.
 """
 
 import html
@@ -150,8 +150,8 @@ class ToolOutputManager:
 
         Mirrors the TUI, which reports a completed background shell as its
         own message instead of as a second line of the tool call.  The row
-        has a single ``show`` link that reveals the original command and the
-        output the shell produced after the tool call had already returned.
+        is informational: its label is tinted blue and it carries no links,
+        because the shell output already lives on the originating tool row.
         """
         command = str(command or "").strip()
         if not command:
@@ -215,8 +215,11 @@ class ToolOutputManager:
         entry = self._find(key)
         if entry is None:
             return
-        if entry["kind"] in ("tool_call", "shell_finished"):
+        if entry["kind"] == "tool_call":
             self._toggle_tool_call(edit, entry)
+            return
+        if entry["kind"] == "shell_finished":
+            # Informational row: no links, nothing to expand.
             return
         if entry["expanded"]:
             self._collapse(edit, entry)
@@ -453,13 +456,13 @@ class ToolOutputManager:
         return f"<div class='termmate-tool-row'>{body}{links}</div>"
 
     def _shell_finished_rows_html(self, entry):
-        key = entry["key"]
-        toggle_label = "hide" if entry["expanded"] else "show"
+        label = html.escape(entry.get("label") or "Shell finished")
+        summary = html.escape(entry.get("summary") or "")
+        detail = f" · {summary}" if summary else ""
         return (
             "<div class='termmate-tool-row'>"
-            f"<span>↳ {html.escape(entry.get('label') or 'Shell finished')}"
-            f" · {html.escape(entry.get('summary') or '')}</span>"
-            f"&nbsp;&nbsp;<a href='toggle:{key}'>{toggle_label}</a>"
+            f"<span class='termmate-shell-finished'>↳ {label}</span>"
+            f"<span>{detail}</span>"
             "</div>"
         )
 
@@ -481,6 +484,7 @@ class ToolOutputManager:
             "color:color(var(--foreground) alpha(0.85));padding:1px 0 3px 2px;}"
             ".termmate-tool-row a,.termmate-command-row a{color:var(--bluish);"
             "text-decoration:none;}"
+            ".termmate-shell-finished{color:var(--bluish);}"
             ".termmate-tool-row a:hover,.termmate-command-row a:hover"
             "{text-decoration:underline;}"
             "</style>"
