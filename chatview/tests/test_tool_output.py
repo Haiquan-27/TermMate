@@ -301,6 +301,56 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIn("Command\n```bash\nnpm test\n```\n", self.view.text)
         self.assertNotIn("Return", self.view.text)
 
+    def test_shell_finished_row_has_show_and_expands_to_command_and_return(self):
+        entry = self.manager.add_shell_finished(
+            self.anchor,
+            "npm run dev",
+            output="server ready\n",
+            summary="npm run dev",
+            key="shell_finished:sh_bg",
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn("↳ Shell finished · npm run dev", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+        self.assertIn(">show<", html)
+        self.assertNotIn("copy", html)
+        phantoms = self.manager.phantom_set.update.call_args[0][0]
+        self.assertEqual(len(phantoms), 1)
+
+        self.manager.toggle(None, entry["key"])
+        text = self.view.text
+        self.assertIn("Command\n```bash\nnpm run dev\n```\n", text)
+        self.assertIn("Return\n```text\nserver ready\n```\n", text)
+        self.assertLess(text.index("Command"), text.index("Return"))
+        self.assertIn(">hide<", self.manager._row_html(entry))
+
+        self.manager.toggle(None, entry["key"])
+        self.assertEqual(self.view.text, "⏺ Bash ls\n\n")
+
+    def test_shell_failed_row_uses_failed_label(self):
+        entry = self.manager.add_shell_finished(
+            self.anchor, "npm run dev", output="boom", failed=True)
+        html = self.manager._row_html(entry)
+        self.assertIn("↳ Shell failed · ", html)
+
+    def test_shell_finished_without_output_shows_empty_return(self):
+        entry = self.manager.add_shell_finished(
+            self.anchor, "npm run dev", output="")
+        self.manager.toggle(None, entry["key"])
+        self.assertIn("Command\n```bash\nnpm run dev\n```\n", self.view.text)
+        self.assertIn("Return\n```text\n(no output)\n```", self.view.text)
+
+    def test_shell_finished_update_by_key_refreshes_output(self):
+        entry = self.manager.add_shell_finished(
+            self.anchor, "npm run dev", output="starting",
+            key="shell_finished:sh_bg")
+        same = self.manager.add_shell_finished(
+            self.anchor, "npm run dev", output="server ready",
+            key="shell_finished:sh_bg")
+        self.assertIs(same, entry)
+        self.assertEqual(len(self.manager.entries), 1)
+        self.assertEqual(entry["output"]["detail"], "server ready")
+
     def test_running_tool_call_shows_status_row(self):
         entry = self.manager.add_tool_call(
             self.anchor,

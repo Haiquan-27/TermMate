@@ -684,10 +684,30 @@ class BaseChatMessageProcessor:
         return (getattr(message, "msg_id", None)
                 or getattr(message, "id", None))
 
-    def format_shell_finished(self, command, failed=False):
-        """One-line notice shown when a shell command finishes."""
-        label = "Shell failed" if failed else "Shell finished"
-        return f"↳ {label} · {self._command_preview(command)}"
+    def format_shell_finished(self, command, failed=False, output="", key=None):
+        """Phantom row shown when a background shell finishes.
+
+        Mirrors the TUI, which reports the completed background job as a
+        separate message.  The single ``show`` link reveals the original
+        command and the output the shell produced after the tool call had
+        already returned.
+        """
+        command = str(command or "").strip()
+        if not command:
+            return None
+        return {
+            "line": -1,
+            "kind": "shell_finished",
+            "key": key,
+            "label": "Shell failed" if failed else "Shell finished",
+            "failed": bool(failed),
+            "summary": self._command_preview(command),
+            "command": {"detail": command.rstrip("\n")},
+            "output": {
+                "summary": "",
+                "detail": output if isinstance(output, str) else "",
+            },
+        }
 
     def append_tool_call(self, block, key=None):
         """Append one tool call, or update its existing phantom row.
@@ -1413,17 +1433,18 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
     def apply_shell_finished(self, command, failed=False, output="",
-                             tool_key=None, exit_code=None):
-        """Finish the row of a background shell and return its notice line.
+                             tool_key=None, exit_code=None, shell_id=None):
+        """Finish the background tool row and build the completion phantom.
 
         The tool result is stored before the shell actually exits, so the
         completion event carries the real output.  Updating the existing row
         (instead of appending a new one) keeps ``running in background`` from
-        becoming a permanent second row.
+        becoming a permanent second row.  The returned phantom is the
+        TUI-style ``↳ Shell finished`` entry with its own ``show`` link.
         """
         command = str(command or "").strip()
         if not command:
-            return ""
+            return None
         if tool_key and self.has_tool_call(tool_key):
             self.append_tool_call({
                 "name": "command_execution",
@@ -1432,25 +1453,28 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                 "status": "failed" if failed else "completed",
                 "exitCode": exit_code,
             }, key=tool_key)
-        return self.format_shell_finished(command, failed)
+        key = f"shell_finished:{shell_id}" if shell_id else None
+        return self.format_shell_finished(
+            command, failed, output=output, key=key)
 
     def _handle_shell_finished(self, message):
-        """Render an OpenCode background shell completion notice."""
+        """Render an OpenCode background shell completion row."""
         content = message.content if isinstance(message.content, dict) else {}
-        line = self.apply_shell_finished(
+        phantom = self.apply_shell_finished(
             content.get("command"),
             bool(content.get("failed")),
             output=content.get("output"),
             tool_key=content.get("tool_key"),
             exit_code=content.get("exit"),
+            shell_id=content.get("shell_id"),
         )
-        if not line:
+        if not phantom:
             return
-        if not self._ends_with_newline:
-            self.append_content("\n", is_tool=True)
-        self.append_content(line + "\n", is_tool=True)
-        self._text_trailing_newlines = 1
+        # The phantom-only append inserts the line it anchors on, so the
+        # buffer already has the paragraph break before the next message.
         self.last_is_tool_call = False
+        self._text_trailing_newlines = 2
+        self.append_content("", is_tool=True, tool_phantoms=[phantom])
 
     def _format_tool_block(self, block):
         name = block.get("name")
