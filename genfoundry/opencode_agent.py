@@ -28,7 +28,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .base_agent import AgentOptions, BaseAgent, Message, MessageType
+from .base_agent import (
+    AgentOptions,
+    BaseAgent,
+    Message,
+    MessageType,
+    SlashCommand,
+)
 
 
 LOG = logging.getLogger("TermMate")
@@ -60,6 +66,22 @@ _SERVER_PASSWORD_RE = re.compile(
 )
 _VERSION_RE = re.compile(
     r"(?:opencode\s+)?v?(\d+\.\d+\.\d+)", re.IGNORECASE
+)
+
+# The v2 compact endpoint only admits the compaction request.  The actual
+# summary is produced asynchronously, so /compact waits for its lifecycle
+# events instead of treating the HTTP response as completion.
+_COMPACTION_TIMEOUT = 600.0
+
+# Slash commands advertised to the completion popup.  ``compact`` is wired to
+# its native endpoint; the remaining entries are placeholders whose
+# ``run_slash_command`` path keeps the raw text out of the model prompt.
+_OPENCODE_SLASH_COMMANDS = (
+    SlashCommand("compact", "Compact the session"),
+    SlashCommand("new", "Start a new session"),
+    SlashCommand("clear", "Clear and start a new session"),
+    SlashCommand("undo", "Undo the previous message"),
+    SlashCommand("redo", "Redo the last undone action"),
 )
 
 
@@ -813,6 +835,8 @@ class OpenCodeAgent(BaseAgent):
         (`MessageType.TEXT`, `TOOL_USE`, `THINKING`, `PLAN_DELTA`, `ERROR`, `STOP`).
     """
 
+    supports_slash_commands = True
+
     def __init__(
         self,
         options: Optional[AgentOptions] = None,
@@ -848,6 +872,15 @@ class OpenCodeAgent(BaseAgent):
         self._turn_plan_mode = False
         self._turn_done = asyncio.Event()
         self._turn_done.set()
+        # Manual compaction is asynchronous on v2: ``compact()`` arms this
+        # event before the HTTP call because the lifecycle events may arrive
+        # before the request returns.
+        self._compaction_event = asyncio.Event()
+        self._compaction_waiting = False
+        self._compaction_reason = ""
+        self._compaction_error: Optional[str] = None
+        self._compaction_summary = ""
+        self._compaction_tokens: Optional[Dict[str, Any]] = None
         self._uses_session_status = False
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -1479,6 +1512,9 @@ class OpenCodeAgent(BaseAgent):
             "session.execution.interrupted",
             "session.idle",
             "session.status",
+            "session.compaction.started",
+            "session.compaction.ended",
+            "session.compaction.failed",
         )
         if event_type in diag_events:
             DIAG.info("event type=%s current_session=%r data=%s",
@@ -1571,6 +1607,19 @@ class OpenCodeAgent(BaseAgent):
                         content={"message_id": message_id},
                         msg_id=message_id,
                     ))
+            return
+
+        # [v2] Compaction lifecycle.  ``/compact`` waits for the lifecycle
+        # events because the HTTP endpoint only admits the request; automatic
+        # compaction is surfaced as a transient notice without touching the
+        # turn's loading state.
+        if event_type in (
+            "session.compaction.started",
+            "session.compaction.delta",
+            "session.compaction.ended",
+            "session.compaction.failed",
+        ):
+            await self._handle_compaction_v2(event_type, properties)
             return
 
         # [v2] Tool invocation and progress tracking
@@ -1782,6 +1831,84 @@ class OpenCodeAgent(BaseAgent):
         if event_type in ("permission.asked", "permission.updated"):
             await self._handle_permission(properties)
             return
+
+    async def _handle_compaction_v2(
+        self, event_type: str, properties: Dict[str, Any]
+    ) -> None:
+        """Translate v2 compaction events into queue messages.
+
+        ``session.compaction.started`` and ``delta`` are only relevant to the
+        manual wait.  Completion and failure are queued for the chat processor
+        so it can render the result and stop the loading spinner.
+        """
+        reason = str(properties.get("reason") or "")
+        manual = reason == "manual"
+
+        if event_type == "session.compaction.delta":
+            # The summary is streamed to the TUI as it is generated; TermMate
+            # only needs the final text, so intermediate deltas are ignored.
+            return
+
+        if event_type == "session.compaction.started":
+            self._compaction_reason = reason
+            if manual and self._compaction_waiting:
+                await self._message_queue.put(Message(
+                    "compaction_started",
+                    content={"reason": reason, "manual": True},
+                ))
+            return
+
+        if event_type == "session.compaction.ended":
+            if manual and not self._compaction_waiting:
+                LOG.debug(
+                    "Ignoring manual compaction completed outside /compact "
+                    "[session_id=%s]",
+                    self._session_id,
+                )
+                return
+            summary = properties.get("text")
+            if not isinstance(summary, str):
+                summary = ""
+            tokens = properties.get("tokens")
+            if not isinstance(tokens, dict):
+                tokens = None
+            if manual:
+                self._compaction_summary = summary
+                self._compaction_tokens = tokens
+                self._compaction_error = None
+            await self._message_queue.put(Message(
+                "compaction_ended",
+                content={
+                    "reason": reason,
+                    "manual": manual,
+                    "summary": summary,
+                    "tokens": tokens,
+                },
+            ))
+            if manual:
+                self._compaction_event.set()
+            return
+
+        # session.compaction.failed
+        if manual and not self._compaction_waiting:
+            LOG.debug(
+                "Ignoring manual compaction failure outside /compact "
+                "[session_id=%s]",
+                self._session_id,
+            )
+            return
+        error_text = self._error_text(properties.get("error") or properties)
+        await self._message_queue.put(Message(
+            "compaction_failed",
+            content={
+                "reason": reason,
+                "manual": manual,
+                "error": error_text,
+            },
+        ))
+        if manual:
+            self._compaction_error = error_text
+            self._compaction_event.set()
 
     async def _handle_idle_v2(self, event_type: str) -> None:
         """Stop the view's loading state for the prompt turn or a resume.
@@ -2569,6 +2696,103 @@ class OpenCodeAgent(BaseAgent):
         ))
         return self._session_id
 
+    async def compact(self) -> None:
+        """Compact the current session natively.
+
+        v2 only queues the request, so this waits for the manual compaction
+        lifecycle events.  v1's ``/summarize`` endpoint is synchronous and
+        returns ``False`` when there is nothing to compact.
+        """
+        if not self._session_id:
+            # Do not create an empty session just to discover that there is
+            # nothing to compress.
+            raise RuntimeError("Nothing to compact yet")
+        if self._compaction_waiting:
+            raise RuntimeError("A compaction is already running")
+
+        session_id = quote(self._session_id, safe="")
+
+        if self.version >= 2:
+            self._compaction_event.clear()
+            self._compaction_reason = "manual"
+            self._compaction_error = None
+            self._compaction_summary = ""
+            self._compaction_tokens = None
+            self._compaction_waiting = True
+            try:
+                await self._http(
+                    "POST",
+                    f"/api/session/{session_id}/compact",
+                    body={},
+                )
+                try:
+                    await asyncio.wait_for(
+                        self._compaction_event.wait(),
+                        timeout=_COMPACTION_TIMEOUT,
+                    )
+                except asyncio.TimeoutError as error:
+                    raise RuntimeError(
+                        "Timed out waiting for OpenCode to compact the session"
+                    ) from error
+                if self._compaction_error:
+                    if not self._is_connected:
+                        raise RuntimeError(self._compaction_error)
+                    # The processor already received ``compaction_failed`` and
+                    # rendered it, so the command itself still succeeded.
+                    LOG.warning(
+                        "OpenCode manual compaction failed [session_id=%s, error=%s]",
+                        self._session_id,
+                        self._compaction_error,
+                    )
+            finally:
+                self._compaction_waiting = False
+            return
+
+        body = self._model_payload() or {}
+        result = self._unwrap(await self._http(
+            "POST",
+            f"/session/{session_id}/summarize",
+            body=body,
+        ))
+        if result is False:
+            await self._message_queue.put(Message(
+                "compaction_failed",
+                content={
+                    "reason": "manual",
+                    "manual": True,
+                    "error": "Nothing to compact yet",
+                },
+            ))
+            return
+        await self._message_queue.put(Message(
+            "compaction_ended",
+            content={
+                "reason": "manual",
+                "manual": True,
+                "summary": "",
+                "tokens": None,
+            },
+        ))
+
+    async def list_slash_commands(self) -> List[SlashCommand]:
+        """Return the commands TermMate currently exposes for OpenCode.
+
+        Command execution is implemented one command at a time; unimplemented
+        entries still appear here so completion remains predictable.
+        """
+        return list(_OPENCODE_SLASH_COMMANDS)
+
+    async def run_slash_command(self, name: str, arguments: str = "") -> bool:
+        """Execute a slash command natively.
+
+        Returning False keeps the raw ``/name`` text out of the model prompt.
+        """
+        command = (name or "").strip().lstrip("/")
+        if command == "compact":
+            await self.compact()
+            return True
+        return False
+
     async def send_message(
         self,
         content: str,
@@ -2885,6 +3109,9 @@ class OpenCodeAgent(BaseAgent):
         self._turn_plan_mode = False
         self._awaiting_user_message_id = False
         self._turn_done.set()
+        self._compaction_waiting = False
+        self._compaction_error = "Disconnected while compacting"
+        self._compaction_event.set()
 
         self._sse_stop.set()
         with self._sse_response_lock:

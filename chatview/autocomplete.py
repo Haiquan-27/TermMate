@@ -28,6 +28,99 @@ class AtQuery(NamedTuple):
     at_pos: int         # Absolute position of '@' in the view
 
 
+class SlashQuery(NamedTuple):
+    """Encapsulates a slash-command token at the start of the input line."""
+    name: str           # Typed command text after '/', e.g. "comp" or "team/rev"
+    slash_pos: int      # Absolute position of '/' in the view
+
+
+# Common word separators used when Sublime does not provide a prefix.  The
+# authoritative length comes from ``on_query_completions``; this fallback only
+# matters for dynamic completions that arrive without one.
+WORD_SEPARATORS = set("<>\"'`;:/\\()[]{}.,-~!@#$%^&*|+=?")
+
+
+def parse_slash_command_text(text: str) -> Optional[Tuple[str, str]]:
+    """Split ``/name arguments`` into ``(name, arguments)``.
+
+    Returns None when the text is not a slash command.  The leading slash is
+    stripped from the name; arguments keep only the text after the first run
+    of whitespace (the command template is expanded by the agent, not here).
+    """
+    if not text:
+        return None
+    stripped = text.lstrip()
+    if not stripped.startswith("/"):
+        return None
+    body = stripped[1:]
+    parts = body.split(None, 1)
+    if not parts or not parts[0]:
+        return None
+    name = parts[0]
+    arguments = parts[1].strip() if len(parts) > 1 else ""
+    return name, arguments
+
+
+def slash_completion_replacement(full_name: str, typed: str,
+                                 prefix: Optional[str] = None) -> str:
+    """Return the text Sublime should insert for a command name.
+
+    Sublime replaces only the word immediately before the cursor.  ``/``
+    counts as a word separator, so for ``team/rev`` the replaced word is
+    ``rev`` and the replacement must be ``review`` (not ``team/review``).
+
+    ``prefix`` is Sublime's own word prefix from ``on_query_completions``; it
+    is the authoritative replacement length.  When it is unavailable, fall
+    back to splitting on the default word separators.
+    """
+    if prefix is not None and typed.endswith(prefix):
+        replaced = len(prefix)
+    else:
+        word_start = len(typed)
+        while word_start > 0:
+            ch = typed[word_start - 1]
+            if ch in WORD_SEPARATORS or ch.isspace():
+                break
+            word_start -= 1
+        replaced = len(typed) - word_start
+    return full_name[len(typed) - replaced:]
+
+
+def slash_completion_items(commands, typed: str, prefix: str = ""):
+    """Return ``(trigger, completion, annotation)`` for matching commands.
+
+    Pure helper shared by the completion popup.  The trigger is the text
+    Sublime filters on, so nested names use the replacement segment (e.g.
+    ``review`` while typing ``team/rev``) and keep the full name in the
+    annotation.
+    """
+    lowered = typed.lower()
+    items = []
+    seen = set()
+
+    for command in commands or []:
+        names = [getattr(command, "name", "")]
+        names.extend(getattr(command, "aliases", ()) or ())
+        for name in names:
+            if not name:
+                continue
+            if typed and not name.lower().startswith(lowered):
+                continue
+            if name in seen:
+                continue
+            seen.add(name)
+
+            replacement = slash_completion_replacement(name, typed, prefix)
+            description = getattr(command, "description", "") or ""
+            if replacement != name:
+                annotation = f"{name} · {description}" if description else name
+            else:
+                annotation = description
+            items.append((replacement, replacement, annotation))
+
+    return items
+
+
 def parse_at_query_text(text_before_cursor: str) -> Optional[Tuple[str, str, str, int]]:
     """
     Pure string parser: extracts '@' query details from text preceding cursor.
@@ -90,6 +183,70 @@ class AutoComplete:
             file_filter=file_filter,
             at_pos=at_pos
         )
+
+    @staticmethod
+    def extract_slash_query(view, pos: int, editable_start: int) -> Optional[SlashQuery]:
+        """Return the line-start slash token at ``pos``, if any.
+
+        Slash commands only trigger when '/' begins the first input line and
+        the cursor is still inside the command word (no whitespace yet).
+        """
+        if not sublime or pos < editable_start + 1:
+            return None
+
+        line = view.line(pos)
+        if line.begin() != editable_start:
+            return None
+
+        if view.substr(sublime.Region(editable_start, editable_start + 1)) != '/':
+            return None
+
+        typed = view.substr(sublime.Region(editable_start + 1, pos))
+        if any(ch.isspace() for ch in typed):
+            return None
+        return SlashQuery(name=typed, slash_pos=editable_start)
+
+    @staticmethod
+    def completion_flags() -> int:
+        """Flags shared by @ and slash completions."""
+        flags = sublime.INHIBIT_WORD_COMPLETIONS
+        if hasattr(sublime, "INHIBIT_EXPLICIT_COMPLETIONS"):
+            flags |= sublime.INHIBIT_EXPLICIT_COMPLETIONS
+        if hasattr(sublime, "DYNAMIC_COMPLETIONS"):
+            flags |= sublime.DYNAMIC_COMPLETIONS
+        return flags
+
+    @classmethod
+    def generate_slash_completions(
+        cls,
+        view,
+        locations: List[int],
+        editable_start: int,
+        commands,
+        prefix: str = "",
+    ) -> Optional[object]:
+        """Build completions for a line-start slash command token."""
+        if not sublime or not locations:
+            return None
+
+        query = cls.extract_slash_query(view, locations[0], editable_start)
+        if not query:
+            return None
+
+        typed = query.name
+        completions = [
+            sublime.CompletionItem(
+                trigger=trigger,
+                annotation=annotation,
+                completion=completion,
+                kind=sublime.KIND_FUNCTION,
+            )
+            for trigger, completion, annotation in slash_completion_items(
+                commands, typed, prefix
+            )
+        ]
+
+        return sublime.CompletionList(completions, flags=cls.completion_flags())
 
     @staticmethod
     def get_workspace_info(
@@ -294,11 +451,7 @@ class AutoComplete:
         )
 
         # Dynamic completions flag: inhibit buffer words and explicit/snippet completions
-        flags = sublime.INHIBIT_WORD_COMPLETIONS
-        if hasattr(sublime, "INHIBIT_EXPLICIT_COMPLETIONS"):
-            flags |= sublime.INHIBIT_EXPLICIT_COMPLETIONS
-        if hasattr(sublime, "DYNAMIC_COMPLETIONS"):
-            flags |= sublime.DYNAMIC_COMPLETIONS
+        flags = cls.completion_flags()
 
         if not active_cwd:
             return sublime.CompletionList([], flags=flags)

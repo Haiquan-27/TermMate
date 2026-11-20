@@ -1375,9 +1375,73 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         self._text_trailing_newlines = 1
         self._text_msg_id = None
 
+    @staticmethod
+    def _compaction_token_suffix(tokens):
+        """Return `` · 12.3k tokens`` for a compaction token usage payload."""
+        if not isinstance(tokens, dict):
+            return ""
+        total = 0.0
+        for key in ("input", "output", "reasoning"):
+            try:
+                total += float(tokens.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+        cache = tokens.get("cache")
+        if isinstance(cache, dict):
+            for key in ("read", "write"):
+                try:
+                    total += float(cache.get(key) or 0)
+                except (TypeError, ValueError):
+                    pass
+        if total <= 0:
+            return ""
+        if total >= 1000:
+            return f" · {total / 1000:.1f}k tokens"
+        return f" · {int(total)} tokens"
+
     def _handle_typed_message(self, message):
         # Unlike Codex, OpenCode's adapter emits only streaming text and does
         # not repeat the completed assistant message.  Render deltas directly.
+        if message.type == "compaction_started":
+            content = message.content if isinstance(message.content, dict) else {}
+            if content.get("manual"):
+                self.session.start_loading(text="compacting")
+            return
+
+        if message.type == "compaction_ended":
+            content = message.content if isinstance(message.content, dict) else {}
+            manual = bool(content.get("manual"))
+            summary = content.get("summary")
+            if not isinstance(summary, str):
+                summary = ""
+            suffix = self._compaction_token_suffix(content.get("tokens"))
+            heading = "Session compacted" if manual else "Context auto-compacted"
+            block = f"\n🗜️ **{heading}**{suffix}\n"
+            has_summary = bool(summary.strip())
+            if has_summary:
+                # The summary is the replacement context OpenCode installed.
+                # Render it like the TUI (and the web client) so /compact has
+                # visible output instead of only a status line.
+                block += f"\n{summary.strip()}\n\n"
+            self.ensure_trailing_newline()
+            self.append_content(block, flush=True)
+            if manual:
+                self.session.stop_loading()
+            self.last_is_tool_call = False
+            self._text_trailing_newlines = 2 if has_summary else 1
+            self._text_msg_id = None
+            return
+
+        if message.type == "compaction_failed":
+            content = message.content if isinstance(message.content, dict) else {}
+            error = content.get("error") or "Compaction failed"
+            if content.get("manual"):
+                self.append_error(error)
+                self.session.stop_loading()
+            else:
+                LOG.warning("OpenCode auto-compaction failed: %s", error)
+            return
+
         if message.type == "thinking":
             self.session.start_loading(text="thinking")
             return

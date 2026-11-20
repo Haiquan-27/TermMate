@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from genfoundry.base_agent import AgentOptions
+from genfoundry.base_agent import AgentOptions, BaseAgent, SlashCommand
 from genfoundry.opencode_agent import (
     OpenCodeAgent,
     OpenCodeHTTPError,
@@ -2178,6 +2178,226 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
             "genfoundry.opencode_agent.urlopen", side_effect=Exception("unreachable")
         ):
             self.assertFalse(probe_opencode_service("http://127.0.0.1:9999", "pwd"))
+
+
+class TestSlashCommandDescriptor(unittest.TestCase):
+    def test_base_agents_are_opting_out(self):
+        self.assertFalse(BaseAgent.supports_slash_commands)
+
+    def test_descriptor_defaults(self):
+        command = SlashCommand("compact", "Compact the session")
+        self.assertEqual(command.name, "compact")
+        self.assertEqual(command.description, "Compact the session")
+        self.assertEqual(command.aliases, ())
+
+        aliased = SlashCommand("variants", aliases=["thinking", "effort"])
+        self.assertEqual(aliased.aliases, ("thinking", "effort"))
+
+
+class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
+    async def test_advertises_commands(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+
+        self.assertTrue(agent.supports_slash_commands)
+        commands = await agent.list_slash_commands()
+        self.assertEqual(
+            {command.name for command in commands},
+            {"compact", "new", "clear", "undo", "redo"},
+        )
+
+    async def test_placeholders_are_not_forwarded_to_the_model(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+
+        handled = await agent.run_slash_command("new", "")
+
+        self.assertFalse(handled)
+
+    async def test_unknown_command_is_not_handled(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+
+        self.assertFalse(await agent.run_slash_command("nope", ""))
+
+    async def test_compact_without_session_reports_nothing(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+
+        with self.assertRaisesRegex(RuntimeError, "Nothing to compact yet"):
+            await agent.run_slash_command("compact", "")
+
+    async def test_compact_rejects_a_concurrent_request(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        agent._compaction_waiting = True
+
+        with self.assertRaisesRegex(RuntimeError, "already running"):
+            await agent.run_slash_command("compact", "")
+
+    async def test_compact_v2_posts_to_compact_endpoint(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append((method, path, body))
+            # The server may emit the whole lifecycle before the HTTP response
+            # returns; setting the event here models that ordering.
+            agent._compaction_event.set()
+            return {"id": "cmp_1"}
+
+        agent._http = fake_http
+
+        handled = await agent.run_slash_command("compact", "")
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            calls,
+            [("POST", "/api/session/ses_1/compact", {})],
+        )
+
+    async def test_compact_v2_waits_for_lifecycle_events(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        posted = asyncio.Event()
+
+        async def fake_http(method, path, body=None, **kwargs):
+            posted.set()
+            return {"id": "cmp_1"}
+
+        agent._http = fake_http
+
+        task = asyncio.create_task(agent.run_slash_command("compact", ""))
+        await asyncio.wait_for(posted.wait(), timeout=1.0)
+        self.assertFalse(task.done())
+
+        await agent._dispatch_event({
+            "type": "session.compaction.ended",
+            "data": {
+                "sessionID": "ses_1",
+                "reason": "manual",
+                "text": "summary",
+            },
+        })
+
+        self.assertTrue(await asyncio.wait_for(task, timeout=1.0))
+
+    async def test_compact_v1_uses_summarize_with_current_model(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=1)
+        agent._session_id = "ses_1"
+        agent.options.model = "anthropic/claude-sonnet-4"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append((method, path, body))
+            return True
+
+        agent._http = fake_http
+
+        handled = await agent.run_slash_command("compact", "")
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            calls,
+            [(
+                "POST",
+                "/session/ses_1/summarize",
+                {"providerID": "anthropic", "modelID": "claude-sonnet-4"},
+            )],
+        )
+        message = agent._message_queue.get_nowait()
+        self.assertEqual(message.type, "compaction_ended")
+        self.assertTrue(message.content["manual"])
+
+    async def test_compact_v1_false_reports_nothing_to_compact(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=1)
+        agent._session_id = "ses_1"
+
+        async def fake_http(method, path, body=None, **kwargs):
+            return False
+
+        agent._http = fake_http
+
+        handled = await agent.run_slash_command("compact", "")
+
+        self.assertTrue(handled)
+        message = agent._message_queue.get_nowait()
+        self.assertEqual(message.type, "compaction_failed")
+        self.assertEqual(message.content["error"], "Nothing to compact yet")
+
+    async def test_manual_compaction_events_resolve_the_wait(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        agent._compaction_waiting = True
+
+        await agent._dispatch_event({
+            "type": "session.compaction.started",
+            "data": {"sessionID": "ses_1", "reason": "manual", "recent": ""},
+        })
+        started = agent._message_queue.get_nowait()
+        self.assertEqual(started.type, "compaction_started")
+        self.assertTrue(started.content["manual"])
+
+        await agent._dispatch_event({
+            "type": "session.compaction.ended",
+            "data": {
+                "sessionID": "ses_1",
+                "reason": "manual",
+                "text": "a summary",
+                "tokens": {
+                    "input": 1200,
+                    "output": 30,
+                    "reasoning": 0,
+                    "cache": {"read": 0, "write": 0},
+                },
+            },
+        })
+
+        self.assertTrue(agent._compaction_event.is_set())
+        self.assertEqual(agent._compaction_summary, "a summary")
+        self.assertEqual(agent._compaction_tokens["input"], 1200)
+        ended = agent._message_queue.get_nowait()
+        self.assertEqual(ended.type, "compaction_ended")
+        self.assertTrue(ended.content["manual"])
+        self.assertEqual(ended.content["summary"], "a summary")
+
+    async def test_manual_compaction_failure_resolves_the_wait(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        agent._compaction_waiting = True
+
+        await agent._dispatch_event({
+            "type": "session.compaction.failed",
+            "data": {
+                "sessionID": "ses_1",
+                "reason": "manual",
+                "error": {
+                    "type": "compaction.unavailable",
+                    "message": "Nothing to compact yet",
+                },
+            },
+        })
+
+        self.assertTrue(agent._compaction_event.is_set())
+        self.assertEqual(agent._compaction_error, "Nothing to compact yet")
+        failed = agent._message_queue.get_nowait()
+        self.assertEqual(failed.type, "compaction_failed")
+        self.assertEqual(failed.content["error"], "Nothing to compact yet")
+
+    async def test_auto_compaction_does_not_resolve_a_manual_wait(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+
+        await agent._dispatch_event({
+            "type": "session.compaction.started",
+            "data": {"sessionID": "ses_1", "reason": "auto", "recent": ""},
+        })
+        self.assertTrue(agent._message_queue.empty())
+
+        await agent._dispatch_event({
+            "type": "session.compaction.ended",
+            "data": {"sessionID": "ses_1", "reason": "auto", "text": "s"},
+        })
+        ended = agent._message_queue.get_nowait()
+        self.assertFalse(ended.content["manual"])
+        self.assertFalse(agent._compaction_event.is_set())
 
 
 if __name__ == "__main__":

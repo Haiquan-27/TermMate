@@ -72,6 +72,21 @@ class ToolPermissionContext:
         self.suggestions = suggestions or []
 
 
+class SlashCommand:
+    """Descriptor for a slash command advertised by an agent."""
+
+    def __init__(self, name: str, description: str = "", aliases=None):
+        self.name = name
+        self.description = description
+        if isinstance(aliases, str):
+            self.aliases = (aliases,)
+        else:
+            self.aliases = tuple(aliases or ())
+
+    def __repr__(self):
+        return f"SlashCommand(name={self.name!r}, aliases={self.aliases!r})"
+
+
 class AgentOptions:
     """Unified configuration options for Agents"""
 
@@ -127,6 +142,28 @@ class BaseAgent(abc.ABC):
     def set_think_level(self, level: str) -> None:
         """Set reasoning / thinking effort level."""
         self.options.think_level = level
+
+    # Slash-command support is opt-in.  Agents that do not override this flag
+    # never receive a completion request from the chat view and cannot have
+    # their input intercepted as a command.
+    supports_slash_commands = False
+
+    async def list_slash_commands(self) -> List[SlashCommand]:
+        """Return commands available from this agent.
+
+        Placeholder for agents without native slash-command support.  Agents
+        that set ``supports_slash_commands = True`` must override this.
+        """
+        return []
+
+    async def run_slash_command(self, name: str, arguments: str = "") -> bool:
+        """Execute a slash command natively.
+
+        Returns True when the command was handled.  Returning False lets the
+        chat view report that the command is not implemented (without sending
+        the raw ``/name`` text to the model).
+        """
+        return False
 
     @abc.abstractmethod
     async def connect(self, prompt: Optional[str] = None) -> None:

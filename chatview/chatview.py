@@ -6,6 +6,7 @@ import re
 import shutil
 import asyncio
 import threading
+import time
 import sublime
 import sublime_plugin
 
@@ -37,7 +38,7 @@ from .chatrender import (
 )
 from .artifact import FileChangesArtifact, DIFF_VIEW_PATH_KEY, diff_view_click
 from .install import run_install, find_existing_cli, get_agent_list_items
-from .autocomplete import AutoComplete
+from .autocomplete import AutoComplete, parse_slash_command_text
 
 def get_available_agents(settings):
     """Returns a list of available agents."""
@@ -595,6 +596,68 @@ class AgentThread(threading.Thread):
                 sublime.set_timeout(lambda: on_done(new_session_id), 0)
 
         self.loop.call_soon_threadsafe(lambda: asyncio.create_task(_run()))
+
+    def supports_slash_commands(self):
+        """True when the live agent advertises slash-command support."""
+        return bool(getattr(self.agent, "supports_slash_commands", False))
+
+    def request_slash_commands(self, on_done):
+        """Fetch the agent's command list on the agent loop.
+
+        ``on_done(commands, supported, ready)`` runs on the Sublime main
+        thread.  ``ready`` is False when the agent loop is still starting, so
+        callers can retry instead of treating the agent as unsupported.
+        """
+        if not self.loop or not self.agent or not self.running or self.loop.is_closed():
+            return False
+
+        async def _run():
+            supported = bool(getattr(self.agent, "supports_slash_commands", False))
+            commands = []
+            if supported:
+                try:
+                    commands = list(await self.agent.list_slash_commands() or [])
+                except Exception as error:
+                    LOG.error("Failed to list slash commands: %s", error, exc_info=True)
+                    supported = False
+                    commands = []
+            sublime.set_timeout(lambda: on_done(commands, supported, True), 0)
+
+        coro = _run()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except RuntimeError:
+            coro.close()
+            return False
+        return True
+
+    def run_slash_command(self, name, arguments="", on_done=None):
+        """Execute a slash command on the agent loop.
+
+        ``on_done(handled, error)`` runs on the Sublime main thread.  Returns
+        False when the command could not be scheduled.
+        """
+        if not self.loop or not self.agent or not self.running or self.loop.is_closed():
+            return False
+
+        async def _run():
+            handled = False
+            error = None
+            try:
+                handled = await self.agent.run_slash_command(name, arguments)
+            except Exception as exc:
+                LOG.error("Slash command /%s failed: %s", name, exc, exc_info=True)
+                error = str(exc)
+            if on_done:
+                sublime.set_timeout(lambda: on_done(handled, error), 0)
+
+        coro = _run()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except RuntimeError:
+            coro.close()
+            return False
+        return True
 
     @property
     def session_id(self):
@@ -1451,6 +1514,11 @@ class ChatSession:
     MODEL_PICKER_RETRY_INTERVAL_MS = 200
     MODEL_PICKER_RETRY_ATTEMPTS = 25
 
+    # Slash-command discovery is cheap but the agent may still be connecting.
+    SLASH_COMMAND_TTL = 30.0
+    SLASH_FETCH_RETRY_INTERVAL_MS = 200
+    SLASH_FETCH_RETRY_ATTEMPTS = 25
+
     def __init__(self, window, view, cwd, add_dirs=None, session_id=None, role=SessionRole.PRIMARY):
         self.window = window
         self.chat_view = view
@@ -1513,6 +1581,15 @@ class ChatSession:
         self.implement_plan_buttons = [] # List of (region, phantom) tuples
 
         self.agent_thread = None
+
+        # Slash-command cache.  ``_slash_commands_supported`` is None until the
+        # agent answers for the first time.
+        self.slash_commands = []
+        self._slash_commands_supported = None
+        self._slash_commands_at = 0.0
+        self._slash_commands_pending = False
+        self._slash_commands_attempts = 0
+        self._slash_commands_callbacks = []
 
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
         self.available_agents = get_available_agents(settings)
@@ -1906,6 +1983,110 @@ class ChatSession:
                 self.token_summary_phantom.show(self.token_usage)
 
         sublime.set_timeout(stop, 0)
+
+    def supports_slash_commands(self):
+        """True when the active agent can handle slash commands."""
+        if self._slash_commands_supported is not None:
+            return self._slash_commands_supported
+        return bool(self.agent_thread and self.agent_thread.supports_slash_commands())
+
+    def ensure_slash_commands(self, on_loaded=None, force=False):
+        """Refresh the command list once per TTL.
+
+        ``on_loaded(supported)`` runs on the Sublime main thread only after a
+        fetch actually completes, so callers can reopen the completion popup
+        with fresh data without causing a completion/refresh loop.
+        """
+        now = time.time()
+        if (not force and self._slash_commands_at
+                and now - self._slash_commands_at < self.SLASH_COMMAND_TTL):
+            return
+
+        if self._slash_commands_pending:
+            if on_loaded:
+                self._slash_commands_callbacks.append(on_loaded)
+            return
+
+        if not self.agent_thread:
+            self._slash_commands_supported = False
+            self._slash_commands_at = now
+            if on_loaded:
+                on_loaded(False)
+            return
+
+        self._slash_commands_pending = True
+        self._slash_commands_attempts = self.SLASH_FETCH_RETRY_ATTEMPTS
+        if on_loaded:
+            self._slash_commands_callbacks.append(on_loaded)
+        self._request_slash_commands()
+
+    def _request_slash_commands(self):
+        def on_done(commands, supported, ready):
+            if not ready and self._slash_commands_attempts > 0:
+                self._slash_commands_attempts -= 1
+                sublime.set_timeout(
+                    self._request_slash_commands, self.SLASH_FETCH_RETRY_INTERVAL_MS
+                )
+                return
+
+            self._slash_commands_pending = False
+            if not ready:
+                # The agent loop is still starting.  Leave the cache cold so
+                # the next keystroke retries instead of caching "unsupported".
+                self._slash_commands_supported = None
+                self._slash_commands_at = 0.0
+            else:
+                self._slash_commands_supported = supported
+                self.slash_commands = list(commands) if supported else []
+                self._slash_commands_at = time.time()
+
+            callbacks = self._slash_commands_callbacks
+            self._slash_commands_callbacks = []
+            for callback in callbacks:
+                try:
+                    callback(self._slash_commands_supported is True)
+                except Exception as error:
+                    LOG.error("Slash command callback failed: %s", error, exc_info=True)
+
+        if not self.agent_thread.request_slash_commands(on_done):
+            on_done([], False, False)
+
+    def _append_slash_notice(self, text):
+        if self.chat_view and self.chat_view.is_valid():
+            self.chat_view.run_command("term_chat_output_append", {"text": text})
+
+    def run_slash_command(self, name, arguments=""):
+        """Execute a slash command natively and report failures in the view.
+
+        The raw ``/name`` text is never forwarded to the model.
+        """
+        if not self.agent_thread:
+            self._append_slash_notice(f"\n⚠️ /{name} is not available.\n")
+            return False
+
+        self.start_loading(text=f"/{name}")
+
+        def on_done(handled, error):
+            if name == "compact" and handled and not error:
+                # v2 compaction finishes asynchronously; the processor stops
+                # the spinner when it receives the compaction event.
+                return
+            self.stop_loading()
+            if error:
+                message = f"\n⚠️ /{name}: {error}\n"
+            elif not handled:
+                message = f"\n⚠️ /{name} is not implemented yet.\n"
+            else:
+                return
+            sublime.set_timeout(
+                lambda: self._append_slash_notice(message), 0
+            )
+
+        if not self.agent_thread.run_slash_command(name, arguments, on_done=on_done):
+            self.stop_loading()
+            self._append_slash_notice(f"\n⚠️ /{name} is not available.\n")
+            return False
+        return True
 
     def loading_region(self):
         """Get the region where the loading animation should be displayed."""
@@ -2712,6 +2893,19 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
         if not user_input:
             return
 
+        slash_supported = bool(
+            session.agent_thread and session.agent_thread.supports_slash_commands()
+        )
+        slash = parse_slash_command_text(user_input)
+        if slash_supported and user_input.lstrip().startswith("/"):
+            if not slash:
+                sublime.status_message("Type a command after /")
+                return
+            self._submit_slash_command(
+                edit, session, user_input, slash, editable_start, raw_region
+            )
+            return
+
         if sublime.platform() == "osx":
             sublime.status_message("Sending... (Cmd+Esc to stop)")
         else:
@@ -2733,6 +2927,20 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
         session.history_stash = ""
         session.send_input(user_input, region=input_region)
         LOG.info(f"User enter prompt {user_input}")
+
+    def _submit_slash_command(self, edit, session, user_input, parsed,
+                              editable_start, raw_region):
+        """Echo a slash command locally and dispatch it without a model turn."""
+        name, arguments = parsed
+        self.view.replace(edit, raw_region, user_input)
+        self.view.insert(edit, editable_start, "❯ ")
+        self.view.run_command("term_chat_input_prompt", {"text": ""})
+
+        session.history.append(user_input)
+        session.history_index = len(session.history)
+        session.history_stash = ""
+        LOG.info(f"User enter slash command /{name}")
+        session.run_slash_command(name, arguments)
 
 
 class TermChatHistoryUpCommand(sublime_plugin.TextCommand):
@@ -3048,6 +3256,26 @@ class ChatViewListener(sublime_plugin.EventListener):
         if editable_start is None:
             return None
 
+        # A line-start '/' is a slash-command token.  It must never fall back
+        # to Sublime's buffer-word completions.
+        if locations and AutoComplete.extract_slash_query(
+                view, locations[0], editable_start):
+            session = chatview_sessions.get(view.id())
+            if not session or not session.supports_slash_commands():
+                return sublime.CompletionList(
+                    [], flags=AutoComplete.completion_flags()
+                )
+            # Warm the cache in the background; on_modified_async reopens the
+            # popup once the list arrives.
+            session.ensure_slash_commands()
+            return AutoComplete.generate_slash_completions(
+                view=view,
+                locations=locations,
+                editable_start=editable_start,
+                commands=session.slash_commands,
+                prefix=prefix,
+            )
+
         return AutoComplete.generate_completions(
             view=view,
             locations=locations,
@@ -3109,8 +3337,42 @@ class ChatViewListener(sublime_plugin.EventListener):
                 "next_completion_if_showing": False
             })
         elif last_char == '/':
-            # Check for segmented path directory cascade trigger
-            AutoComplete.check_cascade_trigger(view, editable_start)
+            session = chatview_sessions.get(view.id())
+            if AutoComplete.extract_slash_query(view, pos, editable_start):
+                self._trigger_slash_completion(view, session, editable_start)
+            else:
+                # Check for segmented path directory cascade trigger
+                AutoComplete.check_cascade_trigger(view, editable_start)
+
+    def _trigger_slash_completion(self, view, session, editable_start):
+        """Open the slash-command popup, waiting for a cold command cache."""
+        if not session:
+            return
+
+        command_args = {
+            "disable_auto_insert": True,
+            "api_completions_only": True,
+            "next_completion_if_showing": False,
+        }
+
+        if session.slash_commands:
+            if not view.is_auto_complete_visible():
+                view.run_command("auto_complete", command_args)
+            return
+
+        if not session.supports_slash_commands():
+            return
+
+        def on_loaded(supported):
+            if not supported or not view.is_valid():
+                return
+            if view.is_auto_complete_visible():
+                return
+            current = view.sel()[0].begin() if view.sel() else -1
+            if AutoComplete.extract_slash_query(view, current, editable_start):
+                view.run_command("auto_complete", command_args)
+
+        session.ensure_slash_commands(on_loaded)
 
 
 class TermChatRewindTruncateCommand(sublime_plugin.TextCommand):

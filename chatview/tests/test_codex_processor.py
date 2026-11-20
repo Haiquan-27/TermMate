@@ -274,6 +274,87 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.session.start_loading.assert_called_once_with()
         append.assert_called_once_with("hello")
 
+    def test_manual_compaction_starts_compacting_loader(self):
+        self.processor.handle_message(Message(
+            "compaction_started", {"manual": True, "reason": "manual"}
+        ))
+
+        self.session.start_loading.assert_called_once_with(text="compacting")
+        self.session.stop_loading.assert_not_called()
+
+    def test_manual_compaction_renders_notice_and_stops_loading(self):
+        with patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(Message(
+                "compaction_ended",
+                {
+                    "manual": True,
+                    "reason": "manual",
+                    "tokens": {
+                        "input": 1200,
+                        "output": 30,
+                        "reasoning": 0,
+                        "cache": {"read": 0, "write": 0},
+                    },
+                },
+            ))
+
+        append.assert_called_once_with(
+            "\n🗜️ **Session compacted** · 1.2k tokens\n", flush=True
+        )
+        self.session.stop_loading.assert_called_once_with()
+
+    def test_manual_compaction_renders_summary_content(self):
+        with patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(Message(
+                "compaction_ended",
+                {
+                    "manual": True,
+                    "reason": "manual",
+                    "summary": "## Goal\n\nKeep the summary visible.",
+                    "tokens": None,
+                },
+            ))
+
+        append.assert_called_once_with(
+            "\n🗜️ **Session compacted**\n\n"
+            "## Goal\n\nKeep the summary visible.\n\n",
+            flush=True,
+        )
+        self.session.stop_loading.assert_called_once_with()
+
+    def test_manual_compaction_failure_renders_error_and_stops_loading(self):
+        with patch.object(self.processor, "append_error") as append_error:
+            self.processor.handle_message(Message(
+                "compaction_failed",
+                {
+                    "manual": True,
+                    "reason": "manual",
+                    "error": "Nothing to compact yet",
+                },
+            ))
+
+        append_error.assert_called_once_with("Nothing to compact yet")
+        self.session.stop_loading.assert_called_once_with()
+
+    def test_auto_compaction_does_not_stop_turn_loading(self):
+        with patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(Message(
+                "compaction_ended",
+                {
+                    "manual": False,
+                    "reason": "auto",
+                    "summary": "## Summary\n\nAuto-compacted.",
+                    "tokens": None,
+                },
+            ))
+
+        append.assert_called_once_with(
+            "\n🗜️ **Context auto-compacted**\n\n"
+            "## Summary\n\nAuto-compacted.\n\n",
+            flush=True,
+        )
+        self.session.stop_loading.assert_not_called()
+
     def test_attaches_server_generated_user_message_id_to_prompt(self):
         self.processor.handle_message(Message(
             "user_message_id",
