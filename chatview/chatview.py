@@ -2481,16 +2481,21 @@ class ChatSession:
                 command = event.get("command")
                 processor = self.message_processor
                 if command and processor is not None:
-                    line = processor.apply_shell_finished(
+                    phantom = processor.apply_shell_finished(
                         command,
                         bool(event.get("failed")),
                         output=event.get("output") or "",
                         tool_key=background_rows.get(event.get("shell_id")),
+                        shell_id=event.get("shell_id"),
                     )
-                    if line:
+                    if phantom:
                         self.chat_view.run_command(
                             "term_chat_output_append",
-                            {"text": f"\n{line}\n", "is_tool": True},
+                            {
+                                "text": "\n",
+                                "is_tool": True,
+                                "tool_phantoms": [phantom],
+                            },
                         )
 
     def _replay_tool_event(self, block, key=None):
@@ -3238,6 +3243,19 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                         item.get("output"),
                         key=item.get("key"),
                         status=item.get("status"),
+                        edit=edit,
+                    )
+                elif kind == "shell_finished":
+                    command = item.get("command") or {}
+                    if not command.get("detail"):
+                        continue
+                    session.tool_outputs.add_shell_finished(
+                        anchor,
+                        command.get("detail"),
+                        output=(item.get("output") or {}).get("detail") or "",
+                        failed=bool(item.get("failed")),
+                        key=item.get("key"),
+                        summary=item.get("summary"),
                         edit=edit,
                     )
                 else:

@@ -466,7 +466,7 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.assertEqual(
             "".join(appended), "我会把结果带回来。\n\n后台任务已完成 ✅")
 
-    def test_shell_finished_updates_row_and_adds_notice(self):
+    def test_shell_finished_updates_row_and_adds_phantom(self):
         seen = {"call_bg": {"key": "call_bg"}}
         self.session.tool_outputs = SimpleNamespace(
             find=lambda key: seen.get(key),
@@ -479,6 +479,7 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.processor.append_content = append
         self.processor.handle_message(Message("shell_finished", {
             "tool_key": "call_bg",
+            "shell_id": "sh_bg",
             "command": "npm run dev",
             "output": "server ready\n",
             "state": "completed",
@@ -491,9 +492,17 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.assertTrue(update["update"])
         self.assertEqual(update["output"]["summary"], "1 line success")
         self.assertEqual(update["output"]["detail"], "server ready")
-        self.assertEqual(calls[1][0], "↳ Shell finished · npm run dev\n")
+        # The phantom-only append inserts its own anchor line.
+        self.assertEqual(calls[1][0], "")
+        phantom = calls[1][1][0]
+        self.assertEqual(phantom["kind"], "shell_finished")
+        self.assertEqual(phantom["label"], "Shell finished")
+        self.assertEqual(phantom["summary"], "npm run dev")
+        self.assertEqual(phantom["command"]["detail"], "npm run dev")
+        self.assertEqual(phantom["output"]["detail"], "server ready\n")
+        self.assertEqual(phantom["key"], "shell_finished:sh_bg")
 
-    def test_apply_shell_finished_updates_row_without_notice(self):
+    def test_apply_shell_finished_updates_row_without_appending(self):
         seen = {"call_bg": {"key": "call_bg"}}
         self.session.tool_outputs = SimpleNamespace(
             find=lambda key: seen.get(key),
@@ -504,10 +513,12 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             calls.append((text, tool_phantoms))
 
         self.processor.append_content = append
-        line = self.processor.apply_shell_finished(
-            "npm run dev", False, output="server ready", tool_key="call_bg")
+        phantom = self.processor.apply_shell_finished(
+            "npm run dev", False, output="server ready", tool_key="call_bg",
+            shell_id="sh_bg")
 
-        self.assertEqual(line, "↳ Shell finished · npm run dev")
+        self.assertEqual(phantom["kind"], "shell_finished")
+        self.assertEqual(phantom["label"], "Shell finished")
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "")
         update = calls[0][1][0]
@@ -515,23 +526,34 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.assertEqual(update["output"]["summary"], "1 line success")
         self.assertEqual(update["output"]["detail"], "server ready")
 
-    def test_apply_shell_finished_without_row_returns_notice_only(self):
+    def test_apply_shell_finished_without_row_returns_phantom_only(self):
         self.session.tool_outputs = SimpleNamespace(find=lambda key: None)
         calls = []
         self.processor.append_content = (
             lambda text, **kw: calls.append((text, kw)))
 
-        line = self.processor.apply_shell_finished(
-            "npm run dev", False, output="ready", tool_key="gone")
+        phantom = self.processor.apply_shell_finished(
+            "npm run dev", True, output="boom", tool_key="gone",
+            shell_id="sh_bg")
 
-        self.assertEqual(line, "↳ Shell finished · npm run dev")
+        self.assertEqual(phantom["label"], "Shell failed")
+        self.assertEqual(phantom["output"]["detail"], "boom")
+        self.assertEqual(phantom["key"], "shell_finished:sh_bg")
         self.assertEqual(calls, [])
+
+    def test_format_shell_finished_truncates_long_command_preview(self):
+        phantom = self.processor.format_shell_finished(
+            "npm test -- --watch --coverage " * 5, False, output="ok")
+        self.assertTrue(phantom["summary"].endswith("…"))
+        self.assertEqual(
+            phantom["command"]["detail"],
+            ("npm test -- --watch --coverage " * 5).strip())
 
     def test_shell_failed_notice(self):
         self.session.tool_outputs = SimpleNamespace(find=lambda key: None)
-        appended = []
+        calls = []
         self.processor.append_content = (
-            lambda text, **kw: appended.append(text))
+            lambda text, **kw: calls.append((text, kw.get("tool_phantoms"))))
         self.processor.handle_message(Message("shell_finished", {
             "tool_key": "call_missing",
             "command": "npm run build",
@@ -539,7 +561,11 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             "failed": True,
         }))
 
-        self.assertEqual(appended, ["↳ Shell failed · npm run build\n"])
+        self.assertEqual([text for text, _ in calls], [""])
+        phantom = calls[0][1][0]
+        self.assertEqual(phantom["label"], "Shell failed")
+        self.assertEqual(phantom["summary"], "npm run build")
+        self.assertEqual(phantom["output"]["detail"], "boom")
 
 
 class TestModelFormatting(unittest.TestCase):

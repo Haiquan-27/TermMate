@@ -25,6 +25,14 @@ button reveals both blocks:
 
 Clicking ``show`` inserts both blocks right after the anchor line and toggles
 the link to ``hide``.
+
+Background shells get a second, standalone row when they finish (the TUI
+reports them as their own message):
+
+    ↳ Shell finished · npm run dev                  [show]
+
+Its ``show`` link reveals the original command and the output the shell
+produced after its tool call had already returned.
 """
 
 import html
@@ -135,6 +143,43 @@ class ToolOutputManager:
         self._update()
         return entry
 
+    def add_shell_finished(self, anchor, command, output="", failed=False,
+                           key=None, summary=None, edit=None):
+        """Register a standalone ``↳ Shell finished`` row for a background job.
+
+        Mirrors the TUI, which reports a completed background shell as its
+        own message instead of as a second line of the tool call.  The row
+        has a single ``show`` link that reveals the original command and the
+        output the shell produced after the tool call had already returned.
+        """
+        command = str(command or "").strip()
+        if not command:
+            return None
+        if key is not None:
+            existing = self.find(key)
+            if existing is not None:
+                return self._update_shell_finished(
+                    existing, command, output, failed, summary, edit=edit)
+        if key is None:
+            key = self.REGION_PREFIX + str(self.next_id)
+            self.next_id += 1
+        region_key = key + "_anchor"
+        self.view.add_regions(region_key, [anchor], flags=sublime.HIDDEN)
+        entry = {
+            "key": key,
+            "region_key": region_key,
+            "detail_key": key + "_detail",
+            "kind": "shell_finished",
+            "label": "Shell failed" if failed else "Shell finished",
+            "summary": summary or "",
+            "command": {"detail": command.rstrip("\n")},
+            "output": {"summary": "", "detail": output or ""},
+            "expanded": False,
+        }
+        self.entries.append(entry)
+        self._update()
+        return entry
+
     def find(self, key):
         """Return the entry registered under ``key``, if any."""
         for entry in self.entries:
@@ -161,7 +206,7 @@ class ToolOutputManager:
         entry = self._find(key)
         if entry is None:
             return
-        if entry["kind"] == "tool_call":
+        if entry["kind"] in ("tool_call", "shell_finished"):
             self._toggle_tool_call(edit, entry)
             return
         if entry["expanded"]:
@@ -214,6 +259,18 @@ class ToolOutputManager:
             elif summary and not entry.get("output"):
                 entry["output"] = {"summary": summary, "detail": ""}
         entry["status"] = status
+        if edit is not None and entry["expanded"]:
+            self._render_tool_call_detail(edit, entry)
+        self._update()
+        return entry
+
+    def _update_shell_finished(self, entry, command, output, failed, summary,
+                               edit=None):
+        """Apply a repeated completion event to an existing shell row."""
+        entry["label"] = "Shell failed" if failed else "Shell finished"
+        entry["summary"] = summary or entry.get("summary") or ""
+        entry["command"] = {"detail": command.rstrip("\n")}
+        entry["output"] = {"summary": "", "detail": output or ""}
         if edit is not None and entry["expanded"]:
             self._render_tool_call_detail(edit, entry)
         self._update()
@@ -278,6 +335,10 @@ class ToolOutputManager:
                 output_block = format_fenced_output(output["detail"])
                 if output_block:
                     sections.append(f"Return\n{output_block}")
+                elif entry["kind"] == "shell_finished":
+                    # A silent background command still needs a Return block
+                    # so the row never looks like it lost its output.
+                    sections.append("Return\n```text\n(no output)\n```")
         text = "\n".join(sections)
 
         old_regions = self.view.get_regions(entry["detail_key"])
@@ -382,10 +443,23 @@ class ToolOutputManager:
         links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{toggle_label}</a>"
         return f"<div class='termmate-tool-row'>{body}{links}</div>"
 
+    def _shell_finished_rows_html(self, entry):
+        key = entry["key"]
+        toggle_label = "hide" if entry["expanded"] else "show"
+        return (
+            "<div class='termmate-tool-row'>"
+            f"<span>↳ {html.escape(entry.get('label') or 'Shell finished')}"
+            f" · {html.escape(entry.get('summary') or '')}</span>"
+            f"&nbsp;&nbsp;<a href='toggle:{key}'>{toggle_label}</a>"
+            "</div>"
+        )
+
     def _row_html(self, entry):
         body_id = f"chatview-tool-output-{entry['key']}"
         if entry["kind"] == "tool_call":
             rows = self._tool_call_rows_html(entry)
+        elif entry["kind"] == "shell_finished":
+            rows = self._shell_finished_rows_html(entry)
         else:
             rows = self._output_row_html(entry)
         return (
