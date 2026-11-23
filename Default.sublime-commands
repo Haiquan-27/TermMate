@@ -12,6 +12,10 @@
         "command": "term_chat_switch_thread"
     },
     {
+        "caption": "TermMate: Rename Chat\trename current chat thread",
+        "command": "term_chat_rename_thread"
+    },
+    {
         "caption": "TermMate: Quick Message\tsend message directly",
         "command": "term_chat_prompt"
     },

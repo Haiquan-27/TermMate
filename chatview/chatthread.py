@@ -17,6 +17,11 @@ CHAT_VIEW_NAME = "Chat View"
 CHAT_THREAD_NAME = "TermChat"
 CHAT_AGENT = "chatview_agent_provider"
 
+# Display-only prefix and fallback label for chat tabs.  Raw titles never
+# include these values; only view.set_name() uses them.
+THREAD_TITLE_PREFIX = "▣ "
+UNTITLED_LABEL = "untitled"
+
 # Thread settings keys
 CHAT_THREAD_LABEL = "chatview_thread_label"
 CHAT_THREAD_COUNTER = "chatview_thread_counter"
@@ -310,12 +315,19 @@ class TermChatNewThreadCommand(sublime_plugin.WindowCommand):
     def _start_task(self, title, initial_msg, send_immediate, cwd, target_group):
         task_num = self._next_task_number()
         clean_title = (title or "").strip()
-        if clean_title:
-            view_name = f"{CHAT_THREAD_NAME} #{task_num} {clean_title}"
-        else:
-            view_name = f"{CHAT_THREAD_NAME} #{task_num}"
 
-        from .chatview import _create_chat_view_and_session
+        # Task titles are a snapshot taken at creation.  When no title is
+        # supplied, derive one from the primary chat so the server does not
+        # auto-name this session later.
+        from .chatview import ChatSession, _create_chat_view_and_session
+        primary_title = ""
+        primary_session = chat_threads.get_primary_session(self.window)
+        if primary_session and primary_session.chat_view:
+            raw = primary_session.chat_view.settings().get(CHAT_THREAD_TITLE, "")
+            primary_title = ChatSession._normalize_thread_title(raw)
+        server_title = clean_title or f"{primary_title or UNTITLED_LABEL} #{task_num}"
+        view_name = f"{THREAD_TITLE_PREFIX}{server_title}"
+
         chat_view = _create_chat_view_and_session(
             self.window,
             role=SessionRole.TASK,
@@ -324,10 +336,10 @@ class TermChatNewThreadCommand(sublime_plugin.WindowCommand):
             send_immediate=send_immediate,
             cwd=cwd,
             target_group=target_group,
+            initial_title=server_title,
         )
         chat_view.settings().set(CHAT_THREAD_ID, task_num)
-        if clean_title:
-            chat_view.settings().set(CHAT_THREAD_TITLE, clean_title)
+        chat_view.settings().set(CHAT_THREAD_TITLE, server_title)
 
 
 class TermChatSwitchThreadCommand(sublime_plugin.WindowCommand):
@@ -382,26 +394,23 @@ class TermChatSwitchThreadCommand(sublime_plugin.WindowCommand):
             vid = s.chat_view.id()
             is_current = bool(current_vid and vid == current_vid)
 
-            if s.role == SessionRole.PRIMARY:
-                raw_title = f"{CHAT_VIEW_NAME} (Primary)"
-            else:
-                raw_title = (
-                    s.chat_view.name()
-                    or f"{CHAT_THREAD_NAME} #{s.chat_view.settings().get(CHAT_THREAD_ID, '')}"
-                )
+            raw_title = s.chat_view.settings().get(CHAT_THREAD_TITLE, "")
+            if not isinstance(raw_title, str) or not raw_title.strip():
+                if s.role == SessionRole.PRIMARY:
+                    raw_title = UNTITLED_LABEL
+                else:
+                    task_num = s.chat_view.settings().get(CHAT_THREAD_ID, "")
+                    raw_title = f"{UNTITLED_LABEL} #{task_num}".rstrip()
+            title = raw_title.strip()
+
+            session_id = (
+                getattr(s.agent_thread, "session_id", None) if s.agent_thread else None
+            ) or s.get_view_session_id(s.chat_view)
+            details = str(session_id) if session_id else "no session"
 
             icon, status, annotation = self._get_session_thread_status(
                 s, is_current=is_current
             )
-            title = raw_title
-
-            agent = chat_threads.get_setting_for_session(
-                window, s, CHAT_AGENT, "claude"
-            )
-            model = chat_threads.get_setting_for_session(
-                window, s, f"chatview_model_{agent}", "default"
-            )
-            details = f"{icon} Agent: {agent} · Model: {model} · {status}"
 
             if hasattr(sublime, "QuickPanelItem"):
                 item = sublime.QuickPanelItem(
@@ -439,8 +448,8 @@ class TermChatSwitchThreadCommand(sublime_plugin.WindowCommand):
 
 class TermChatRenameThreadCommand(sublime_plugin.WindowCommand):
     """
-    Rename the current Task Chat thread tab (`chatview #<id> <title>`).
-    Primary Chat View cannot be renamed.
+    Rename the current chat view (primary or task) and sync the server title
+    when the active agent supports native session rename.
     """
     def _resolve_target_view(self, group=-1, index=-1, view_id=None):
         if view_id is not None:
@@ -459,24 +468,19 @@ class TermChatRenameThreadCommand(sublime_plugin.WindowCommand):
 
     def is_visible(self, group=-1, index=-1, view_id=None):
         view = self._resolve_target_view(group, index, view_id)
-        return bool(view and is_task_chat_view(view))
+        return bool(view and is_chat_view(view))
 
     def is_enabled(self, group=-1, index=-1, view_id=None):
         view = self._resolve_target_view(group, index, view_id)
-        return bool(view and is_task_chat_view(view))
+        return bool(view and is_chat_view(view))
 
     def run(self, title=None, group=-1, index=-1, view_id=None):
         target_view = self._resolve_target_view(group, index, view_id)
         if not target_view:
             sublime.status_message("No view to rename")
             return
-
-        if is_primary_chat_view(target_view):
-            sublime.status_message(f"Primary {CHAT_VIEW_NAME} cannot be renamed")
-            return
-
-        if not is_task_chat_view(target_view):
-            sublime.status_message("Current tab is not a Task Chat thread")
+        if not is_chat_view(target_view):
+            sublime.status_message("Current tab is not a chat view")
             return
 
         if title is not None:
@@ -485,7 +489,7 @@ class TermChatRenameThreadCommand(sublime_plugin.WindowCommand):
 
         current_title = target_view.settings().get(CHAT_THREAD_TITLE, "")
         panel = self.window.show_input_panel(
-            "Rename Chat Thread:",
+            "Rename Chat:",
             current_title,
             lambda text: self._apply_rename(target_view, text),
             None,
@@ -494,28 +498,23 @@ class TermChatRenameThreadCommand(sublime_plugin.WindowCommand):
         panel.settings().set("is_widget", True)
 
     def _apply_rename(self, view, title):
+        # Forward exactly what the user typed; only outer whitespace is
+        # trimmed by the input machinery.  No prefix stripping here.
         clean_title = (title or "").strip()
-        clean_title = re.sub(
-            rf"^(?:{re.escape(CHAT_THREAD_NAME)}|{re.escape(CHAT_VIEW_NAME)}|term\s*chat)\s*#\d+\s*",
-            "",
-            clean_title,
-            flags=re.IGNORECASE,
-        ).strip()
-        task_num = view.settings().get(CHAT_THREAD_ID)
-        if task_num is not None:
-            view_name = (
-                f"{CHAT_THREAD_NAME} #{task_num} {clean_title}"
-                if clean_title
-                else f"{CHAT_THREAD_NAME} #{task_num}"
-            )
+        session = chat_threads.sessions.get(view.id())
+        if session is not None and hasattr(session, "set_thread_title"):
+            if clean_title:
+                session.rename_thread(clean_title)
+            else:
+                session.set_thread_title("")
         else:
-            view_name = clean_title or CHAT_THREAD_NAME
-
-        view.set_name(view_name)
-        if clean_title:
-            view.settings().set(CHAT_THREAD_TITLE, clean_title)
-        else:
-            view.settings().erase(CHAT_THREAD_TITLE)
+            # Views without a live ChatSession (e.g. restored sessions before
+            # reconnect) still get a local-only rename.
+            if clean_title:
+                view.settings().set(CHAT_THREAD_TITLE, clean_title)
+            else:
+                view.settings().erase(CHAT_THREAD_TITLE)
+            view.set_name(f"{THREAD_TITLE_PREFIX}{clean_title or UNTITLED_LABEL}")
 
         chat_threads.update_window_model_phantoms(self.window)
-        sublime.status_message(f"Renamed thread to: {view_name}")
+        sublime.status_message(f"Renamed chat to: {view.name()}")

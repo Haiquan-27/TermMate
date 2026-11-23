@@ -111,6 +111,7 @@ class AgentOptions:
         debug_agent_message: bool = False,
         enable_file_checkpoint: bool = False,
         think_level: Optional[str] = None,
+        initial_title: Optional[str] = None,
     ):
         import os
         self.cwd = cwd or os.getcwd()
@@ -131,6 +132,10 @@ class AgentOptions:
         self.debug_agent_message = debug_agent_message
         self.enable_file_checkpoint = enable_file_checkpoint
         self.think_level = think_level
+        # Server-side title supplied when a session is created.  Agents that
+        # support native session titles forward this on create; the value is
+        # always a raw title (no display-only decoration).
+        self.initial_title = initial_title
 
 
 class BaseAgent(abc.ABC):
@@ -162,6 +167,14 @@ class BaseAgent(abc.ABC):
         Returns True when the command was handled.  Returning False lets the
         chat view report that the command is not implemented (without sending
         the raw ``/name`` text to the model).
+        """
+        return False
+
+    async def rename_session(self, title: str) -> bool:
+        """Rename the server-side session when supported.
+
+        Agents without native rename support return False; the chat view then
+        keeps the user-supplied title as a local-only label.
         """
         return False
 

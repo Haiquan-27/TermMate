@@ -441,6 +441,12 @@ class BaseChatMessageProcessor:
             LOG.info("Session reset completed successfully")
             return
 
+        if getattr(message, "type", None) == "thread_title":
+            content = message.content if isinstance(message.content, dict) else {}
+            if hasattr(self.session, "set_thread_title"):
+                self.session.set_thread_title(content.get("title", ""))
+            return
+
         if hasattr(message, "type"):
             if message.type == "token_usage":
                 if hasattr(self.session, "set_token_usage"):

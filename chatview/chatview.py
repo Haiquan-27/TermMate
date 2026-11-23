@@ -70,6 +70,10 @@ CHAT_LAST_Y = "chatview_last_y"
 CHAT_AUTOSCROLL = "chatview_autoscroll"
 CHAT_STATUS_KEY = "termmate.agent_model"
 PACKAGE_NAME = "TermMate"
+# OpenCode's creation-time placeholder is not a real title.
+_FALLBACK_TITLE_RE = re.compile(
+    r"^(?:New|Child) session - \d{4}-\d{2}-\d{2}T[\d:.]+Z$"
+)
 PROMPT_PREFIX = "\n❯ "  # transcript prefix for submitted prompts; the live input line uses InputPromptMarker instead
 AGENT_SEPARATOR = "⋅⋅⋅"
 PREFERENCES_CHANGE_KEY = "termmate_chatview_preferences"
@@ -83,6 +87,8 @@ from .chatthread import (
     CHAT_THREAD_COUNTER,
     CHAT_THREAD_ID,
     CHAT_THREAD_TITLE,
+    THREAD_TITLE_PREFIX,
+    UNTITLED_LABEL,
     ChatThreadSet,
     chat_threads,
     chatview_sessions,
@@ -358,10 +364,13 @@ def _reconnect_chat_view(view):
     view.settings().set("highlight_gutter", False)
     view.settings().set("highlight_line", False)
 
+    initial_title = view.settings().get(CHAT_THREAD_TITLE, "")
     session = ChatSession(
-        window, view, cwd, add_dirs=add_dirs, session_id=session_id, role=role
+        window, view, cwd, add_dirs=add_dirs, session_id=session_id, role=role,
+        initial_title=initial_title,
     )
     chat_threads.register(window, view, session)
+    session.set_thread_title(initial_title)
     update_agent_model_status(window)
     # Restore the input phantoms at the existing CHAT_INPUT_START position
     session.notice_phantom.show("conversation restored after restart")
@@ -492,6 +501,7 @@ class AgentThread(threading.Thread):
             ),
             think_level=self.anthropic_config.get("think_level"),
             sandbox_mode=self.anthropic_config.get("sandbox_mode"),
+            initial_title=self.anthropic_config.get("initial_title"),
         )
 
         agent_provider = self.anthropic_config.get("agent_provider", "claude")
@@ -647,6 +657,34 @@ class AgentThread(threading.Thread):
                 handled = await self.agent.run_slash_command(name, arguments)
             except Exception as exc:
                 LOG.error("Slash command /%s failed: %s", name, exc, exc_info=True)
+                error = str(exc)
+            if on_done:
+                sublime.set_timeout(lambda: on_done(handled, error), 0)
+
+        coro = _run()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except RuntimeError:
+            coro.close()
+            return False
+        return True
+
+    def rename_session(self, title, on_done=None):
+        """Rename the agent session on its loop, if supported.
+
+        ``on_done(handled, error)`` runs on the Sublime main thread.  Agents
+        without native rename support report ``handled=False``.
+        """
+        if not self.loop or not self.agent or not self.running or self.loop.is_closed():
+            return False
+
+        async def _run():
+            handled = False
+            error = None
+            try:
+                handled = await self.agent.rename_session(title)
+            except Exception as exc:
+                LOG.error("Failed to rename session: %s", exc, exc_info=True)
                 error = str(exc)
             if on_done:
                 sublime.set_timeout(lambda: on_done(handled, error), 0)
@@ -1519,7 +1557,8 @@ class ChatSession:
     SLASH_FETCH_RETRY_INTERVAL_MS = 200
     SLASH_FETCH_RETRY_ATTEMPTS = 25
 
-    def __init__(self, window, view, cwd, add_dirs=None, session_id=None, role=SessionRole.PRIMARY):
+    def __init__(self, window, view, cwd, add_dirs=None, session_id=None,
+                 role=SessionRole.PRIMARY, initial_title=None):
         self.window = window
         self.chat_view = view
         if isinstance(role, str):
@@ -1528,6 +1567,8 @@ class ChatSession:
             except ValueError:
                 role = SessionRole.PRIMARY
         self.role = role
+        self.initial_title = initial_title or ""
+        self._untitled_after_reset = False
         if self.chat_view:
             self.chat_view.settings().set(CHAT_THREAD_LABEL, self.role.value)
         self._reset_markdown_formatter()
@@ -1644,6 +1685,7 @@ class ChatSession:
             "env": settings.get("env", {}),
             "debug_agent_message": settings.get("debug_agent_message", False),
             "sandbox_mode": self._get_sandbox_mode(settings, agent_provider),
+            "initial_title": self.initial_title,
         }
 
         # Initialize background agent thread
@@ -1655,6 +1697,85 @@ class ChatSession:
             add_dirs=self.add_dirs
         )
         self.agent_thread.start()
+        if self.initial_title:
+            self.set_thread_title(self.initial_title)
+
+    # ------------------------------------------------------------------
+    # Thread title helpers.  Raw titles live in CHAT_THREAD_TITLE; the "▣"
+    # prefix is added only by _thread_display_name() when naming the tab.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_thread_title(title):
+        if not isinstance(title, str):
+            return ""
+        title = title.strip()
+        # Server titles and user input are single-line UI labels.
+        title = " ".join(title.splitlines()).strip()
+        if _FALLBACK_TITLE_RE.match(title):
+            return ""
+        return title
+
+    def _primary_thread_title(self):
+        """Return the primary chat's raw title, or "" when it has none."""
+        try:
+            primary = chat_threads.get_primary_session(self.window)
+        except Exception:
+            primary = None
+        if primary and primary is not self and primary.chat_view:
+            title = primary.chat_view.settings().get(CHAT_THREAD_TITLE, "")
+            return self._normalize_thread_title(title)
+        return ""
+
+    def _thread_display_name(self):
+        title = ""
+        if self.chat_view:
+            title = self._normalize_thread_title(
+                self.chat_view.settings().get(CHAT_THREAD_TITLE, "")
+            )
+        if not title and self._untitled_after_reset:
+            return f"{THREAD_TITLE_PREFIX}{UNTITLED_LABEL}"
+        if not title and self.role == SessionRole.TASK:
+            base = self._primary_thread_title() or UNTITLED_LABEL
+            number = self.chat_view.settings().get(CHAT_THREAD_ID) if self.chat_view else None
+            if isinstance(number, int):
+                title = f"{base} #{number}"
+            else:
+                title = base
+        if not title:
+            title = UNTITLED_LABEL
+        return f"{THREAD_TITLE_PREFIX}{title}"
+
+    def set_thread_title(self, title):
+        """Store the raw server title and refresh the chat tab name."""
+        raw_title = self._normalize_thread_title(title)
+        if not self.chat_view:
+            return
+        if raw_title:
+            self.chat_view.settings().set(CHAT_THREAD_TITLE, raw_title)
+            self._untitled_after_reset = False
+        else:
+            self.chat_view.settings().erase(CHAT_THREAD_TITLE)
+        self.chat_view.set_name(self._thread_display_name())
+
+    def clear_thread_title(self):
+        """Return the tab to its untitled state after a reset/agent switch."""
+        self._untitled_after_reset = True
+        self.set_thread_title("")
+
+    def rename_thread(self, title):
+        """Apply a rename locally, then sync it to the agent when supported."""
+        self.set_thread_title(title)
+        if not self.agent_thread:
+            return
+        if not self.agent_thread.rename_session(
+            title,
+            on_done=lambda handled, error: self._on_rename_done(error),
+        ):
+            return
+
+    def _on_rename_done(self, error):
+        if error:
+            self._append_slash_notice(f"\n⚠️ /rename: {error}\n")
 
     def get_setting(self, key, default=None):
         """Read setting for this session (view settings first, then window settings)."""
@@ -2358,6 +2479,7 @@ class ChatSession:
         self.session_allow_all = False
         self.has_sent_message = False
         self.chat_view.settings().set(CHAT_SESSION_ID, None)
+        self.clear_thread_title()
 
         # Show reset message in the history
         reset_msg = f"\n\n{PACKAGE_NAME} session reset...\n"
@@ -2380,6 +2502,7 @@ class ChatSession:
         # Clear stale models and session_id from previous agent
         self.available_models = []
         self.chat_view.settings().set(CHAT_SESSION_ID, None)
+        self.clear_thread_title()
         self.clear_prompt_buttons()
         self.artifact.clear()
 
@@ -2486,6 +2609,8 @@ class ChatSession:
         if not quiet:
             if old_session_id:
                 session_info = self._fetch_session_info(current_agent_provider, old_session_id, cwd)
+                if session_info and isinstance(session_info.get("summary"), str):
+                    self.set_thread_title(session_info["summary"])
                 self._append_resume_history(current_agent_provider, old_session_id, session_info)
             else:
                 self.chat_view.run_command(
@@ -2710,6 +2835,7 @@ def _create_chat_view_and_session(
     send_immediate=False,
     cwd="",
     target_group=None,
+    initial_title=None,
 ):
     """Create a new chat view, initialize its ChatSession, and focus it."""
     chat_view = window.new_file()
@@ -2718,7 +2844,8 @@ def _create_chat_view_and_session(
             chat_view, target_group, len(window.views_in_group(target_group))
         )
 
-    chat_view.set_name(view_name)
+    title = ChatSession._normalize_thread_title(initial_title)
+    chat_view.set_name(f"{THREAD_TITLE_PREFIX}{title or UNTITLED_LABEL}")
     chat_view.set_scratch(True)
     chat_view.set_syntax_file(f"Packages/{PACKAGE_NAME}/chatview/ChatMD.sublime-syntax")
 
@@ -2755,7 +2882,10 @@ def _create_chat_view_and_session(
     set_input_start(chat_view, chat_view.size())
 
     # Create and start the ChatSession
-    session = ChatSession(window, chat_view, resolved_cwd, add_dirs=add_dirs, role=role)
+    session = ChatSession(
+        window, chat_view, resolved_cwd, add_dirs=add_dirs, role=role,
+        initial_title=initial_title,
+    )
     chat_threads.register(window, chat_view, session)
     update_agent_model_status(window)
 

@@ -1,7 +1,7 @@
 [
     { "caption": "-" },
     {
-        "caption": "TermMate: Rename Chat Thread…",
+        "caption": "TermMate: Rename Chat…",
         "command": "term_chat_rename_thread",
         "args": {"group": "$group", "index": "$index"}
     },

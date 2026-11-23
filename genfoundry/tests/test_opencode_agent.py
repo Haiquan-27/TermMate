@@ -386,7 +386,7 @@ class TestOpenCodeTurns(unittest.IsolatedAsyncioTestCase):
             messages.append(await agent._message_queue.get())
         self.assertEqual(
             [message.type for message in messages],
-            ["thread_started", "turn_started"],
+            ["thread_started", "thread_title", "turn_started"],
         )
         self.assertEqual(messages[0].content, {"session_id": "ses_new"})
 
@@ -2202,7 +2202,7 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
         commands = await agent.list_slash_commands()
         self.assertEqual(
             {command.name for command in commands},
-            {"compact", "new", "clear", "undo", "redo"},
+            {"compact", "rename", "new", "clear", "undo", "redo"},
         )
 
     async def test_placeholders_are_not_forwarded_to_the_model(self):
@@ -2398,6 +2398,152 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
         ended = agent._message_queue.get_nowait()
         self.assertFalse(ended.content["manual"])
         self.assertFalse(agent._compaction_event.is_set())
+
+
+class TestOpenCodeSessionTitles(unittest.IsolatedAsyncioTestCase):
+    def _drain(self, agent):
+        messages = []
+        while not agent._message_queue.empty():
+            messages.append(agent._message_queue.get_nowait())
+        return messages
+
+    async def test_rename_v2_patches_server_title_verbatim(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append((method, path, body))
+            return None
+
+        agent._http = fake_http
+
+        handled = await agent.run_slash_command("rename", "▣ 修复登录")
+
+        self.assertTrue(handled)
+        self.assertEqual(
+            calls,
+            [("PATCH", "/api/session/ses_1", {"title": "▣ 修复登录"})],
+        )
+        self.assertEqual(agent._session_title, "▣ 修复登录")
+        titles = [m for m in self._drain(agent) if m.type == "thread_title"]
+        self.assertEqual(len(titles), 1)
+        self.assertEqual(titles[0].content["title"], "▣ 修复登录")
+
+    async def test_rename_rejects_an_empty_title(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        agent._http = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "Usage: /rename <title>"):
+            await agent.run_slash_command("rename", "   ")
+        agent._http.assert_not_awaited()
+
+    async def test_rename_before_first_prompt_becomes_initial_title(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._http = AsyncMock()
+
+        handled = await agent.rename_session("before-start")
+
+        self.assertTrue(handled)
+        self.assertEqual(agent.options.initial_title, "before-start")
+        self.assertEqual(agent._session_create_body_v2()["title"], "before-start")
+        agent._http.assert_not_awaited()
+
+    async def test_rename_v1_is_best_effort(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=1)
+        agent._session_id = "ses_1"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append((method, path, body))
+            raise RuntimeError("unsupported")
+
+        agent._http = fake_http
+
+        self.assertTrue(await agent.rename_session("local only"))
+
+        self.assertEqual(
+            calls,
+            [("PATCH", "/session/ses_1", {"title": "local only"})],
+        )
+        self.assertEqual(agent._session_title, "local only")
+
+    async def test_renamed_event_emits_thread_title(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+
+        await agent._dispatch_event({
+            "type": "session.renamed",
+            "data": {"sessionID": "ses_1", "title": "auto title"},
+        })
+
+        self.assertEqual(agent._session_title, "auto title")
+        messages = self._drain(agent)
+        self.assertEqual([m.type for m in messages], ["thread_title"])
+        self.assertEqual(messages[0].content["title"], "auto title")
+
+    async def test_renamed_event_from_another_session_is_ignored(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+
+        await agent._dispatch_event({
+            "type": "session.renamed",
+            "data": {"sessionID": "ses_other", "title": "other"},
+        })
+
+        self.assertTrue(agent._message_queue.empty())
+
+    async def test_initial_title_is_sent_on_v2_create(self):
+        agent = OpenCodeAgent(
+            AgentOptions(cwd=".", initial_title="main title #2"), version=2
+        )
+        self.assertEqual(agent._session_create_body_v2()["title"], "main title #2")
+
+    async def test_initial_title_is_sent_on_v1_create(self):
+        agent = OpenCodeAgent(
+            AgentOptions(cwd=".", initial_title="main title #2"), version=1
+        )
+        self.assertEqual(agent._session_create_body_v1(), {"title": "main title #2"})
+
+    async def test_resumed_session_publishes_its_title(self):
+        agent = OpenCodeAgent(AgentOptions(cwd=".", session_id="ses_existing"), version=2)
+        agent._loop = asyncio.get_running_loop()
+        agent._sse_ready.set()
+
+        async def fake_http(method, path, **kwargs):
+            if path == "/api/info":
+                return {}
+            if path == "/api/session/ses_existing":
+                return {"id": "ses_existing", "title": "resumed title"}
+            raise AssertionError((method, path))
+
+        agent._http = fake_http
+        agent._process_events = AsyncMock()
+        agent._start_sse_thread = lambda env: None
+        agent._fetch_models = AsyncMock()
+
+        await agent._finish_connect({}, None)
+
+        self.assertEqual(agent._session_title, "resumed title")
+        messages = self._drain(agent)
+        self.assertEqual(
+            [m.type for m in messages], ["thread_started", "thread_title"]
+        )
+        self.assertEqual(messages[1].content["title"], "resumed title")
+
+    async def test_create_without_echoed_title_keeps_initial_title(self):
+        agent = OpenCodeAgent(
+            AgentOptions(cwd=".", initial_title="local task title"), version=1
+        )
+        agent._is_connected = True
+        agent._http = AsyncMock(side_effect=[{"id": "ses_new"}, None])
+
+        await agent.send_message("hello")
+
+        titles = [m for m in self._drain(agent) if m.type == "thread_title"]
+        self.assertEqual(len(titles), 1)
+        self.assertEqual(titles[0].content["title"], "local task title")
 
 
 if __name__ == "__main__":

@@ -989,5 +989,25 @@ class TestThinkPresets(unittest.TestCase):
         self.assertEqual([p["value"] for p in presets], ["low", "high"])
 
 
+class TestThreadTitleMessage(unittest.TestCase):
+    def test_thread_title_updates_the_chat_session(self):
+        session = MagicMock()
+        processor = ClaudeMessageProcessor(session)
+
+        processor.handle_message(Message(
+            "thread_title", {"session_id": "ses_1", "title": "new title"}
+        ))
+
+        session.set_thread_title.assert_called_once_with("new title")
+
+    def test_thread_title_with_empty_content_is_safe(self):
+        session = MagicMock()
+        processor = ClaudeMessageProcessor(session)
+
+        processor.handle_message(SimpleNamespace(type="thread_title", content=None))
+
+        session.set_thread_title.assert_called_once_with("")
+
+
 if __name__ == "__main__":
     unittest.main()

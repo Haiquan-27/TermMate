@@ -73,11 +73,13 @@ _VERSION_RE = re.compile(
 # events instead of treating the HTTP response as completion.
 _COMPACTION_TIMEOUT = 600.0
 
-# Slash commands advertised to the completion popup.  ``compact`` is wired to
-# its native endpoint; the remaining entries are placeholders whose
-# ``run_slash_command`` path keeps the raw text out of the model prompt.
+# Slash commands advertised to the completion popup.  ``compact`` and
+# ``rename`` are wired to their native endpoints; the remaining entries are
+# placeholders whose ``run_slash_command`` path keeps the raw text out of the
+# model prompt.
 _OPENCODE_SLASH_COMMANDS = (
     SlashCommand("compact", "Compact the session"),
+    SlashCommand("rename", "Rename the session"),
     SlashCommand("new", "Start a new session"),
     SlashCommand("clear", "Clear and start a new session"),
     SlashCommand("undo", "Undo the previous message"),
@@ -864,6 +866,9 @@ class OpenCodeAgent(BaseAgent):
         self._server_password: Optional[str] = None
 
         self._session_id: Optional[str] = self.options.session_id
+        # Raw server title for the current session.  Decoration (the "▣"
+        # prefix) is a chat-view concern and never lives here.
+        self._session_title: str = ""
         self.plan_mode = self.options.plan_mode
         self.available_models: List[Dict[str, Any]] = []
 
@@ -1072,9 +1077,13 @@ class OpenCodeAgent(BaseAgent):
                 raise RuntimeError("OpenCode did not return a valid session")
 
             self._session_id = session["id"]
+            self._session_title = (
+                self._session_title_from_payload(session)
+            )
             await self._message_queue.put(Message(
                 "thread_started", content={"session_id": self._session_id}
             ))
+            await self._emit_thread_title(self._session_title)
 
         asyncio.create_task(self._fetch_models())
 
@@ -1456,6 +1465,25 @@ class OpenCodeAgent(BaseAgent):
         except asyncio.CancelledError:
             pass
 
+    def _session_title_from_payload(self, session: Any) -> str:
+        """Prefer the server title, but keep a locally supplied title if the
+        backend does not echo it (notably OpenCode v1)."""
+        title = session.get("title") if isinstance(session, dict) else None
+        if isinstance(title, str) and title.strip():
+            return title
+        return getattr(self.options, "initial_title", "") or ""
+
+    async def _emit_thread_title(self, title: str) -> None:
+        """Publish the raw server title to the chat view.
+
+        The title is passed through unchanged; the chat view owns display
+        decoration and fallback-title filtering.
+        """
+        await self._message_queue.put(Message(
+            "thread_title",
+            content={"session_id": self._session_id, "title": title},
+        ))
+
     def _event_payload(self, event: Dict[str, Any]) -> Dict[str, Any]:
         payload = event.get("payload", event)
         return payload if isinstance(payload, dict) else {}
@@ -1515,6 +1543,7 @@ class OpenCodeAgent(BaseAgent):
             "session.compaction.started",
             "session.compaction.ended",
             "session.compaction.failed",
+            "session.renamed",
         )
         if event_type in diag_events:
             DIAG.info("event type=%s current_session=%r data=%s",
@@ -1529,6 +1558,14 @@ class OpenCodeAgent(BaseAgent):
         # =================================================================
         # 1. OpenCode v2 Protocol Events (received on /api/event)
         # =================================================================
+
+        # [v2] Manual rename and auto-title generation share this event.
+        if event_type == "session.renamed":
+            title = properties.get("title")
+            if isinstance(title, str):
+                self._session_title = title
+                await self._emit_thread_title(title)
+            return
 
         # [v2] Assistant streaming text delta
         if event_type == "session.text.delta":
@@ -2671,6 +2708,18 @@ class OpenCodeAgent(BaseAgent):
         permissions = self._session_permissions_v2()
         if permissions:
             body["permissions"] = permissions
+        initial_title = getattr(self.options, "initial_title", None)
+        if isinstance(initial_title, str) and initial_title.strip():
+            # A title supplied at creation prevents OpenCode from generating
+            # its own title after the first message.
+            body["title"] = initial_title
+        return body
+
+    def _session_create_body_v1(self) -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        initial_title = getattr(self.options, "initial_title", None)
+        if isinstance(initial_title, str) and initial_title.strip():
+            body["title"] = initial_title
         return body
 
     async def _ensure_session(self) -> str:
@@ -2684,7 +2733,7 @@ class OpenCodeAgent(BaseAgent):
             session = await self._http("POST", "/api/session", body=body)
         else:
             # [OpenCode v1] Create simple session at root /session
-            session = await self._http("POST", "/session", body={})
+            session = await self._http("POST", "/session", body=self._session_create_body_v1())
 
         session = self._unwrap(session)
         if not isinstance(session, dict) or not session.get("id"):
@@ -2694,6 +2743,10 @@ class OpenCodeAgent(BaseAgent):
         await self._message_queue.put(Message(
             "thread_started", content={"session_id": self._session_id}
         ))
+        self._session_title = (
+            self._session_title_from_payload(session)
+        )
+        await self._emit_thread_title(self._session_title)
         return self._session_id
 
     async def compact(self) -> None:
@@ -2791,7 +2844,41 @@ class OpenCodeAgent(BaseAgent):
         if command == "compact":
             await self.compact()
             return True
+        if command == "rename":
+            await self.rename_session(arguments)
+            return True
         return False
+
+    async def rename_session(self, title: str) -> bool:
+        """Rename the active session on the server.
+
+        The title is forwarded verbatim; empty titles are rejected because v2
+        treats an empty title as "regenerate title" rather than "clear".
+        """
+        if not isinstance(title, str) or not title.strip():
+            raise RuntimeError("Usage: /rename <title>")
+
+        # Optimistic update: the tab follows the title even if the SSE event is
+        # lost.  No display-only prefix is stored here.
+        self._session_title = title
+        await self._emit_thread_title(title)
+
+        if not self._session_id:
+            # A fresh chat has no server session yet.  Carry the title into
+            # the create request so OpenCode does not auto-name it later.
+            self.options.initial_title = title
+            return True
+
+        sid = quote(self._session_id, safe="")
+        if self.version >= 2:
+            await self._http("PATCH", f"/api/session/{sid}", body={"title": title})
+        else:
+            # v1 does not consistently expose rename; keep the local title.
+            try:
+                await self._http("PATCH", f"/session/{sid}", body={"title": title})
+            except Exception as exc:
+                LOG.warning("OpenCode v1 rename failed locally: %s", exc)
+        return True
 
     async def send_message(
         self,
@@ -2919,7 +3006,7 @@ class OpenCodeAgent(BaseAgent):
             body = self._session_create_body_v2()
             session = await self._http("POST", "/api/session", body=body)
         else:
-            session = await self._http("POST", "/session", body={})
+            session = await self._http("POST", "/session", body=self._session_create_body_v1())
 
         session = self._unwrap(session)
         if not isinstance(session, dict) or not session.get("id"):
@@ -2929,6 +3016,9 @@ class OpenCodeAgent(BaseAgent):
         # any late SSE events from it are ignored by _belongs_to_session().
         self._session_id = session["id"]
         self.options.session_id = None
+        self._session_title = (
+            self._session_title_from_payload(session)
+        )
 
         self._turn_active = False
         self._turn_plan_mode = False
@@ -2951,6 +3041,7 @@ class OpenCodeAgent(BaseAgent):
         await self._message_queue.put(Message(
             "thread_started", content={"session_id": self._session_id}
         ))
+        await self._emit_thread_title(self._session_title)
         return self._session_id
 
     async def rewind(self, message_id: str) -> Optional[str]:
