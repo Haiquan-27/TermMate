@@ -3712,6 +3712,13 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
 
     status = state.get("status")
     output_text = _tool_output_text(state.get("output"))
+    if output_text is None:
+        # OpenCode v2 keeps a completed tool's result in ``state.content``
+        # (a list of text/file blocks) instead of the v1 ``state.output``.
+        # Live v2 events normalise this before reaching this builder, but raw
+        # history messages are passed straight through, so handle it here too.
+        # Without the result the replayed row loses its "show" link.
+        output_text = _tool_output_text(state.get("content"))
     error_data = state.get("error")
     error_text = _error_text_value(error_data) if error_data else None
 

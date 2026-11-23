@@ -408,5 +408,51 @@ class TestRenderFullHistory(unittest.TestCase):
         self.assertEqual(self._appended_texts(session), [])
 
 
+class TestReplayToolResult(unittest.TestCase):
+    def test_replayed_tool_call_keeps_result_for_show_link(self):
+        session = MagicMock()
+        session.get_setting.return_value = None
+        processor_cls = chatview_mod.BaseChatMessageProcessor.for_provider("opencode")
+        session.message_processor = processor_cls(session)
+        block = {
+            "name": "command_execution",
+            "command": "pytest -q",
+            "output": "3 passed\n",
+            "status": "completed",
+            "exitCode": 0,
+        }
+
+        chatview_mod.ChatSession._replay_tool_event(session, block, key="tool_v2_1")
+
+        call = session.chat_view.run_command.call_args
+        self.assertEqual(call.args[0], "term_chat_output_append")
+        payload = call.args[1]
+        self.assertTrue(payload.get("is_tool"))
+        phantoms = payload["tool_phantoms"]
+        self.assertEqual(len(phantoms), 1)
+        self.assertEqual(phantoms[0]["kind"], "tool_call")
+        self.assertEqual(phantoms[0]["output"]["detail"], "3 passed")
+        self.assertIn("success", phantoms[0]["output"]["summary"])
+
+    def test_replayed_result_renders_show_link(self):
+        from chatview.tooloutput import ToolOutputManager
+
+        view = MagicMock()
+        view.get_regions.return_value = []
+        manager = ToolOutputManager(view, lambda v: 0, lambda v, p: None)
+        anchor = chatview_mod.sublime.Region(0, 0)
+        entry = manager.add_tool_call(
+            anchor,
+            {"heading": "⏺ command", "summary": "pytest -q",
+             "detail": "pytest -q", "show_command": True},
+            {"summary": "1 line success", "detail": "3 passed\n"},
+            status_only=True,
+        )
+        html = manager._row_html(entry)
+        self.assertIn("1 line success", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+        self.assertIn(">show<", html)
+
+
 if __name__ == "__main__":
     unittest.main()

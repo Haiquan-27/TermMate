@@ -2163,6 +2163,80 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
         self.assertEqual(bash["name"], "command_execution")
         self.assertEqual(bash["output"], "boom")
 
+    def test_tool_content_from_state_reads_v2_content(self):
+        from genfoundry.opencode_agent import _tool_content_from_state
+
+        block = _tool_content_from_state("bash", {
+            "status": "completed",
+            "input": {"command": "ls"},
+            "content": [
+                {"type": "text", "text": "a.txt\nb.txt\n"},
+                {"type": "file", "uri": "file:///tmp/a.txt"},
+            ],
+        })
+        self.assertEqual(block["name"], "command_execution")
+        self.assertEqual(block["output"], "a.txt\nb.txt\n")
+
+        # v1 ``output`` still wins when both fields are present.
+        both = _tool_content_from_state("read", {
+            "status": "completed",
+            "output": "legacy",
+            "content": [{"type": "text", "text": "v2"}],
+        })
+        self.assertEqual(both["output"], "legacy")
+
+    def test_get_opencode_session_info_includes_v2_tool_result(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")
+        session = {"id": "ses_v2out", "title": "V2 output",
+                   "time": {"updated": 1600000040000}}
+        messages = [
+            {
+                "info": {"role": "user"},
+                "content": [{"type": "text", "text": "Run tests"}],
+            },
+            {
+                "info": {"role": "assistant"},
+                "content": [
+                    {"type": "text", "text": "Running."},
+                    {
+                        "type": "tool",
+                        "tool": "bash",
+                        "id": "tool_v2_1",
+                        "state": {
+                            "status": "completed",
+                            "input": {"command": "pytest -q"},
+                            "content": [
+                                {"type": "text", "text": "3 passed\n"},
+                            ],
+                            "metadata": {"exit": 0},
+                        },
+                    },
+                ],
+            },
+        ]
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            # _sync_request normally unwraps the v2 {"data": ...} envelope.
+            if path == "/api/session/ses_v2out":
+                return session
+            if path == "/api/session/ses_v2out/message":
+                return messages
+            return None
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            with patch(
+                "genfoundry.opencode_agent._sync_request", side_effect=fake_request
+            ):
+                info = get_opencode_session_info("ses_v2out", cwd="/workspace")
+
+        self.assertIsNotNone(info)
+        events = info["turns"][0]["events"]
+        self.assertEqual([e["kind"] for e in events], ["user", "assistant", "tool"])
+        tool_block = events[2]["block"]
+        self.assertEqual(tool_block["name"], "command_execution")
+        self.assertEqual(tool_block["output"], "3 passed\n")
+
     def test_probe_opencode_service(self):
         class _MockContext:
             def __enter__(self):
