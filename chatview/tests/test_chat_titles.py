@@ -50,6 +50,7 @@ SessionRole = chatthread_mod.SessionRole
 CHAT_THREAD_TITLE = chatthread_mod.CHAT_THREAD_TITLE
 CHAT_THREAD_ID = chatthread_mod.CHAT_THREAD_ID
 THREAD_TITLE_PREFIX = chatthread_mod.THREAD_TITLE_PREFIX
+CHAT_SESSION_ID = chatview_mod.CHAT_SESSION_ID
 chat_threads = chatthread_mod.chat_threads
 
 
@@ -189,6 +190,69 @@ class TestChatThreadTitles(unittest.TestCase):
             if call.args[0] == "term_chat_output_append" and len(call.args) > 1
         ]
         self.assertTrue(any("⚠️ /rename: boom" in text for text in appended))
+
+    def test_open_forked_session_creates_bound_task_tab(self):
+        session, view, _ = self._make_session(SessionRole.PRIMARY)
+        session.cwd = "/work"
+        new_view = MagicMock()
+        new_view.id.return_value = 777
+        new_view.settings.return_value = _FakeViewSettings()
+        new_session = MagicMock()
+
+        with patch.object(
+            chatview_mod.TermChatNewThreadCommand, "_next_task_number", return_value=7
+        ), patch.object(
+            chatview_mod, "_create_chat_view_and_session", return_value=new_view
+        ) as create, patch.dict(
+            chatview_mod.chat_threads.sessions, {777: new_session}
+        ):
+            session._open_forked_session({
+                "session_id": "ses_fork",
+                "title": "main title (fork #1)",
+            })
+
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["role"], SessionRole.TASK)
+        self.assertEqual(kwargs["cwd"], "/work")
+        self.assertEqual(kwargs["initial_title"], "main title (fork #1)")
+        self.assertEqual(kwargs["session_id"], "ses_fork")
+
+        settings = new_view.settings.return_value.data
+        self.assertEqual(settings[CHAT_THREAD_ID], 7)
+        self.assertEqual(settings[CHAT_SESSION_ID], "ses_fork")
+        self.assertTrue(new_session.has_sent_message)
+        new_session.set_thread_title.assert_called_once_with("main title (fork #1)")
+
+        appended = [
+            call.args[1].get("text", "")
+            for call in view.run_command.call_args_list
+            if call.args[0] == "term_chat_output_append" and len(call.args) > 1
+        ]
+        self.assertTrue(any("Forked session ses_fork" in text for text in appended))
+
+    def test_run_fork_command_reports_failure(self):
+        session, view, _ = self._make_session(SessionRole.PRIMARY)
+        session.agent_thread = MagicMock()
+        session.start_loading = MagicMock()
+        session.stop_loading = MagicMock()
+
+        def fake_fork(on_done=None):
+            on_done(None, "boom")
+            return True
+
+        session.agent_thread.fork_session.side_effect = fake_fork
+
+        self.assertTrue(session.run_slash_command("fork", "ignored"))
+
+        session.start_loading.assert_called_once_with(text="/fork")
+        session.stop_loading.assert_called_once()
+        appended = [
+            call.args[1].get("text", "")
+            for call in view.run_command.call_args_list
+            if call.args[0] == "term_chat_output_append" and len(call.args) > 1
+        ]
+        self.assertTrue(any("⚠️ /fork: boom" in text for text in appended))
 
 
 if __name__ == "__main__":

@@ -2202,7 +2202,7 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
         commands = await agent.list_slash_commands()
         self.assertEqual(
             {command.name for command in commands},
-            {"compact", "rename", "new", "clear", "undo", "redo"},
+            {"compact", "rename", "fork", "new", "clear", "undo", "redo"},
         )
 
     async def test_placeholders_are_not_forwarded_to_the_model(self):
@@ -2398,6 +2398,71 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
         ended = agent._message_queue.get_nowait()
         self.assertFalse(ended.content["manual"])
         self.assertFalse(agent._compaction_event.is_set())
+
+
+class TestOpenCodeFork(unittest.IsolatedAsyncioTestCase):
+    async def test_fork_v2_copies_full_history_without_arguments(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append((method, path, body))
+            return {"data": {
+                "id": "ses_fork",
+                "title": "main title (fork #1)",
+                "fork": {"sessionID": "ses_1"},
+            }}
+
+        agent._http = fake_http
+
+        result = await agent.fork_session()
+
+        self.assertEqual(calls, [("POST", "/api/session/ses_1/fork", {})])
+        self.assertEqual(result, {
+            "session_id": "ses_fork",
+            "title": "main title (fork #1)",
+            "fork": {"sessionID": "ses_1"},
+        })
+
+    async def test_fork_slash_command_ignores_arguments(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        calls = []
+
+        async def fake_http(method, path, body=None, **kwargs):
+            calls.append(body)
+            return {"id": "ses_fork", "title": "forked"}
+
+        agent._http = fake_http
+
+        self.assertTrue(await agent.run_slash_command("fork", "ignored text"))
+        self.assertEqual(calls, [{}])
+
+    async def test_fork_without_a_session_is_rejected(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._http = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "Nothing to fork yet"):
+            await agent.fork_session()
+        agent._http.assert_not_awaited()
+
+    async def test_fork_v1_is_rejected(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=1)
+        agent._session_id = "ses_1"
+        agent._http = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, r"/fork requires OpenCode v2"):
+            await agent.fork_session()
+        agent._http.assert_not_awaited()
+
+    async def test_fork_rejects_an_invalid_response(self):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
+        agent._session_id = "ses_1"
+        agent._http = AsyncMock(return_value={"data": {"title": "no id"}})
+
+        with self.assertRaisesRegex(RuntimeError, "valid fork"):
+            await agent.fork_session()
 
 
 class TestOpenCodeSessionTitles(unittest.IsolatedAsyncioTestCase):

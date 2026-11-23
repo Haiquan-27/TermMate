@@ -178,6 +178,14 @@ class BaseAgent(abc.ABC):
         """
         return False
 
+    async def fork_session(self) -> Optional[Dict[str, Any]]:
+        """Fork the active session when supported.
+
+        Agents without native fork support return None.  Only OpenCode v2
+        currently implements this through its native session fork endpoint.
+        """
+        return None
+
     @abc.abstractmethod
     async def connect(self, prompt: Optional[str] = None) -> None:
         """Connect to the Agent and optionally send an initial prompt"""

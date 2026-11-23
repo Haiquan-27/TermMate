@@ -73,13 +73,14 @@ _VERSION_RE = re.compile(
 # events instead of treating the HTTP response as completion.
 _COMPACTION_TIMEOUT = 600.0
 
-# Slash commands advertised to the completion popup.  ``compact`` and
-# ``rename`` are wired to their native endpoints; the remaining entries are
+# Slash commands advertised to the completion popup.  ``compact``, ``rename``
+# and ``fork`` are wired to their native endpoints; the remaining entries are
 # placeholders whose ``run_slash_command`` path keeps the raw text out of the
 # model prompt.
 _OPENCODE_SLASH_COMMANDS = (
     SlashCommand("compact", "Compact the session"),
     SlashCommand("rename", "Rename the session"),
+    SlashCommand("fork", "Fork this session into a new chat"),
     SlashCommand("new", "Start a new session"),
     SlashCommand("clear", "Clear and start a new session"),
     SlashCommand("undo", "Undo the previous message"),
@@ -2847,7 +2848,34 @@ class OpenCodeAgent(BaseAgent):
         if command == "rename":
             await self.rename_session(arguments)
             return True
+        if command == "fork":
+            # /fork always copies the full history; no arguments are parsed.
+            await self.fork_session()
+            return True
         return False
+
+    async def fork_session(self) -> Optional[Dict[str, Any]]:
+        """Fork the active OpenCode v2 session and return its new identity.
+
+        The whole projected history is copied.  The chat view opens a new tab
+        bound to the returned session; the original session is untouched.
+        """
+        if not self._session_id:
+            raise RuntimeError("Nothing to fork yet")
+        if self.version < 2:
+            raise RuntimeError("/fork requires OpenCode v2")
+
+        sid = quote(self._session_id, safe="")
+        response = await self._http("POST", f"/api/session/{sid}/fork", body={})
+        session = self._unwrap(response)
+        if not isinstance(session, dict) or not session.get("id"):
+            raise RuntimeError("OpenCode did not return a valid fork")
+
+        return {
+            "session_id": session["id"],
+            "title": session.get("title") if isinstance(session.get("title"), str) else "",
+            "fork": session.get("fork") if isinstance(session.get("fork"), dict) else {},
+        }
 
     async def rename_session(self, title: str) -> bool:
         """Rename the active session on the server.

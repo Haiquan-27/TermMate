@@ -697,6 +697,36 @@ class AgentThread(threading.Thread):
             return False
         return True
 
+    def fork_session(self, on_done=None):
+        """Fork the active session on the agent loop.
+
+        ``on_done(result, error)`` runs on the Sublime main thread.  ``result``
+        contains the new session id and title when the fork succeeds.
+        """
+        if not self.loop or not self.agent or not self.running or self.loop.is_closed():
+            return False
+
+        async def _run():
+            result = None
+            error = None
+            try:
+                result = await self.agent.fork_session()
+                if not result:
+                    error = "this agent does not support /fork"
+            except Exception as exc:
+                LOG.error("Failed to fork session: %s", exc, exc_info=True)
+                error = str(exc)
+            if on_done:
+                sublime.set_timeout(lambda: on_done(result, error), 0)
+
+        coro = _run()
+        try:
+            asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except RuntimeError:
+            coro.close()
+            return False
+        return True
+
     @property
     def session_id(self):
         """Get the session id of the current running agent."""
@@ -2176,6 +2206,52 @@ class ChatSession:
         if self.chat_view and self.chat_view.is_valid():
             self.chat_view.run_command("term_chat_output_append", {"text": text})
 
+    def _run_fork_command(self):
+        """Fork the full history into a new Task tab, leaving this tab intact."""
+        self.start_loading(text="/fork")
+
+        def on_done(result, error):
+            self.stop_loading()
+            if error:
+                self._append_slash_notice(f"\n⚠️ /fork: {error}\n")
+                return
+            if not result:
+                self._append_slash_notice("\n⚠️ /fork: this agent did not return a fork\n")
+                return
+            self._open_forked_session(result)
+
+        if not self.agent_thread.fork_session(on_done=on_done):
+            self.stop_loading()
+            self._append_slash_notice("\n⚠️ /fork is not available.\n")
+            return False
+        return True
+
+    def _open_forked_session(self, result):
+        fork_id = result.get("session_id") or result.get("id")
+        if not fork_id:
+            self._append_slash_notice("\n⚠️ /fork: OpenCode did not return a session id\n")
+            return
+        fork_title = result.get("title") or ""
+
+        task_num = TermChatNewThreadCommand(self.window)._next_task_number()
+        new_view = _create_chat_view_and_session(
+            self.window,
+            role=SessionRole.TASK,
+            cwd=self.cwd,
+            initial_title=fork_title,
+            session_id=fork_id,
+        )
+        new_view.settings().set(CHAT_THREAD_ID, task_num)
+        new_view.settings().set(CHAT_SESSION_ID, fork_id)
+        new_session = chat_threads.sessions.get(new_view.id())
+        if new_session is not None:
+            new_session.has_sent_message = True
+            new_session.set_thread_title(fork_title)
+
+        self._append_slash_notice(
+            f"\n■ Forked session {str(fork_id)[:8]} → new Task tab\n"
+        )
+
     def run_slash_command(self, name, arguments=""):
         """Execute a slash command natively and report failures in the view.
 
@@ -2184,6 +2260,9 @@ class ChatSession:
         if not self.agent_thread:
             self._append_slash_notice(f"\n⚠️ /{name} is not available.\n")
             return False
+
+        if name == "fork":
+            return self._run_fork_command()
 
         self.start_loading(text=f"/{name}")
 
@@ -2836,6 +2915,7 @@ def _create_chat_view_and_session(
     cwd="",
     target_group=None,
     initial_title=None,
+    session_id=None,
 ):
     """Create a new chat view, initialize its ChatSession, and focus it."""
     chat_view = window.new_file()
@@ -2860,6 +2940,8 @@ def _create_chat_view_and_session(
     chat_view.settings().set("highlight_line", False)
     chat_view.settings().set(CHAT_VIEW_FLAG, True)
     chat_view.settings().set(CHAT_THREAD_LABEL, role.value)
+    if session_id:
+        chat_view.settings().set(CHAT_SESSION_ID, session_id)
 
     shortcut = "Command+Enter" if sublime.platform() == "osx" else "Ctrl+Enter"
     welcome_text = "\nType your message and press %s to send.\n" % shortcut
@@ -2884,8 +2966,12 @@ def _create_chat_view_and_session(
     # Create and start the ChatSession
     session = ChatSession(
         window, chat_view, resolved_cwd, add_dirs=add_dirs, role=role,
-        initial_title=initial_title,
+        initial_title=initial_title, session_id=session_id,
     )
+    if session_id:
+        # A forked/resumed session already has history, so persist its id
+        # immediately and allow later reconnects to find it again.
+        session.has_sent_message = True
     chat_threads.register(window, chat_view, session)
     update_agent_model_status(window)
 
