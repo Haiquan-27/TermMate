@@ -73,17 +73,78 @@ class TablePhantomManager:
         self.phantom_set.update([])
 
 
+NOTICE_KINDS = {
+    "info": {
+        "border": "color(var(--bluish) alpha(0.85))",
+        "bg": "color(var(--bluish) alpha(0.10))",
+    },
+    "success": {
+        "border": "color(var(--greenish) alpha(0.85))",
+        "bg": "color(var(--greenish) alpha(0.10))",
+    },
+    "warning": {
+        "border": "color(var(--yellowish) alpha(0.85))",
+        "bg": "color(var(--yellowish) alpha(0.10))",
+    },
+    "error": {
+        "border": "color(var(--redish) alpha(0.85))",
+        "bg": "color(var(--redish) alpha(0.10))",
+    },
+}
+
+
+def _notice_style(kind):
+    style = NOTICE_KINDS.get(kind)
+    if style is None:
+        style = NOTICE_KINDS["info"]
+    return style
+
+
+def render_notice_html(message, kind="info"):
+    normalized = kind if kind in NOTICE_KINDS else "info"
+    style = _notice_style(normalized)
+    escaped = html.escape(str(message or ""))
+    label = html.escape(normalized)
+    return f"""
+        <body id="chatview-notice" style="margin:0;padding:0">
+            <style>
+                .notice {{
+                    margin: 6px 0;
+                    padding: 5px 8px;
+                    border-left: 3px solid {style["border"]};
+                    background-color: {style["bg"]};
+                    font-family: var(--font-mono);
+                    font-size: 0.85em;
+                }}
+                .notice-kind {{
+                    font-weight: bold;
+                    opacity: 0.9;
+                }}
+                .notice-message {{
+                    color: var(--foreground);
+                    opacity: 0.95;
+                }}
+            </style>
+            <div class="notice">
+                <span class="notice-kind">{label}</span>&nbsp;&nbsp;<span class="notice-message">{escaped}</span>
+            </div>
+        </body>
+        """
+
+
 class NoticePhantom:
-    """Displays a notice without writing it to the buffer."""
+    """Displays a transient notice above the input without writing to the buffer."""
 
     def __init__(self, view, input_start_provider):
         self.view = view
         self.input_start_provider = input_start_provider
         self.phantom_set = sublime.PhantomSet(view, "chatview_notice")
         self.message = None
+        self.kind = "info"
 
-    def show(self, message):
+    def show(self, message, kind="info"):
         self.message = message
+        self.kind = kind if kind in NOTICE_KINDS else "info"
         self.update()
 
     def update(self):
@@ -95,29 +156,7 @@ class NoticePhantom:
         input_start = self.input_start_provider()
         region_start = max(0, input_start - 1)
         region = sublime.Region(region_start, input_start)
-        message = html.escape(self.message)
-
-        notice_html = f"""
-        <body id="chatview-notice" style="margin:0;padding:0">
-            <style>
-                .notice {{
-                    margin: 6px 0;
-                    padding: 5px 8px;
-                    border-left: 2px solid color(var(--accent) alpha(0.55));
-                    background-color: color(var(--accent) alpha(0.06));
-                    font-family: var(--font-mono);
-                    font-size: 0.85em;
-                }}
-                .notice-message {{
-                    color: var(--foreground);
-                    font-weight: bold;
-                }}
-            </style>
-            <div class="notice">
-                <span class="notice-message">ℹ️ {message}</span>
-            </div>
-        </body>
-        """
+        notice_html = render_notice_html(self.message, self.kind)
         self.phantom_set.update([sublime.Phantom(
             region,
             notice_html,
@@ -126,6 +165,64 @@ class NoticePhantom:
 
     def clear(self):
         self.message = None
+        self.kind = "info"
+        self.phantom_set.update([])
+
+
+class TranscriptNoticeManager:
+    """Owns transcript-anchored notice phantoms."""
+
+    REGION_PREFIX = "term_chat_notice_"
+
+    def __init__(self, view):
+        self.view = view
+        self.phantom_set = sublime.PhantomSet(view, "chatview_transcript_notices")
+        self.entries = []
+        self.next_id = 0
+
+    def add(self, region, message, kind="info", edit=None):
+        key = self.REGION_PREFIX + str(self.next_id)
+        self.next_id += 1
+        self.view.add_regions(key, [region], flags=sublime.HIDDEN)
+        self.entries.append((key, message, kind))
+        self._update()
+
+    def _update(self):
+        phantoms = []
+        active = []
+        for key, message, kind in self.entries:
+            regions = self.view.get_regions(key)
+            if not regions:
+                continue
+            region = regions[0]
+            active.append((key, message, kind))
+            anchor = sublime.Region(region.end(), region.end())
+            phantoms.append(sublime.Phantom(
+                anchor,
+                render_notice_html(message, kind),
+                sublime.LAYOUT_BLOCK,
+            ))
+        self.entries = active
+        self.phantom_set.update(phantoms)
+
+    def refresh(self):
+        self._update()
+
+    def truncate(self, cut_point):
+        kept = []
+        for key, message, kind in self.entries:
+            regions = self.view.get_regions(key)
+            if regions and regions[0].end() < cut_point:
+                kept.append((key, message, kind))
+            else:
+                self.view.erase_regions(key)
+        self.entries = kept
+        self._update()
+
+    def clear(self):
+        for key, _, _ in self.entries:
+            self.view.erase_regions(key)
+        self.entries = []
         self.phantom_set.update([])
 
 

@@ -2276,15 +2276,16 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
         commands = await agent.list_slash_commands()
         self.assertEqual(
             {command.name for command in commands},
-            {"compact", "rename", "fork", "new", "clear", "undo", "redo"},
+            {"compact", "rename", "fork", "new", "clear"},
         )
 
     async def test_placeholders_are_not_forwarded_to_the_model(self):
         agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
 
-        handled = await agent.run_slash_command("new", "")
-
-        self.assertFalse(handled)
+        # /new is opened in a new tab by ChatSession, so the agent still does
+        # not consume it; /clear remains an unimplemented placeholder.
+        self.assertFalse(await agent.run_slash_command("new", ""))
+        self.assertFalse(await agent.run_slash_command("clear", ""))
 
     async def test_unknown_command_is_not_handled(self):
         agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)

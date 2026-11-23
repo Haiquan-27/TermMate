@@ -91,6 +91,16 @@ class TestChatThreadTitles(unittest.TestCase):
         session.agent_thread = None
         return session, view, settings
 
+    @staticmethod
+    def _notice_messages(view):
+        messages = []
+        for call in view.run_command.call_args_list:
+            if call.args[0] != "term_chat_output_append" or len(call.args) < 2:
+                continue
+            for item in call.args[1].get("notice_phantoms") or []:
+                messages.append(item.get("message", ""))
+        return messages
+
     def test_primary_without_title_shows_untitled(self):
         session, view, settings = self._make_session(SessionRole.PRIMARY)
 
@@ -184,12 +194,8 @@ class TestChatThreadTitles(unittest.TestCase):
 
         session.rename_thread("new title")
 
-        appended = [
-            call.args[1].get("text", "")
-            for call in view.run_command.call_args_list
-            if call.args[0] == "term_chat_output_append" and len(call.args) > 1
-        ]
-        self.assertTrue(any("⚠️ /rename: boom" in text for text in appended))
+        notices = self._notice_messages(view)
+        self.assertTrue(any("/rename: boom" in text for text in notices))
 
     def test_open_forked_session_creates_bound_task_tab(self):
         session, view, _ = self._make_session(SessionRole.PRIMARY)
@@ -224,12 +230,8 @@ class TestChatThreadTitles(unittest.TestCase):
         self.assertTrue(new_session.has_sent_message)
         new_session.set_thread_title.assert_called_once_with("main title (fork #1)")
 
-        appended = [
-            call.args[1].get("text", "")
-            for call in view.run_command.call_args_list
-            if call.args[0] == "term_chat_output_append" and len(call.args) > 1
-        ]
-        self.assertTrue(any("Forked session ses_fork" in text for text in appended))
+        notices = self._notice_messages(view)
+        self.assertTrue(any("Forked session ses_fork" in text for text in notices))
 
     def test_run_fork_command_reports_failure(self):
         session, view, _ = self._make_session(SessionRole.PRIMARY)
@@ -247,12 +249,33 @@ class TestChatThreadTitles(unittest.TestCase):
 
         session.start_loading.assert_called_once_with(text="/fork")
         session.stop_loading.assert_called_once()
-        appended = [
-            call.args[1].get("text", "")
-            for call in view.run_command.call_args_list
-            if call.args[0] == "term_chat_output_append" and len(call.args) > 1
-        ]
-        self.assertTrue(any("⚠️ /fork: boom" in text for text in appended))
+        notices = self._notice_messages(view)
+        self.assertTrue(any("/fork: boom" in text for text in notices))
+
+    def test_run_new_command_opens_fresh_task_tab(self):
+        session, view, _ = self._make_session(SessionRole.PRIMARY)
+        session.cwd = "/work"
+        new_view = MagicMock()
+        new_view.id.return_value = 888
+        new_view.settings.return_value = _FakeViewSettings()
+
+        with patch.object(
+            chatview_mod.TermChatNewThreadCommand, "_next_task_number", return_value=9
+        ), patch.object(
+            chatview_mod, "_create_chat_view_and_session", return_value=new_view
+        ) as create:
+            self.assertTrue(session.run_slash_command("new", "ignored"))
+
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["role"], SessionRole.TASK)
+        self.assertEqual(kwargs["cwd"], "/work")
+        self.assertEqual(kwargs["initial_title"], "New session #9")
+        self.assertNotIn("session_id", kwargs)
+        self.assertEqual(
+            new_view.settings.return_value.data[CHAT_THREAD_ID], 9)
+        notices = self._notice_messages(view)
+        self.assertTrue(any("new Task tab" in text for text in notices))
 
 
 if __name__ == "__main__":

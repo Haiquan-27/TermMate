@@ -795,10 +795,10 @@ class BaseChatMessageProcessor:
         )
 
     def append_error(self, error_msg):
-        """Append error message to chat view."""
+        """Append error notice to chat view."""
         sublime.set_timeout(
-            lambda: self.session.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n\nError: {error_msg}\n"}),
+            lambda: self.session.append_notice(
+                f"Error: {error_msg}", kind="error"),
             0
         )
 

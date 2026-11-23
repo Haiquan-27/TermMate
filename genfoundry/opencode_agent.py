@@ -83,8 +83,6 @@ _OPENCODE_SLASH_COMMANDS = (
     SlashCommand("fork", "Fork this session into a new chat"),
     SlashCommand("new", "Start a new session"),
     SlashCommand("clear", "Clear and start a new session"),
-    SlashCommand("undo", "Undo the previous message"),
-    SlashCommand("redo", "Redo the last undone action"),
 )
 
 

@@ -27,7 +27,7 @@ from .chatprocessor import (
 )
 from .chatpanel import (
     LoadingAnimation, NoticePhantom, RewindConfirmPanel, StatusHint,
-    TablePhantomManager, TokenSummaryPhantom,
+    TablePhantomManager, TokenSummaryPhantom, TranscriptNoticeManager,
 )
 
 from .md_render import MarkdownFormatter
@@ -377,7 +377,7 @@ def _reconnect_chat_view(view):
     # the tool headers already present in the saved buffer.
     session._restore_history_phantoms_after_reconnect(session_id, cwd)
     # Restore the input phantoms at the existing CHAT_INPUT_START position
-    session.notice_phantom.show("conversation restored after restart")
+    session.show_notice("conversation restored after restart", kind="info")
     session.model_phantom.update()
     # Scroll after phantom layout so the restored view reaches the end.
     sublime.set_timeout(lambda: view.show(view.size()), 0)
@@ -1618,6 +1618,7 @@ class ChatSession:
             self.chat_view,
             lambda: get_input_start(self.chat_view),
         )
+        self.transcript_notices = TranscriptNoticeManager(self.chat_view)
         self.token_usage = None
         self.token_summary_phantom = TokenSummaryPhantom(
             self.chat_view,
@@ -1670,9 +1671,10 @@ class ChatSession:
         self.available_agents = get_available_agents(settings)
 
         if not self.available_agents:
-            self.chat_view.run_command("term_chat_output_append", {
-                "text": f"\n\n⚠️ Error: No agent CLI found.\nPlease install Claude Code, Codex, Pi, OpenCode, or Antigravity; alternatively configure its command or OpenCode server URL in {PACKAGE_NAME} settings.\n\n"
-            })
+            self.append_notice(
+                f"Error: No agent CLI found. Please install Claude Code, Codex, Pi, OpenCode, or Antigravity; alternatively configure its command or OpenCode server URL in {PACKAGE_NAME} settings.",
+                kind="error",
+            )
             self.window.run_command("term_chat_install_agent")
             return
 
@@ -1809,7 +1811,7 @@ class ChatSession:
 
     def _on_rename_done(self, error):
         if error:
-            self._append_slash_notice(f"\n⚠️ /rename: {error}\n")
+            self._append_slash_notice(f"/rename: {error}", kind="error")
 
     def get_setting(self, key, default=None):
         """Read setting for this session (view settings first, then window settings)."""
@@ -2206,9 +2208,30 @@ class ChatSession:
         if not self.agent_thread.request_slash_commands(on_done):
             on_done([], False, False)
 
-    def _append_slash_notice(self, text):
+    def show_notice(self, message, kind="info"):
+        """Show a transient notice phantom above the input."""
         if self.chat_view and self.chat_view.is_valid():
-            self.chat_view.run_command("term_chat_output_append", {"text": text})
+            self.notice_phantom.show(message, kind=kind)
+
+    def append_notice(self, message, kind="info"):
+        """Append a transcript-anchored notice phantom."""
+        if not self.chat_view or not self.chat_view.is_valid():
+            return
+        self.chat_view.run_command(
+            "term_chat_output_append",
+            {"notice_phantoms": [{"message": message, "kind": kind}]},
+        )
+
+    def notify(self, message, kind="info", transient=False):
+        """Unified notice API for TermMate notices."""
+        if transient:
+            self.show_notice(message, kind=kind)
+        else:
+            self.append_notice(message, kind=kind)
+
+    def _append_slash_notice(self, message, kind="warning"):
+        """Compatibility wrapper for slash-command notices."""
+        self.append_notice(message, kind=kind)
 
     def _run_fork_command(self):
         """Fork the full history into a new Task tab, leaving this tab intact."""
@@ -2217,23 +2240,23 @@ class ChatSession:
         def on_done(result, error):
             self.stop_loading()
             if error:
-                self._append_slash_notice(f"\n⚠️ /fork: {error}\n")
+                self._append_slash_notice(f"/fork: {error}", kind="error")
                 return
             if not result:
-                self._append_slash_notice("\n⚠️ /fork: this agent did not return a fork\n")
+                self._append_slash_notice("/fork: this agent did not return a fork", kind="error")
                 return
             self._open_forked_session(result)
 
         if not self.agent_thread.fork_session(on_done=on_done):
             self.stop_loading()
-            self._append_slash_notice("\n⚠️ /fork is not available.\n")
+            self._append_slash_notice("/fork is not available.", kind="warning")
             return False
         return True
 
     def _open_forked_session(self, result):
         fork_id = result.get("session_id") or result.get("id")
         if not fork_id:
-            self._append_slash_notice("\n⚠️ /fork: OpenCode did not return a session id\n")
+            self._append_slash_notice("/fork: OpenCode did not return a session id", kind="error")
             return
         fork_title = result.get("title") or ""
 
@@ -2253,16 +2276,42 @@ class ChatSession:
             new_session.set_thread_title(fork_title)
 
         self._append_slash_notice(
-            f"\n■ Forked session {str(fork_id)[:8]} → new Task tab\n"
+            f"Forked session {str(fork_id)[:8]} → new Task tab",
+            kind="success",
         )
+
+    def _run_new_command(self):
+        """Open a fresh Task tab, leaving the current session intact."""
+        try:
+            task_num = TermChatNewThreadCommand(self.window)._next_task_number()
+            clean_title = f"New session #{task_num}"
+            new_view = _create_chat_view_and_session(
+                self.window,
+                role=SessionRole.TASK,
+                cwd=self.cwd,
+                initial_title=clean_title,
+            )
+            new_view.settings().set(CHAT_THREAD_ID, task_num)
+            self._append_slash_notice(
+                "Started new session in a new Task tab",
+                kind="success",
+            )
+            return True
+        except Exception as exc:
+            LOG.error("/new failed: %s", exc, exc_info=True)
+            self._append_slash_notice(f"/new: {exc}", kind="error")
+            return False
 
     def run_slash_command(self, name, arguments=""):
         """Execute a slash command natively and report failures in the view.
 
         The raw ``/name`` text is never forwarded to the model.
         """
+        if name == "new":
+            return self._run_new_command()
+
         if not self.agent_thread:
-            self._append_slash_notice(f"\n⚠️ /{name} is not available.\n")
+            self._append_slash_notice(f"/{name} is not available.", kind="warning")
             return False
 
         if name == "fork":
@@ -2277,18 +2326,20 @@ class ChatSession:
                 return
             self.stop_loading()
             if error:
-                message = f"\n⚠️ /{name}: {error}\n"
+                message = f"/{name}: {error}"
+                kind = "error"
             elif not handled:
-                message = f"\n⚠️ /{name} is not implemented yet.\n"
+                message = f"/{name} is not implemented yet."
+                kind = "warning"
             else:
                 return
             sublime.set_timeout(
-                lambda: self._append_slash_notice(message), 0
+                lambda: self._append_slash_notice(message, kind=kind), 0
             )
 
         if not self.agent_thread.run_slash_command(name, arguments, on_done=on_done):
             self.stop_loading()
-            self._append_slash_notice(f"\n⚠️ /{name} is not available.\n")
+            self._append_slash_notice(f"/{name} is not available.", kind="warning")
             return False
         return True
 
@@ -2342,8 +2393,7 @@ class ChatSession:
         self.rewind_confirm_panel.clear()
         self.token_summary_phantom.clear()
         if not self.agent_thread:
-            self.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n\n⚠️ Error: No agent CLI found.\n\n"})
+            self.append_notice("Error: No agent CLI found.", kind="error")
             self.stop_loading()
             return
 
@@ -2541,9 +2591,9 @@ class ChatSession:
         else:
             self.chat_view.run_command("term_chat_input_prompt", {"text": rewind_text})
 
-        self.chat_view.run_command(
-            "term_chat_output_append",
-            {"text": "\n■ Rewind conversation to earlier checkpoint\n"}
+        self.append_notice(
+            "Rewind conversation to earlier checkpoint",
+            kind="info",
         )
 
         self.reload_agent(session_id_override=new_session_id, quiet=True)
@@ -2565,12 +2615,10 @@ class ChatSession:
         self.clear_thread_title()
 
         # Show reset message in the history
-        reset_msg = f"\n\n{PACKAGE_NAME} session reset...\n"
-        self.chat_view.run_command("term_chat_output_append", {"text": reset_msg})
-
+        self.append_notice(f"{PACKAGE_NAME} session reset...", kind="info")
         cwd = get_best_dir(self.chat_view)
         if cwd:
-            self.chat_view.run_command("term_chat_output_append", {"text": f"cwd: {cwd}\n\n"})
+            self.append_notice(f"cwd: {cwd}", kind="info")
 
         # Reset the agent (disconnect and reconnect)
         self.agent_thread.reset()
@@ -2597,7 +2645,7 @@ class ChatSession:
         # Update available agents
         self.available_agents = get_available_agents(settings)
         if new_agent_provider not in self.available_agents:
-            self.chat_view.run_command("term_chat_output_append", {"text": f"\n\n⚠️ Error: Agent '{new_agent_provider}' not found on system.\n\n"})
+            self.append_notice(f"Error: Agent '{new_agent_provider}' not found on system.", kind="error")
             return
 
         cli_path = settings.get(f"{new_agent_provider}_command") or None
@@ -2630,8 +2678,7 @@ class ChatSession:
         self.agent_thread.start()
         LOG.info(f"Switched agent to: {new_agent_provider}")
 
-        switch_msg = f"\n\n[Switched agent to: {new_agent_provider}]\n\n"
-        self.chat_view.run_command("term_chat_output_append", {"text": switch_msg})
+        self.append_notice(f"Switched agent to: {new_agent_provider}", kind="info")
 
     def reload_agent(self, plan_mode=None, session_id_override=None, quiet=False,
                      fetch_history_async=False):
@@ -2656,7 +2703,7 @@ class ChatSession:
         # Update available agents
         self.available_agents = get_available_agents(settings)
         if current_agent_provider not in self.available_agents:
-            self.chat_view.run_command("term_chat_output_append", {"text": f"\n\n⚠️ Error: Agent '{current_agent_provider}' not found on system.\n\n"})
+            self.append_notice(f"Error: Agent '{current_agent_provider}' not found on system.", kind="error")
             return
 
         cli_path = settings.get(f"{current_agent_provider}_command") or None
@@ -2704,9 +2751,7 @@ class ChatSession:
                         ),
                     )
             else:
-                self.chat_view.run_command(
-                    "term_chat_output_append", {"text": "\n\n[reconnecting agent...]\n\n"}
-                )
+                self.append_notice("reconnecting agent...", kind="info")
 
     def _fetch_resume_history_async(self, agent, session_id, cwd,
                                     history_limit=None, render_full=False):
@@ -2994,25 +3039,22 @@ class ChatSession:
         self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
         self.chat_view.settings().erase(CHAT_LAST_Y)
 
-        self.chat_view.run_command("term_chat_output_append",
-            {"text": f"\n[Resuming session for {agent}]\n\n"})
+        self.append_notice(f"Resuming session for {agent}", kind="info")
 
         replayed_events = any(turn.get("events") for turn in turns)
         if not replayed_events and agent != "opencode":
-            self.chat_view.run_command(
-                "term_chat_output_append",
-                {"text": f"· Tool calls are not replayed for {agent} yet.\n\n"},
-            )
+            self.append_notice(
+                f"Tool calls are not replayed for {agent} yet.", kind="warning")
 
         self._render_full_history(session_info)
 
         if session_info and session_info.get("mtime"):
             dt = datetime.datetime.fromtimestamp(session_info["mtime"]).strftime("%Y-%m-%d %H:%M")
-            self.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n■ ResumeConversation ({session_id[:8]} : {dt})\n\n"})
+            self.append_notice(
+                f"ResumeConversation ({session_id[:8]} : {dt})", kind="info")
         else:
-            self.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n■ ResumeConversation ({session_id[:8]})\n\n"})
+            self.append_notice(
+                f"ResumeConversation ({session_id[:8]})", kind="info")
 
     def _render_full_history(self, session_info):
         """Render the complete session history directly into the chat view.
@@ -3887,13 +3929,17 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
             _, y = self.view.viewport_position()
             self.view.settings().set(CHAT_LAST_Y, y)
 
-    def run(self, edit, text="", html_tables=None, is_tool=False, tool_phantoms=None):
+    def run(self, edit, text="", html_tables=None, is_tool=False, tool_phantoms=None, notice_phantoms=None):
         follow = self._should_follow()
         tool_phantoms = tool_phantoms or []
+        notice_phantoms = notice_phantoms or []
 
-        # A new phantom-only tool call still needs its own line to anchor on;
-        # an update of an existing row must not insert anything.
-        needs_line = any(not item.get("update") for item in tool_phantoms)
+        # A new phantom-only row still needs its own line to anchor on;
+        # an update of an existing tool row must not insert anything.
+        needs_line = (
+            any(not item.get("update") for item in tool_phantoms)
+            or bool(notice_phantoms)
+        )
         if not text and needs_line:
             text = "\n"
 
@@ -3977,6 +4023,14 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                         continue
                     session.tool_outputs.add(
                         anchor, item.get("summary"), detail)
+
+        if notice_phantoms and session:
+            notice_anchor = max(0, insert_at + inserted - 1)
+            anchor = sublime.Region(notice_anchor, notice_anchor)
+            for item in notice_phantoms:
+                message = item.get("message", "")
+                kind = item.get("kind", "info")
+                session.transcript_notices.add(anchor, message, kind=kind)
 
         if not is_tool:
             quick_popup_manager.append(self.view.id(), text)
@@ -4511,10 +4565,8 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
                 )
                 session.model_phantom.set_stopping(True)
                 sublime.set_timeout(
-                    lambda: session.chat_view.run_command(
-                        "term_chat_output_append",
-                        {"text": "\n■ Conversation interrupted\n"}
-                    ),
+                    lambda: session.append_notice(
+                        "Conversation interrupted", kind="info"),
                     1000
                 )
                 sublime.status_message("Interrupting agent")
