@@ -2629,7 +2629,8 @@ class ChatSession:
         switch_msg = f"\n\n[Switched agent to: {new_agent_provider}]\n\n"
         self.chat_view.run_command("term_chat_output_append", {"text": switch_msg})
 
-    def reload_agent(self, plan_mode=None, session_id_override=None, quiet=False):
+    def reload_agent(self, plan_mode=None, session_id_override=None, quiet=False,
+                     fetch_history_async=False):
         """Restart the current agent process, optionally with a new plan mode or resuming session."""
         self.stop_loading()
 
@@ -2687,14 +2688,41 @@ class ChatSession:
 
         if not quiet:
             if old_session_id:
-                session_info = self._fetch_session_info(current_agent_provider, old_session_id, cwd)
-                if session_info and isinstance(session_info.get("summary"), str):
-                    self.set_thread_title(session_info["summary"])
-                self._append_resume_history(current_agent_provider, old_session_id, session_info)
+                if fetch_history_async:
+                    self._fetch_resume_history_async(
+                        current_agent_provider, old_session_id, cwd
+                    )
+                else:
+                    self._apply_resume_history(
+                        current_agent_provider, old_session_id,
+                        self._fetch_session_info(
+                            current_agent_provider, old_session_id, cwd
+                        ),
+                    )
             else:
                 self.chat_view.run_command(
                     "term_chat_output_append", {"text": "\n\n[reconnecting agent...]\n\n"}
                 )
+
+    def _fetch_resume_history_async(self, agent, session_id, cwd):
+        """Fetch session history off the UI thread, then apply it on the UI thread."""
+        def _worker():
+            try:
+                info = self._fetch_session_info(agent, session_id, cwd)
+            except Exception as exc:
+                LOG.warning("[resume] failed to fetch session info: %s", exc)
+                info = None
+            sublime.set_timeout(
+                lambda: self._apply_resume_history(agent, session_id, info), 0
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_resume_history(self, agent, session_id, session_info):
+        """Apply fetched history/title in the chat view (call on the UI thread)."""
+        if session_info and isinstance(session_info.get("summary"), str):
+            self.set_thread_title(session_info["summary"])
+        self._append_resume_history(agent, session_id, session_info)
 
     def _replay_prompt(self, prompt_text):
         """Append a previously-submitted prompt with gutter highlight, as if the user had just sent it."""
@@ -4176,61 +4204,86 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
 
         placeholder = f"[{agent}] Resume previous session"
-        sessions = self._load_sessions(agent, cwd, settings)
-
-        if not sessions:
-            sublime.status_message("No past sessions found for this workspace")
-            return
-
         current_session_id = (
             session.agent_thread.session_id if session and session.agent_thread else None
         )
 
-        items = []
-        for s in sessions:
-            sid = s["session_id"]
-            summary = s["summary"] or "(empty)"
-            if len(summary) > self._PREVIEW_LEN:
-                summary = summary[:self._PREVIEW_LEN] + "…"
-            dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
-            marker = "  ●" if sid == current_session_id else ""
-            items.append([summary, f"{sid[:8]}  {dt}{marker}"])
+        # Session discovery performs subprocess calls, HTTP requests and file
+        # I/O (e.g. OpenCode may start its server).  Run it off the UI thread
+        # and hop back via set_timeout to present the quick panel.
+        request_id = getattr(self, "_resume_request_id", 0) + 1
+        self._resume_request_id = request_id
+        sublime.status_message(f"[{agent}] Loading sessions…")
 
-        def on_select(index):
-            if index < 0:
+        def _load():
+            try:
+                loaded = self._load_sessions(agent, cwd, settings)
+            except Exception as exc:
+                LOG.warning("[resume] failed to list sessions: %s", exc)
+                loaded = []
+            sublime.set_timeout(lambda: _present(loaded, request_id), 0)
+
+        def _present(sessions, rid):
+            # A newer invocation superseded this one; don't open a stale panel.
+            if rid != getattr(self, "_resume_request_id", 0):
                 return
-            chosen = sessions[index]
-            chosen_id = chosen["session_id"]
-            if chosen_id == current_session_id:
-                sublime.status_message("Already on that session")
+            if not sessions:
+                sublime.status_message("No past sessions found for this workspace")
                 return
 
-            active_session = chat_threads.get_active_or_primary_session(
-                self.window, view_id=target_vid
-            )
-            if active_session is not None:
-                active_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                active_session.has_sent_message = False
-                active_session._clear_transcript()
-                active_session.reload_agent(session_id_override=chosen_id, quiet=False)
-            else:
-                self.window.run_command("term_chat_cli")
+            items = []
+            for s in sessions:
+                sid = s["session_id"]
+                summary = s["summary"] or "(empty)"
+                if len(summary) > self._PREVIEW_LEN:
+                    summary = summary[:self._PREVIEW_LEN] + "…"
+                dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+                marker = "  ●" if sid == current_session_id else ""
+                items.append([summary, f"{sid[:8]}  {dt}{marker}"])
 
-                def _resume_after_open():
-                    new_session = chat_threads.get_primary_session(self.window)
-                    if new_session is None:
-                        LOG.warning("[resume] chat view not ready after term_chat_cli")
-                        return
-                    new_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                    new_session.has_sent_message = False
-                    new_session._clear_transcript()
-                    new_session.reload_agent(session_id_override=chosen_id, quiet=False)
+            def on_select(index):
+                if index < 0:
+                    return
+                chosen = sessions[index]
+                chosen_id = chosen["session_id"]
+                if chosen_id == current_session_id:
+                    sublime.status_message("Already on that session")
+                    return
 
-                sublime.set_timeout(_resume_after_open, 0)
+                active_session = chat_threads.get_active_or_primary_session(
+                    self.window, view_id=target_vid
+                )
+                if active_session is not None:
+                    active_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
+                    active_session.has_sent_message = False
+                    active_session._clear_transcript()
+                    active_session.reload_agent(
+                        session_id_override=chosen_id, quiet=False,
+                        fetch_history_async=True,
+                    )
+                else:
+                    self.window.run_command("term_chat_cli")
 
-            sublime.status_message(f"Resuming session {chosen_id[:8]}…")
+                    def _resume_after_open():
+                        new_session = chat_threads.get_primary_session(self.window)
+                        if new_session is None:
+                            LOG.warning("[resume] chat view not ready after term_chat_cli")
+                            return
+                        new_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
+                        new_session.has_sent_message = False
+                        new_session._clear_transcript()
+                        new_session.reload_agent(
+                            session_id_override=chosen_id, quiet=False,
+                            fetch_history_async=True,
+                        )
 
-        self.window.show_quick_panel(items, on_select, placeholder=placeholder)
+                    sublime.set_timeout(_resume_after_open, 0)
+
+                sublime.status_message(f"Resuming session {chosen_id[:8]}…")
+
+            self.window.show_quick_panel(items, on_select, placeholder=placeholder)
+
+        threading.Thread(target=_load, daemon=True).start()
 
 
 class TermChatInterruptCommand(sublime_plugin.WindowCommand):
