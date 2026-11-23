@@ -2759,7 +2759,11 @@ class ChatSession:
                     agent, session_id, cwd, history_limit=0
                 )
             except Exception as exc:
-                LOG.warning("[reconnect] failed to fetch tool history: %s", exc)
+                plugin.DIAG.error(
+                    "[reconnect] failed to fetch tool history: %s", exc)
+                # Allow the next reconnect/load to retry instead of locking
+                # the view into a permanently phantom-less state.
+                self._history_phantoms_restore_started = False
                 info = None
             sublime.set_timeout(
                 lambda: self._restore_history_phantoms(info), 0

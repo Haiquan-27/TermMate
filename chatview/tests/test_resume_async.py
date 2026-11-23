@@ -554,6 +554,7 @@ class TestRestoreHistoryPhantomsAsync(unittest.TestCase):
             threads.targets[0].target()
 
         session._restore_history_phantoms.assert_called_once_with(None)
+        self.assertFalse(session._history_phantoms_restore_started)
 
     def test_reconnect_helper_only_fetches_for_opencode(self):
         session = MagicMock()
