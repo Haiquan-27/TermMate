@@ -551,9 +551,14 @@ class TestRestoreHistoryPhantomsAsync(unittest.TestCase):
             chatview_mod.ChatSession._restore_history_phantoms_async(
                 session, "opencode", "ses_1", "/work"
             )
-            threads.targets[0].target()
+            # Drain initial worker plus bounded retries.
+            for _ in range(10):
+                if not threads.targets:
+                    break
+                threads.targets.pop(0).target()
 
-        session._restore_history_phantoms.assert_called_once_with(None)
+        self.assertEqual(session._restore_history_phantoms.call_count, 1)
+        session._restore_history_phantoms.assert_called_with(None)
         self.assertFalse(session._history_phantoms_restore_started)
 
     def test_reconnect_helper_only_fetches_for_opencode(self):

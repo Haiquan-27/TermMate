@@ -2761,10 +2761,34 @@ class ChatSession:
             except Exception as exc:
                 plugin.DIAG.error(
                     "[reconnect] failed to fetch tool history: %s", exc)
-                # Allow the next reconnect/load to retry instead of locking
-                # the view into a permanently phantom-less state.
-                self._history_phantoms_restore_started = False
                 info = None
+
+            if info is None:
+                retries = getattr(
+                    self, "_history_phantoms_restore_retries", 0)
+                if not isinstance(retries, int):
+                    retries = 0
+                if retries < 3:
+                    self._history_phantoms_restore_retries = retries + 1
+                    self._history_phantoms_restore_started = False
+                    plugin.DIAG.warning(
+                        "[reconnect] no tool history for %s; retry %d/3",
+                        session_id, retries + 1)
+                    sublime.set_timeout(
+                        lambda: ChatSession._restore_history_phantoms_async(
+                            self, agent, session_id, cwd),
+                        2000 * (retries + 1),
+                    )
+                    return
+                self._history_phantoms_restore_started = False
+                plugin.DIAG.warning(
+                    "[reconnect] giving up restoring tool history for %s",
+                    session_id)
+                sublime.set_timeout(
+                    lambda: self._restore_history_phantoms(None), 0)
+                return
+
+            self._history_phantoms_restore_retries = 0
             sublime.set_timeout(
                 lambda: self._restore_history_phantoms(info), 0
             )
@@ -2808,10 +2832,13 @@ class ChatSession:
                 candidates.setdefault(text, []).append(line.end())
 
         last_anchor = -1
+        added = 0
+        saw_tool = False
         for turn in turns:
             for event in turn.get("events") or []:
                 if event.get("kind") != "tool":
                     continue
+                saw_tool = True
                 rendered, phantoms = processor.format_tool_call(
                     event.get("block"), key=event.get("id")
                 )
@@ -2841,6 +2868,26 @@ class ChatSession:
                         status=item.get("status"),
                         status_only=bool(item.get("status_only")),
                     )
+                    added += 1
+
+        if saw_tool and added == 0:
+            sid = self.get_view_session_id(view)
+            agent = self.get_setting(CHAT_AGENT) or "opencode"
+            retries = getattr(
+                self, "_history_phantoms_restore_retries", 0)
+            if not isinstance(retries, int):
+                retries = 0
+            if isinstance(sid, str) and sid and retries < 3:
+                self._history_phantoms_restore_retries = retries + 1
+                self._history_phantoms_restore_started = False
+                plugin.DIAG.warning(
+                    "[reconnect] matched no tool rows for %s; retry %d/3",
+                    sid, retries + 1)
+                sublime.set_timeout(
+                    lambda: ChatSession._restore_history_phantoms_async(
+                        self, agent, sid, self.cwd),
+                    2000 * (retries + 1),
+                )
 
     def _apply_resume_history(self, agent, session_id, session_info, render_full=False):
         """Apply fetched history/title in the chat view (call on the UI thread)."""
