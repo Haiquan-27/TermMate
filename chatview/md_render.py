@@ -570,6 +570,13 @@ class MarkdownFormatter:
         """
         self._html_tables = []
 
+        # An empty chunk with nothing buffered must stay a no-op. Otherwise
+        # the trailing-newline append below turns it into "'\n'", which makes
+        # phantom-only updates (e.g. tool status rows) insert stray blank
+        # lines into the chat buffer.
+        if not text and not self.remaining_text:
+            return ""
+
         # Combine with leftover from previous chunk
         combined_text = (self.remaining_text + text).expandtabs(4)
 

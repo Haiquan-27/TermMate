@@ -120,5 +120,32 @@ class TestMarkdownFormatterCodeFence(unittest.TestCase):
         self.assertEqual(formatter.table_buffer, [])
 
 
+class TestMarkdownFormatterEmptyChunk(unittest.TestCase):
+
+    def setUp(self):
+        mock_settings = MagicMock()
+        mock_settings.get.side_effect = lambda k, default=None: (
+            "html" if k == "table_style" else default
+        )
+        sys.modules["sublime"].load_settings.return_value = mock_settings
+
+    def test_empty_chunk_is_no_op(self):
+        # Phantom-only updates call append_content(""); the formatter must not
+        # turn that into a newline, or every tool status refresh adds a blank
+        # line to the transcript.
+        formatter = MarkdownFormatter()
+        self.assertEqual(formatter.format("", flush=False), "")
+        self.assertEqual(formatter.format("", flush=True), "")
+        self.assertEqual(formatter.format(""), "")
+
+    def test_empty_chunk_does_not_clear_pending_line(self):
+        formatter = MarkdownFormatter()
+        self.assertEqual(formatter.format("partial", flush=False), "")
+        self.assertEqual(formatter.remaining_text, "partial")
+        self.assertEqual(formatter.format("", flush=False), "")
+        self.assertEqual(formatter.remaining_text, "partial")
+        self.assertEqual(formatter.format("\n", flush=False), "partial\n")
+
+
 if __name__ == "__main__":
     unittest.main()

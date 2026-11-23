@@ -675,5 +675,174 @@ class TestRestoreHistoryPhantoms(unittest.TestCase):
         view.run_command.assert_not_called()
 
 
+class TestNormalizeHistoryToolBlock(unittest.TestCase):
+    """History API stores tool calls under the generic name ``tool``."""
+
+    def test_command_block_is_normalised(self):
+        block = {
+            "name": "tool",
+            "input": {"command": "df -h"},
+            "output": "Filesystem",
+            "error": None,
+            "status": "completed",
+            "metadata": {"exit": 0},
+        }
+        result = chatview_mod._normalize_history_tool_block(block)
+        self.assertEqual(result["name"], "command_execution")
+        self.assertEqual(result["command"], "df -h")
+        self.assertEqual(result["exitCode"], 0)
+        self.assertEqual(result["output"], "Filesystem")
+
+    def test_skill_block_is_normalised(self):
+        block = {
+            "name": "tool",
+            "input": {"id": "dev-env-manager"},
+            "output": "skill body",
+            "status": "completed",
+        }
+        result = chatview_mod._normalize_history_tool_block(block)
+        self.assertEqual(result, {
+            "name": "skill",
+            "input": {"id": "dev-env-manager"},
+            "output": "skill body",
+            "error": None,
+            "status": "completed",
+            "metadata": None,
+        })
+
+    def test_read_block_is_normalised(self):
+        block = {
+            "name": "tool",
+            "input": {"path": "/home/haiquan/.bashrc", "offset": 5},
+            "output": "Read file /home/haiquan/.bashrc",
+            "status": "completed",
+        }
+        result = chatview_mod._normalize_history_tool_block(block)
+        self.assertEqual(result["name"], "read")
+        self.assertEqual(result["input"]["path"], "/home/haiquan/.bashrc")
+        self.assertEqual(result["input"]["offset"], 5)
+        self.assertEqual(result["output"], "Read file /home/haiquan/.bashrc")
+
+    def test_already_normalised_and_unknown_blocks_pass_through(self):
+        command_block = {"name": "command_execution", "command": "ls"}
+        self.assertIs(
+            chatview_mod._normalize_history_tool_block(command_block),
+            command_block,
+        )
+        other = {"name": "tool", "input": {"foo": "bar"}}
+        self.assertIs(chatview_mod._normalize_history_tool_block(other), other)
+
+
+class TestRestoreTablePhantoms(unittest.TestCase):
+    """Table source lines survive restart; phantoms must be rebuilt."""
+
+    def test_rebuilds_phantoms_from_marker_lines(self):
+        lines = [
+            "some transcript",
+            "≡",
+            "  | A | B |",
+            "  |---|---|",
+            "  | 1 | 2 |",
+            "after table",
+        ]
+        view, cut = _make_transcript_view(lines)
+        stored_regions = {}
+        view.add_regions.side_effect = lambda key, regions, flags=0: stored_regions.__setitem__(key, regions)
+        view.get_regions.side_effect = lambda key: stored_regions.get(key, [])
+        view.erase_regions.side_effect = lambda key: stored_regions.pop(key, None)
+
+        session = MagicMock()
+        session.chat_view = view
+        session.table_phantoms = chatview_mod.TablePhantomManager(view)
+        session.markdown_formatter = MagicMock()
+        session.markdown_formatter._get_table_style.return_value = "html"
+        session.markdown_formatter._parse_table.return_value = ([[["A"], ["B"]]], 0, [])
+        session.markdown_formatter._render_html_table.return_value = "<table/>"
+
+        with patch.object(chatview_mod, "get_input_start", return_value=cut), \
+             patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            chatview_mod.ChatSession._restore_table_phantoms_after_reconnect(session)
+
+        self.assertEqual(len(session.table_phantoms.entries), 1)
+        key, html = session.table_phantoms.entries[0]
+        self.assertEqual(html, "<table/>")
+        region = view.get_regions(key)[0]
+        self.assertEqual(region.begin(), view.text_point(1, 0))
+        self.assertEqual(region.end(), view.text_point(5, 0))
+        session.markdown_formatter._parse_table.assert_called_once()
+        self.assertEqual(
+            session.markdown_formatter._parse_table.call_args.args[0],
+            ["| A | B |", "|---|---|", "| 1 | 2 |"],
+        )
+
+    def test_text_style_migrates_marker_lines_and_creates_no_phantom(self):
+        lines = [
+            "some transcript",
+            "≡",
+            "  | A | B |",
+            "  |---|---|",
+            "  | 1 | 2 |",
+            "≡",
+            "  | X | Y |",
+            "  |---|---|",
+            "  | 3 | 4 |",
+            "after tables",
+        ]
+        view, cut = _make_transcript_view(lines)
+        stored_regions = {}
+        view.add_regions.side_effect = lambda key, regions, flags=0: stored_regions.__setitem__(key, regions)
+        view.get_regions.side_effect = lambda key: stored_regions.get(key, [])
+
+        session = MagicMock()
+        session.chat_view = view
+        session.table_phantoms = chatview_mod.TablePhantomManager(view)
+        session.markdown_formatter = MagicMock()
+        session.markdown_formatter._get_table_style.return_value = "bordered"
+        session.markdown_formatter.format_table.side_effect = [
+            ["────", " A  B ", "────"],
+            ["────", " X  Y ", "────"],
+        ]
+
+        with patch.object(chatview_mod, "get_input_start", return_value=cut), \
+             patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            chatview_mod.ChatSession._restore_table_phantoms_after_reconnect(session)
+
+        # No phantom should be created for text styles.
+        self.assertEqual(session.table_phantoms.entries, [])
+        # Migration runs through a TextCommand so it can obtain an edit token.
+        view.run_command.assert_called_once()
+        args = view.run_command.call_args.args
+        self.assertEqual(args[0], "term_chat_migrate_tables")
+        replacements = args[1]["replacements"]
+        self.assertEqual(len(replacements), 2)
+        self.assertEqual(replacements[0]["text"], "────\n A  B \n────\n")
+        self.assertEqual(replacements[1]["text"], "────\n X  Y \n────\n")
+        self.assertLess(replacements[0]["start"], replacements[1]["start"])
+
+    def test_migrate_tables_command_replaces_back_to_front(self):
+        """The TextCommand applies edits back-to-front with a valid edit."""
+        view, _ = _make_transcript_view(["0123456789"])
+        view.size.return_value = 10
+        cmd = chatview_mod.TermChatMigrateTablesCommand(view)
+        cmd.view = view
+        edit = object()
+        replacements = [
+            {"start": 0, "end": 3, "text": "AAA"},
+            {"start": 5, "end": 8, "text": "BBB"},
+        ]
+
+        with patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            cmd.run(edit, replacements=replacements)
+
+        self.assertEqual(view.replace.call_count, 2)
+        first, second = view.replace.call_args_list
+        self.assertIs(first.args[0], edit)
+        # Later region (5-8) is replaced first so earlier offsets stay valid.
+        self.assertEqual((first.args[1].begin(), first.args[1].end()), (5, 8))
+        self.assertEqual(first.args[2], "BBB")
+        self.assertEqual((second.args[1].begin(), second.args[1].end()), (0, 3))
+        self.assertEqual(second.args[2], "AAA")
+
+
 if __name__ == "__main__":
     unittest.main()

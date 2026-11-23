@@ -336,6 +336,76 @@ def _restore_chat_sessions():
                 _reconnect_chat_view(view)
 
 
+def _normalize_history_tool_block(block):
+    """Map a raw history tool block to the shape live events produce.
+
+    OpenCode's history API stores every tool under the generic name "tool"
+    and keeps the real tool type inside ``input``.  Live rendering instead
+    normalises bash/shell/command into ``command_execution`` with a top-level
+    ``command`` field.  Without this mapping the restored tool header renders
+    as ``⏺ tool (command: ...)`` and can never match the saved ``⏺ command ...``
+    line in the buffer.
+    """
+    if not isinstance(block, dict):
+        return block
+    name = str(block.get("name") or "tool").lower()
+    if name != "tool":
+        return block
+    inp = block.get("input")
+    if not isinstance(inp, dict):
+        return block
+
+    command = inp.get("command") or inp.get("cmd")
+    if command:
+        metadata = block.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        exit_code = metadata.get("exit")
+        if exit_code is None:
+            exit_code = metadata.get("exit_code", metadata.get("exitCode"))
+        return {
+            "name": "command_execution",
+            "command": command,
+            "output": block.get("output"),
+            "error": block.get("error"),
+            "status": block.get("status"),
+            "metadata": metadata,
+            "exitCode": exit_code,
+        }
+
+    # File readers keep their target in ``input.path``; live rendering maps
+    # them to the ``read`` tool and resolves the path relative to the session
+    # cwd. Restore that shape so the saved ``⏺ read <path>`` header matches.
+    file_path = (inp.get("filePath") or inp.get("file_path")
+                 or inp.get("path"))
+    if file_path and any(k in inp for k in ("path", "filePath", "file_path")):
+        read_input = {"path": file_path}
+        for key in ("offset", "line", "limit", "filePath", "file_path"):
+            if key in inp:
+                read_input[key] = inp[key]
+        return {
+            "name": "read",
+            "input": read_input,
+            "title": block.get("title"),
+            "output": block.get("output"),
+            "error": block.get("error"),
+            "metadata": block.get("metadata"),
+            "status": block.get("status"),
+        }
+
+    skill_id = inp.get("id") or inp.get("skill") or inp.get("name")
+    if skill_id:
+        return {
+            "name": "skill",
+            "input": {"id": skill_id},
+            "output": block.get("output"),
+            "error": block.get("error"),
+            "status": block.get("status"),
+            "metadata": block.get("metadata"),
+        }
+    return block
+
+
 def _reconnect_chat_view(view):
     """
     Reconnect an existing chat view to a new ChatSession after a restart.
@@ -376,6 +446,9 @@ def _reconnect_chat_view(view):
     # Re-fetch the native session history and re-attach tool status rows to
     # the tool headers already present in the saved buffer.
     session._restore_history_phantoms_after_reconnect(session_id, cwd)
+    # Markdown table source lines survive in the buffer, but their hidden
+    # regions and HTML phantoms do not. Rebuild them from the saved "≡" markers.
+    session._restore_table_phantoms_after_reconnect()
     # Restore the input phantoms at the existing CHAT_INPUT_START position
     session.show_notice("conversation restored after restart", kind="info")
     session.model_phantom.update()
@@ -2833,7 +2906,8 @@ class ChatSession:
                     lambda: self._restore_history_phantoms(None), 0)
                 return
 
-            self._history_phantoms_restore_retries = 0
+            # Keep the retry counter: _restore_history_phantoms decides whether
+            # the history actually matched the buffer and resets it on success.
             sublime.set_timeout(
                 lambda: self._restore_history_phantoms(info), 0
             )
@@ -2884,8 +2958,9 @@ class ChatSession:
                 if event.get("kind") != "tool":
                     continue
                 saw_tool = True
+                block = _normalize_history_tool_block(event.get("block"))
                 rendered, phantoms = processor.format_tool_call(
-                    event.get("block"), key=event.get("id")
+                    block, key=event.get("id")
                 )
                 if not phantoms:
                     continue
@@ -2915,6 +2990,11 @@ class ChatSession:
                     )
                     added += 1
 
+        if added:
+            # At least one row matched; the restore succeeded. Clear any
+            # retry state so a later reconnect starts from a clean slate.
+            self._history_phantoms_restore_retries = 0
+
         if saw_tool and added == 0:
             sid = self.get_view_session_id(view)
             agent = self.get_setting(CHAT_AGENT) or "opencode"
@@ -2933,6 +3013,109 @@ class ChatSession:
                         self, agent, sid, self.cwd),
                     2000 * (retries + 1),
                 )
+            else:
+                self._history_phantoms_restore_started = False
+                plugin.DIAG.warning(
+                    "[reconnect] giving up matching tool rows for %s", sid)
+
+    def _restore_table_phantoms_after_reconnect(self):
+        """Restore or migrate the saved table source blocks after a restart.
+
+        With ``table_style="html"`` a Markdown table is written to the
+        transcript as a ``≡`` marker followed by indented pipe rows, and its
+        HTML is attached as a folded phantom.  Sublime restores the text but
+        not the fold, region or phantom set, so the raw source is left visible
+        after a restart.  Re-parse those rows and either rebuild the phantom
+        (when the current style is still ``html``) or, if the user has since
+        switched to a text style such as ``bordered``, replace the source
+        block with freshly rendered text so the old HTML layout does not stick
+        around.
+        """
+        view = self.chat_view
+        if not view or not view.is_valid():
+            return
+        manager = getattr(self, "table_phantoms", None)
+        formatter = getattr(self, "markdown_formatter", None)
+        if manager is None or formatter is None:
+            return
+
+        use_html = formatter._get_table_style() == "html"
+
+        cut = get_input_start(view, view.size())
+        try:
+            end_row = view.rowcol(cut)[0]
+        except Exception:
+            end_row = 0
+
+        blocks = []
+        row = 0
+        while row <= max(0, end_row):
+            line_region = view.line(view.text_point(row, 0))
+            if line_region.begin() >= cut:
+                break
+            line_text = view.substr(line_region)
+            if line_text.strip() != "≡":
+                row += 1
+                continue
+
+            # Collect the indented pipe rows that belong to this table.
+            table_lines = []
+            start = line_region.begin()
+            end = line_region.end()
+            next_row = row + 1
+            while next_row <= max(0, end_row):
+                next_region = view.line(view.text_point(next_row, 0))
+                if next_region.begin() >= cut:
+                    break
+                next_text = view.substr(next_region)
+                stripped = next_text.strip()
+                if stripped.startswith("|") and next_text.startswith((" ", "\t")):
+                    table_lines.append(stripped)
+                    end = next_region.end()
+                    next_row += 1
+                    continue
+                break
+
+            if table_lines:
+                blocks.append((sublime.Region(start, end), table_lines))
+            row = max(next_row, row + 1)
+
+        if not blocks:
+            return
+
+        if use_html:
+            restored = 0
+            for region, table_lines in blocks:
+                parsed = formatter._parse_table(table_lines)
+                if parsed is not None:
+                    manager.add(region, formatter._render_html_table(parsed))
+                    restored += 1
+            if restored:
+                plugin.DIAG.info(
+                    "[reconnect] restored %d table phantoms", restored)
+            return
+
+        # Text style: drop the html source markers and render the table with
+        # the current style. Sublime can only mutate text from a TextCommand,
+        # so collect the replacements and apply them in one edit. The command
+        # handles back-to-front ordering; the input-start anchor shifts with
+        # the buffer automatically.
+        replacements = []
+        for region, table_lines in blocks:
+            rendered = formatter.format_table(table_lines)
+            if rendered:
+                replacements.append({
+                    "start": region.begin(),
+                    "end": region.end(),
+                    "text": "\n".join(rendered) + "\n",
+                })
+        if replacements:
+            view.run_command("term_chat_migrate_tables", {
+                "replacements": replacements,
+            })
+            plugin.DIAG.info(
+                "[reconnect] migrated %d tables to text style",
+                len(replacements))
 
     def _apply_resume_history(self, agent, session_id, session_info, render_full=False):
         """Apply fetched history/title in the chat view (call on the UI thread)."""
@@ -3891,6 +4074,30 @@ class TermChatRewindTruncateCommand(sublime_plugin.TextCommand):
 
         if session:
             session.input_marker.update()
+
+
+class TermChatMigrateTablesCommand(sublime_plugin.TextCommand):
+    """Replace saved html-table source blocks with rendered text tables.
+
+    Used after a restart when ``table_style`` is no longer ``html``: the old
+    ``≡`` markers are swapped for plain text rendered by MarkdownFormatter.
+    Regions are applied back-to-front so earlier offsets stay valid.
+    """
+
+    def run(self, edit, replacements=None):
+        if not replacements:
+            return
+        ordered = sorted(
+            replacements, key=lambda item: item.get("start", 0), reverse=True)
+        for item in ordered:
+            start = item.get("start")
+            end = item.get("end")
+            text = item.get("text")
+            if not isinstance(start, int) or not isinstance(end, int):
+                continue
+            if start < 0 or end < start or end > self.view.size():
+                continue
+            self.view.replace(edit, sublime.Region(start, end), text or "")
 
 
 class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
