@@ -1,7 +1,6 @@
 import importlib
 import os
 import sys
-import threading
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -72,6 +71,16 @@ class _CapturedThreads:
         return thread
 
 
+def _open_panel(cmd, window, threads):
+    """Run the command, finish the loader, and return the quick-panel callback."""
+    with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
+         patch.object(chatview_mod.sublime, "set_timeout",
+                      side_effect=lambda fn, delay=0: fn()):
+        cmd.run()
+        threads.targets[0].target()
+    return window.show_quick_panel.call_args.args[1]
+
+
 class TestResumeSessionAsyncLoading(unittest.TestCase):
     def test_run_loads_sessions_off_ui_thread(self):
         cmd, window = _make_command()
@@ -139,28 +148,81 @@ class TestResumeSessionAsyncLoading(unittest.TestCase):
         window.show_quick_panel.assert_not_called()
         status.assert_any_call("No past sessions found for this workspace")
 
-    def test_select_uses_async_history_fetch(self):
-        cmd, window = _make_command()
+
+class TestResumeSelectOpensNewTab(unittest.TestCase):
+    def setUp(self):
+        self.old_session = MagicMock()
+        self.old_session.chat_view.id.return_value = 55
+        self.old_session.agent_thread.session_id = "ses_111111"
+
+        self.new_view = MagicMock()
+        self.new_view.id.return_value = 777
+        self.new_session = MagicMock()
+        self.new_view_settings = {}
+        self.new_view.settings.return_value.get.side_effect = (
+            lambda k, d=None: self.new_view_settings.get(k, d)
+        )
+        self.new_view.settings.return_value.set.side_effect = (
+            lambda k, v: self.new_view_settings.__setitem__(k, v)
+        )
+
+    def _select(self, cmd, window, index=0):
         cmd._load_sessions = MagicMock(return_value=list(_SESSIONS))
         threads = _CapturedThreads()
-        session = MagicMock()
-        session.chat_view.id.return_value = 55
-        session.agent_thread.session_id = "ses_current"
+        on_select = _open_panel(cmd, window, threads)
+        with patch.object(chatview_mod.chat_threads, "get_active_or_primary_session",
+                          return_value=self.old_session), \
+             patch.object(chatview_mod.TermChatNewThreadCommand,
+                          "_next_task_number", return_value=7), \
+             patch.object(chatview_mod, "_create_chat_view_and_session",
+                          return_value=self.new_view) as create, \
+             patch.object(chatview_mod.chat_threads, "sessions",
+                          {777: self.new_session}):
+            on_select(index)
+        return create
 
-        with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
-             patch.object(chatview_mod.sublime, "set_timeout",
-                          side_effect=lambda fn, delay=0: fn()), \
-             patch.object(chatview_mod.chat_threads, "get_active_or_primary_session",
-                          return_value=session):
-            cmd.run()
-            threads.targets[0].target()
-            on_select = window.show_quick_panel.call_args.args[1]
-            on_select(0)
+    def test_select_opens_new_task_tab_bound_to_chosen_session(self):
+        cmd, window = _make_command()
+        create = self._select(cmd, window)
 
-        session.reload_agent.assert_called_once_with(
-            session_id_override="ses_111111", quiet=False,
-            fetch_history_async=True,
+        create.assert_called_once()
+        kwargs = create.call_args.kwargs
+        self.assertEqual(kwargs["role"], chatview_mod.SessionRole.TASK)
+        self.assertEqual(kwargs["cwd"], "/work")
+        self.assertEqual(kwargs["session_id"], "ses_111111")
+        self.assertEqual(kwargs["initial_title"], "first session")
+
+        self.assertEqual(self.new_view_settings[chatview_mod.CHAT_THREAD_ID], 7)
+        self.assertEqual(
+            self.new_view_settings[chatview_mod.CHAT_THREAD_TITLE], "first session"
         )
+        self.new_session.set_thread_title.assert_called_once_with("first session")
+        self.new_session._clear_transcript.assert_called_once_with()
+        self.assertTrue(self.new_session.has_sent_message)
+
+    def test_select_does_not_touch_current_tab(self):
+        cmd, window = _make_command()
+        self._select(cmd, window)
+
+        self.old_session.reload_agent.assert_not_called()
+        self.old_session._clear_transcript.assert_not_called()
+        self.old_session.chat_view.settings.return_value.set.assert_not_called()
+        window.run_command.assert_not_called()
+
+    def test_select_fetches_full_history_without_banner(self):
+        cmd, window = _make_command()
+        self._select(cmd, window)
+
+        self.new_session._fetch_resume_history_async.assert_called_once_with(
+            "opencode", "ses_111111", "/work",
+            history_limit=0, render_full=True,
+        )
+
+    def test_selecting_current_session_still_opens_new_tab(self):
+        """The old 'Already on that session' early-return must be gone."""
+        cmd, window = _make_command()
+        create = self._select(cmd, window, index=0)
+        create.assert_called_once()
 
 
 class TestFetchResumeHistoryAsync(unittest.TestCase):
@@ -181,10 +243,10 @@ class TestFetchResumeHistoryAsync(unittest.TestCase):
             threads.targets[0].target()
 
         session._fetch_session_info.assert_called_once_with(
-            "opencode", "ses_1", "/work"
+            "opencode", "ses_1", "/work", history_limit=None
         )
         session._apply_resume_history.assert_called_once_with(
-            "opencode", "ses_1", info
+            "opencode", "ses_1", info, render_full=False
         )
 
     def test_worker_error_still_applies_on_ui_thread(self):
@@ -196,12 +258,16 @@ class TestFetchResumeHistoryAsync(unittest.TestCase):
              patch.object(chatview_mod.sublime, "set_timeout",
                           side_effect=lambda fn, delay=0: fn()):
             chatview_mod.ChatSession._fetch_resume_history_async(
-                session, "opencode", "ses_1", "/work"
+                session, "opencode", "ses_1", "/work",
+                history_limit=0, render_full=True,
             )
             threads.targets[0].target()
 
+        session._fetch_session_info.assert_called_once_with(
+            "opencode", "ses_1", "/work", history_limit=0
+        )
         session._apply_resume_history.assert_called_once_with(
-            "opencode", "ses_1", None
+            "opencode", "ses_1", None, render_full=True
         )
 
     def test_apply_resume_history_sets_title_and_history(self):
@@ -216,6 +282,19 @@ class TestFetchResumeHistoryAsync(unittest.TestCase):
         session._append_resume_history.assert_called_once_with(
             "opencode", "ses_1", info
         )
+        session._render_full_history.assert_not_called()
+
+    def test_apply_resume_history_full_renders_directly(self):
+        session = MagicMock()
+        info = {"summary": "Fetched title", "mtime": 1700000000, "turns": []}
+
+        chatview_mod.ChatSession._apply_resume_history(
+            session, "opencode", "ses_1", info, render_full=True
+        )
+
+        session.set_thread_title.assert_called_once_with("Fetched title")
+        session._render_full_history.assert_called_once_with(info)
+        session._append_resume_history.assert_not_called()
 
     def test_apply_resume_history_ignores_non_string_summary(self):
         session = MagicMock()
@@ -229,6 +308,104 @@ class TestFetchResumeHistoryAsync(unittest.TestCase):
         session._append_resume_history.assert_called_once_with(
             "opencode", "ses_1", info
         )
+
+    def test_apply_resume_history_skips_closed_view(self):
+        session = MagicMock()
+        session.chat_view.is_valid.return_value = False
+        info = {"summary": "Fetched title", "turns": []}
+
+        chatview_mod.ChatSession._apply_resume_history(
+            session, "opencode", "ses_1", info
+        )
+
+        session._append_resume_history.assert_not_called()
+        session._render_full_history.assert_not_called()
+
+
+class TestFetchSessionInfoHistoryLimit(unittest.TestCase):
+    def test_explicit_zero_is_passed_through(self):
+        session = MagicMock()
+        with patch.object(chatview_mod, "get_opencode_session_info",
+                          return_value={"turns": []}) as get_info:
+            result = chatview_mod.ChatSession._fetch_session_info(
+                session, "opencode", "ses_1", "/work", history_limit=0
+            )
+        self.assertEqual(result, {"turns": []})
+        get_info.assert_called_once()
+        self.assertEqual(get_info.call_args.kwargs["history_limit"], 0)
+
+    def test_none_uses_configured_default(self):
+        session = MagicMock()
+        settings = MagicMock()
+        settings.get.side_effect = lambda key, default=None: (
+            12 if key == "session_history_limit" else default
+        )
+        with patch.object(chatview_mod.sublime, "load_settings",
+                          return_value=settings), \
+             patch.object(chatview_mod, "get_opencode_session_info",
+                          return_value={"turns": []}) as get_info:
+            chatview_mod.ChatSession._fetch_session_info(
+                session, "opencode", "ses_1", "/work"
+            )
+        self.assertEqual(get_info.call_args.kwargs["history_limit"], 12)
+        settings.get.assert_any_call("session_history_limit", 50)
+
+
+class TestRenderFullHistory(unittest.TestCase):
+    @staticmethod
+    def _appended_texts(session):
+        texts = []
+        for call in session.chat_view.run_command.call_args_list:
+            if not call.args or call.args[0] != "term_chat_output_append":
+                continue
+            payload = call.args[1] if len(call.args) > 1 else call.kwargs
+            if isinstance(payload, dict):
+                texts.append(payload.get("text", ""))
+        return texts
+
+    def test_renders_prompt_and_response_without_resume_banner_or_footer(self):
+        session = MagicMock()
+        session.markdown_formatter.format.return_value = "rendered response\n"
+        session.markdown_formatter.take_html_tables.return_value = []
+        info = {"turns": [{"prompt": "hello", "response": "hi there"}]}
+
+        chatview_mod.ChatSession._render_full_history(session, info)
+
+        session._replay_prompt.assert_called_once_with("hello")
+        texts = self._appended_texts(session)
+        joined = "\n".join(texts)
+        self.assertIn("rendered response", joined)
+        self.assertNotIn("[Resuming session", joined)
+        self.assertNotIn("ResumeConversation", joined)
+        self.assertNotIn("Tool calls are not replayed", joined)
+
+    def test_replays_structured_tool_and_shell_events(self):
+        session = MagicMock()
+        info = {
+            "turns": [
+                {
+                    "events": [
+                        {"kind": "user", "text": "fix it"},
+                        {"kind": "assistant", "text": "working"},
+                        {"kind": "tool", "id": "call_1", "block": {"name": "edit"}},
+                        {"kind": "shell", "command": "pytest", "output": "ok"},
+                    ]
+                }
+            ]
+        }
+
+        chatview_mod.ChatSession._render_full_history(session, info)
+
+        session._replay_turn_events.assert_called_once_with(info["turns"][0])
+        session._replay_prompt.assert_not_called()
+        texts = self._appended_texts(session)
+        self.assertFalse(any("[Resuming session" in t for t in texts))
+        self.assertFalse(any("ResumeConversation" in t for t in texts))
+
+    def test_no_turns_means_no_visible_content(self):
+        session = MagicMock()
+        chatview_mod.ChatSession._render_full_history(session, None)
+        self.assertEqual(self._appended_texts(session), [])
 
 
 if __name__ == "__main__":

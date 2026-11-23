@@ -2704,25 +2704,40 @@ class ChatSession:
                     "term_chat_output_append", {"text": "\n\n[reconnecting agent...]\n\n"}
                 )
 
-    def _fetch_resume_history_async(self, agent, session_id, cwd):
-        """Fetch session history off the UI thread, then apply it on the UI thread."""
+    def _fetch_resume_history_async(self, agent, session_id, cwd,
+                                    history_limit=None, render_full=False):
+        """Fetch session history off the UI thread, then apply it on the UI thread.
+
+        ``render_full=True`` renders the complete history directly (no resume
+        banner/footer), used when a session is resumed in a brand-new tab.
+        """
         def _worker():
             try:
-                info = self._fetch_session_info(agent, session_id, cwd)
+                info = self._fetch_session_info(
+                    agent, session_id, cwd, history_limit=history_limit
+                )
             except Exception as exc:
                 LOG.warning("[resume] failed to fetch session info: %s", exc)
                 info = None
             sublime.set_timeout(
-                lambda: self._apply_resume_history(agent, session_id, info), 0
+                lambda: self._apply_resume_history(
+                    agent, session_id, info, render_full=render_full
+                ),
+                0,
             )
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _apply_resume_history(self, agent, session_id, session_info):
+    def _apply_resume_history(self, agent, session_id, session_info, render_full=False):
         """Apply fetched history/title in the chat view (call on the UI thread)."""
+        if not self.chat_view or not self.chat_view.is_valid():
+            return
         if session_info and isinstance(session_info.get("summary"), str):
             self.set_thread_title(session_info["summary"])
-        self._append_resume_history(agent, session_id, session_info)
+        if render_full:
+            self._render_full_history(session_info)
+        else:
+            self._append_resume_history(agent, session_id, session_info)
 
     def _replay_prompt(self, prompt_text):
         """Append a previously-submitted prompt with gutter highlight, as if the user had just sent it."""
@@ -2735,13 +2750,16 @@ class ChatSession:
         if region_end > region_start:
             self.add_prompt_highlight(sublime.Region(region_start, region_end))
 
-    def _fetch_session_info(self, agent, session_id, cwd):
-        """Fetch session metadata and recent turns. Returns a unified dict or None.
+    def _fetch_session_info(self, agent, session_id, cwd, history_limit=None):
+        """Fetch session metadata and turns. Returns a unified dict or None.
 
-        Keys: summary (str|None), mtime (float), turns (list).
+        Keys: summary (str|None), mtime (float), turns (list).  When
+        ``history_limit`` is None the configured default is used; an explicit
+        0 means "fetch the complete history" (no truncation).
         """
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
-        history_limit = settings.get("session_history_limit", 50)
+        if history_limit is None:
+            history_limit = settings.get("session_history_limit", 50)
 
         if agent == "codex":
             info = get_codex_session_info(
@@ -2810,13 +2828,14 @@ class ChatSession:
     def _append_resume_history(self, agent, session_id, session_info):
         """Render resume banner and recent turns to the chat view. Pure display — no I/O."""
         import datetime
+        turns = (session_info or {}).get("turns", [])
+
         self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
         self.chat_view.settings().erase(CHAT_LAST_Y)
 
         self.chat_view.run_command("term_chat_output_append",
             {"text": f"\n[Resuming session for {agent}]\n\n"})
 
-        turns = (session_info or {}).get("turns", [])
         replayed_events = any(turn.get("events") for turn in turns)
         if not replayed_events and agent != "opencode":
             self.chat_view.run_command(
@@ -2824,6 +2843,30 @@ class ChatSession:
                 {"text": f"· Tool calls are not replayed for {agent} yet.\n\n"},
             )
 
+        self._render_full_history(session_info)
+
+        if session_info and session_info.get("mtime"):
+            dt = datetime.datetime.fromtimestamp(session_info["mtime"]).strftime("%Y-%m-%d %H:%M")
+            self.chat_view.run_command("term_chat_output_append",
+                {"text": f"\n■ ResumeConversation ({session_id[:8]} : {dt})\n\n"})
+        else:
+            self.chat_view.run_command("term_chat_output_append",
+                {"text": f"\n■ ResumeConversation ({session_id[:8]})\n\n"})
+
+    def _render_full_history(self, session_info):
+        """Render the complete session history directly into the chat view.
+
+        Unlike ``_append_resume_history`` this emits no resume banner and no
+        footer: a resumed session opened in a new tab simply *is* that
+        session.  Structured events (user text, assistant text, tool calls and
+        shell output) are replayed when available, with a prompt/response
+        fallback for providers that only expose plain turns.  Pure display —
+        no I/O.
+        """
+        self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
+        self.chat_view.settings().erase(CHAT_LAST_Y)
+
+        turns = (session_info or {}).get("turns", [])
         for turn in turns:
             if turn.get("events"):
                 self._replay_turn_events(turn)
@@ -2842,14 +2885,6 @@ class ChatSession:
                     "text": response,
                     "html_tables": formatter.take_html_tables(),
                 })
-
-        if session_info and session_info.get("mtime"):
-            dt = datetime.datetime.fromtimestamp(session_info["mtime"]).strftime("%Y-%m-%d %H:%M")
-            self.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n■ ResumeConversation ({session_id[:8]} : {dt})\n\n"})
-        else:
-            self.chat_view.run_command("term_chat_output_append",
-                {"text": f"\n■ ResumeConversation ({session_id[:8]})\n\n"})
 
     def _replay_turn_events(self, turn):
         """Replay one structured turn (user text, assistant text, tool calls)."""
@@ -4156,8 +4191,10 @@ class TermChatClearSessionCommand(sublime_plugin.WindowCommand):
 class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
     """
     Shows a quick-panel listing past sessions for the current workspace and agent.
-    Works whether or not a ChatView is already open: when none exists, opening
-    the selected session creates one first.
+
+    Selecting a session always opens a new Task tab bound to that server
+    session and renders its complete history directly; the tab the command was
+    invoked from is left untouched.
     """
 
     _PREVIEW_LEN = 80
@@ -4198,7 +4235,6 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
     def run(self, view_id=None):
         import datetime
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
-        target_vid = session.chat_view.id() if session else None
         agent = self._get_agent(session)
         cwd = self._get_cwd(session)
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
@@ -4246,40 +4282,40 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                     return
                 chosen = sessions[index]
                 chosen_id = chosen["session_id"]
-                if chosen_id == current_session_id:
-                    sublime.status_message("Already on that session")
-                    return
+                raw_title = chosen.get("summary") or ""
 
-                active_session = chat_threads.get_active_or_primary_session(
-                    self.window, view_id=target_vid
+                # A resume always gets its own tab: the current tab keeps its
+                # own session untouched.  Bind the new tab directly to the
+                # chosen server session so subsequent messages continue it.
+                task_num = TermChatNewThreadCommand(self.window)._next_task_number()
+                new_view = _create_chat_view_and_session(
+                    self.window,
+                    role=SessionRole.TASK,
+                    cwd=cwd,
+                    session_id=chosen_id,
+                    initial_title=raw_title,
                 )
-                if active_session is not None:
-                    active_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                    active_session.has_sent_message = False
-                    active_session._clear_transcript()
-                    active_session.reload_agent(
-                        session_id_override=chosen_id, quiet=False,
-                        fetch_history_async=True,
-                    )
-                else:
-                    self.window.run_command("term_chat_cli")
+                new_view.settings().set(CHAT_THREAD_ID, task_num)
+                new_view.settings().set(CHAT_THREAD_TITLE, raw_title)
 
-                    def _resume_after_open():
-                        new_session = chat_threads.get_primary_session(self.window)
-                        if new_session is None:
-                            LOG.warning("[resume] chat view not ready after term_chat_cli")
-                            return
-                        new_session.chat_view.settings().set(CHAT_SESSION_ID, chosen_id)
-                        new_session.has_sent_message = False
-                        new_session._clear_transcript()
-                        new_session.reload_agent(
-                            session_id_override=chosen_id, quiet=False,
-                            fetch_history_async=True,
-                        )
+                new_session = chat_threads.sessions.get(new_view.id())
+                if new_session is None:
+                    LOG.warning("[resume] new chat session not registered")
+                    return
+                new_session.has_sent_message = True
+                new_session.set_thread_title(raw_title)
+                # Drop the "Starting ... agent / Type your message" filler so
+                # the transcript starts with the actual session history.
+                new_session._clear_transcript()
 
-                    sublime.set_timeout(_resume_after_open, 0)
+                # history_limit=0 means no truncation: render the entire
+                # session, including tool calls and shell output where the
+                # provider exposes them.  No resume banner or footer.
+                new_session._fetch_resume_history_async(
+                    agent, chosen_id, cwd, history_limit=0, render_full=True
+                )
 
-                sublime.status_message(f"Resuming session {chosen_id[:8]}…")
+                sublime.status_message(f"Opened session {str(chosen_id)[:8]} in a new tab")
 
             self.window.show_quick_panel(items, on_select, placeholder=placeholder)
 
