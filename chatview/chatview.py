@@ -339,7 +339,7 @@ def _restore_chat_sessions():
 def _reconnect_chat_view(view):
     """
     Reconnect an existing chat view to a new ChatSession after a restart.
-    Appends a reconnection notice, but does not redraw historical phantoms.
+    Appends a reconnection notice and reattaches historical tool phantoms.
     """
     window = view.window()
     if not window:
@@ -372,6 +372,10 @@ def _reconnect_chat_view(view):
     chat_threads.register(window, view, session)
     session.set_thread_title(initial_title)
     update_agent_model_status(window)
+    # The transcript text survives a restart, but phantom sets do not.
+    # Re-fetch the native session history and re-attach tool status rows to
+    # the tool headers already present in the saved buffer.
+    session._restore_history_phantoms_after_reconnect(session_id, cwd)
     # Restore the input phantoms at the existing CHAT_INPUT_START position
     session.notice_phantom.show("conversation restored after restart")
     session.model_phantom.update()
@@ -2727,6 +2731,112 @@ class ChatSession:
             )
 
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _restore_history_phantoms_after_reconnect(self, session_id, cwd):
+        """Reattach historical tool rows when a view is restored after restart.
+
+        Only OpenCode exposes completed tool calls (with their result text) in
+        its native history API, so other providers are left untouched.  The
+        heavy fetch is scheduled off the UI thread by
+        ``_restore_history_phantoms_async``.
+        """
+        if not session_id:
+            return
+        if self.get_setting(CHAT_AGENT) != "opencode":
+            return
+        self._restore_history_phantoms_async("opencode", session_id, cwd)
+
+    def _restore_history_phantoms_async(self, agent, session_id, cwd):
+        """Fetch full history in the background and restore tool phantoms."""
+        if (not session_id
+                or getattr(self, "_history_phantoms_restore_started", False) is True):
+            return
+        self._history_phantoms_restore_started = True
+
+        def _worker():
+            try:
+                info = self._fetch_session_info(
+                    agent, session_id, cwd, history_limit=0
+                )
+            except Exception as exc:
+                LOG.warning("[reconnect] failed to fetch tool history: %s", exc)
+                info = None
+            sublime.set_timeout(
+                lambda: self._restore_history_phantoms(info), 0
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _restore_history_phantoms(self, session_info):
+        """Re-attach tool status phantoms to tool headers already in the buffer.
+
+        Sublime restores transcript text but not phantom sets, so a restarted
+        chat view loses every ``⎿ N lines success [show]`` row.  Match each
+        completed tool event from the native history to the tool header saved
+        in the buffer and register its status row in place.  No transcript
+        text is inserted or removed, so the restored conversation is unchanged.
+        """
+        view = self.chat_view
+        if not view or not view.is_valid():
+            return
+        turns = (session_info or {}).get("turns") or []
+        processor = getattr(self, "message_processor", None)
+        outputs = getattr(self, "tool_outputs", None)
+        if not turns or processor is None or outputs is None:
+            return
+
+        cut = get_input_start(view, view.size())
+        try:
+            end_row = view.rowcol(cut)[0]
+        except Exception:
+            end_row = 0
+
+        # Collect candidate anchors from the saved transcript only.  Sublime
+        # regions shift automatically with buffer edits, so each line end is a
+        # stable anchor for the phantom once registered.
+        candidates = {}
+        for row in range(max(0, end_row) + 1):
+            line = view.line(view.text_point(row, 0))
+            if line.begin() >= cut:
+                break
+            text = view.substr(line).strip()
+            if text:
+                candidates.setdefault(text, []).append(line.end())
+
+        last_anchor = -1
+        for turn in turns:
+            for event in turn.get("events") or []:
+                if event.get("kind") != "tool":
+                    continue
+                rendered, phantoms = processor.format_tool_call(
+                    event.get("block"), key=event.get("id")
+                )
+                if not phantoms:
+                    continue
+                header = (rendered or "").partition("\n")[0].strip()
+                anchor_pos = None
+                for pos in candidates.get(header, []):
+                    if pos > last_anchor:
+                        anchor_pos = pos
+                        last_anchor = pos
+                        break
+                if anchor_pos is None:
+                    continue
+                anchor = sublime.Region(anchor_pos, anchor_pos)
+                for item in phantoms:
+                    if item.get("kind") != "tool_call":
+                        continue
+                    command = item.get("command") or {}
+                    if not command.get("detail"):
+                        continue
+                    outputs.add_tool_call(
+                        anchor,
+                        command,
+                        item.get("output"),
+                        key=item.get("key"),
+                        status=item.get("status"),
+                        status_only=bool(item.get("status_only")),
+                    )
 
     def _apply_resume_history(self, agent, session_id, session_info, render_full=False):
         """Apply fetched history/title in the chat view (call on the UI thread)."""

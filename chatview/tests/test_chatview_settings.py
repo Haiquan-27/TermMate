@@ -148,6 +148,34 @@ class TestChatViewSettings(unittest.TestCase):
         self.assertIs(settings.get("highlight_line"), False)
         self.assertEqual(settings.get("draw_unicode_white_space"), "none")
 
+    def test_reconnect_restores_historical_tool_phantoms(self):
+        window = MagicMock()
+        window.id.return_value = 3
+        window.folders.return_value = []
+        window.settings.return_value = _FakeViewSettings()
+
+        chat_view, _ = _make_fake_view(
+            view_id=52,
+            window=window,
+            initial_settings={
+                chatview_mod.CHAT_VIEW_FLAG: True,
+                chatview_mod.CHAT_THREAD_LABEL: SessionRole.TASK.value,
+                chatview_mod.CHAT_SESSION_ID: "ses_reconnect",
+                chatview_mod.CHAT_AGENT: "opencode",
+            },
+        )
+
+        app_settings = _FakeViewSettings({"share_workspace_folders": False})
+        with patch.object(chatview_mod.sublime, "load_settings", return_value=app_settings), \
+             patch.object(chatview_mod, "ChatSession") as mock_session_cls, \
+             patch.object(chatview_mod, "update_agent_model_status"):
+            mock_session_cls.return_value.role = SessionRole.TASK
+            mock_session_cls.get_view_session_id.return_value = "ses_reconnect"
+            chatview_mod._reconnect_chat_view(chat_view)
+
+        mock_session_cls.return_value._restore_history_phantoms_after_reconnect \
+            .assert_called_once_with("ses_reconnect", "")
+
 
 class TestModelPanelThinkTag(unittest.TestCase):
     """The effort level rides inside the model button."""

@@ -454,5 +454,220 @@ class TestReplayToolResult(unittest.TestCase):
         self.assertIn(">show<", html)
 
 
+class _Region:
+    """Minimal region used to inspect phantom anchors in restore tests."""
+
+    def __init__(self, a, b=None):
+        self.a = a
+        self.b = a if b is None else b
+
+    def begin(self):
+        return min(self.a, self.b)
+
+    def end(self):
+        return max(self.a, self.b)
+
+    def size(self):
+        return self.end() - self.begin()
+
+
+def _make_transcript_view(lines):
+    """Fake view containing ``lines`` plus the input line after them."""
+    view = MagicMock()
+    view.is_valid.return_value = True
+    offsets = []
+    pos = 0
+    for line in lines:
+        offsets.append(pos)
+        pos += len(line) + 1
+    transcript = "\n".join(lines) + "\n" if lines else ""
+    view.size.return_value = pos
+
+    def text_point(row, col=0):
+        if row >= len(offsets):
+            return pos
+        return offsets[row] + col
+
+    def rowcol(point):
+        for row, start in enumerate(offsets):
+            if point < start + len(lines[row]) + 1:
+                return row, point - start
+        return len(offsets), 0
+
+    def line_for(point):
+        if point >= pos:
+            return _Region(pos, pos)
+        for row, start in enumerate(offsets):
+            end = start + len(lines[row]) + 1
+            if point < end:
+                return _Region(start, end)
+        return _Region(pos, pos)
+
+    def substr(region):
+        return transcript[region.begin():region.end()]
+
+    view.text_point.side_effect = text_point
+    view.rowcol.side_effect = rowcol
+    view.line.side_effect = line_for
+    view.substr.side_effect = substr
+    return view, pos
+
+
+class TestRestoreHistoryPhantomsAsync(unittest.TestCase):
+    def test_worker_fetches_full_history_off_ui_thread_once(self):
+        session = MagicMock()
+        info = {"turns": []}
+        session._fetch_session_info = MagicMock(return_value=info)
+        threads = _CapturedThreads()
+
+        with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
+             patch.object(chatview_mod.sublime, "set_timeout",
+                          side_effect=lambda fn, delay=0: fn()):
+            chatview_mod.ChatSession._restore_history_phantoms_async(
+                session, "opencode", "ses_1", "/work"
+            )
+            session._fetch_session_info.assert_not_called()
+
+            # A second trigger must not start a duplicate fetch.
+            chatview_mod.ChatSession._restore_history_phantoms_async(
+                session, "opencode", "ses_1", "/work"
+            )
+            threads.targets[0].target()
+
+        self.assertEqual(len(threads.targets), 1)
+        session._fetch_session_info.assert_called_once_with(
+            "opencode", "ses_1", "/work", history_limit=0
+        )
+        session._restore_history_phantoms.assert_called_once_with(info)
+
+    def test_worker_error_still_applies_on_ui_thread(self):
+        session = MagicMock()
+        session._fetch_session_info = MagicMock(side_effect=RuntimeError("boom"))
+        threads = _CapturedThreads()
+
+        with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
+             patch.object(chatview_mod.sublime, "set_timeout",
+                          side_effect=lambda fn, delay=0: fn()):
+            chatview_mod.ChatSession._restore_history_phantoms_async(
+                session, "opencode", "ses_1", "/work"
+            )
+            threads.targets[0].target()
+
+        session._restore_history_phantoms.assert_called_once_with(None)
+
+    def test_reconnect_helper_only_fetches_for_opencode(self):
+        session = MagicMock()
+        session.get_setting.return_value = "claude"
+        session._restore_history_phantoms_async = MagicMock()
+
+        chatview_mod.ChatSession._restore_history_phantoms_after_reconnect(
+            session, "ses_1", "/work"
+        )
+        session._restore_history_phantoms_async.assert_not_called()
+
+        session.get_setting.return_value = "opencode"
+        chatview_mod.ChatSession._restore_history_phantoms_after_reconnect(
+            session, "ses_1", "/work"
+        )
+        session._restore_history_phantoms_async.assert_called_once_with(
+            "opencode", "ses_1", "/work"
+        )
+
+
+class TestRestoreHistoryPhantoms(unittest.TestCase):
+    def _make_session(self, lines):
+        view, cut = _make_transcript_view(lines)
+        session = MagicMock()
+        session.chat_view = view
+        session.get_setting.return_value = None
+        processor_cls = chatview_mod.BaseChatMessageProcessor.for_provider("opencode")
+        session.message_processor = processor_cls(session)
+        session.tool_outputs = MagicMock()
+        return session, view, cut
+
+    @staticmethod
+    def _tool_event(event_id, output):
+        return {
+            "kind": "tool",
+            "id": event_id,
+            "block": {
+                "name": "command_execution",
+                "command": "pytest -q",
+                "output": output,
+                "status": "completed",
+                "exitCode": 0,
+            },
+        }
+
+    def test_reattaches_status_row_without_touching_transcript(self):
+        lines = ["⏺ command pytest -q", "assistant answer"]
+        session, view, cut = self._make_session(lines)
+        info = {"turns": [{"events": [self._tool_event("call_1", "3 passed\n")]}]}
+
+        with patch.object(chatview_mod, "get_input_start", return_value=cut), \
+             patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            chatview_mod.ChatSession._restore_history_phantoms(session, info)
+
+        # Only the phantom manager is touched; the saved transcript is intact.
+        view.run_command.assert_not_called()
+        add = session.tool_outputs.add_tool_call
+        add.assert_called_once()
+        args, kwargs = add.call_args
+        self.assertEqual(args[1]["detail"], "pytest -q")
+        self.assertTrue(args[1]["show_command"])
+        self.assertEqual(kwargs["key"], "call_1")
+        self.assertEqual(args[2]["detail"], "3 passed")
+        self.assertIn("success", args[2]["summary"])
+        self.assertTrue(kwargs["status_only"])
+        self.assertEqual(args[0].begin(), len(lines[0]) + 1)
+
+        from chatview.tooloutput import ToolOutputManager
+        manager = ToolOutputManager(view, lambda v: 0, lambda v, p: None)
+        entry = manager.add_tool_call(
+            args[0], args[1], args[2],
+            key=kwargs["key"], status=kwargs["status"],
+            status_only=kwargs["status_only"],
+        )
+        html = manager._row_html(entry)
+        self.assertIn("1 line success", html)
+        self.assertIn(f"toggle:{entry['key']}", html)
+        self.assertIn(">show<", html)
+
+    def test_repeated_headers_are_matched_in_order(self):
+        lines = ["⏺ command pytest -q", "⏺ command pytest -q"]
+        session, view, cut = self._make_session(lines)
+        info = {"turns": [{"events": [
+            self._tool_event("call_1", "first\n"),
+            self._tool_event("call_2", "second\n"),
+        ]}]}
+
+        with patch.object(chatview_mod, "get_input_start", return_value=cut), \
+             patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            chatview_mod.ChatSession._restore_history_phantoms(session, info)
+
+        calls = session.tool_outputs.add_tool_call.call_args_list
+        self.assertEqual([c.kwargs["key"] for c in calls], ["call_1", "call_2"])
+        self.assertEqual(calls[0].args[0].begin(), len(lines[0]) + 1)
+        self.assertEqual(
+            calls[1].args[0].begin(), len(lines[0]) + 1 + len(lines[1]) + 1
+        )
+        self.assertEqual(calls[0].args[2]["detail"], "first")
+        self.assertEqual(calls[1].args[2]["detail"], "second")
+        self.assertEqual(calls[0].kwargs["key"], "call_1")
+        self.assertEqual(calls[1].kwargs["key"], "call_2")
+
+    def test_unmatched_headers_and_empty_history_are_noops(self):
+        session, view, cut = self._make_session(["unrelated text"])
+        info = {"turns": [{"events": [self._tool_event("call_1", "out\n")]}]}
+
+        with patch.object(chatview_mod, "get_input_start", return_value=cut), \
+             patch.object(chatview_mod.sublime, "Region", side_effect=_Region):
+            chatview_mod.ChatSession._restore_history_phantoms(session, info)
+            chatview_mod.ChatSession._restore_history_phantoms(session, None)
+
+        session.tool_outputs.add_tool_call.assert_not_called()
+        view.run_command.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
