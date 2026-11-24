@@ -13,7 +13,9 @@ Getting Started:
   - Claude Code: Run `claude /login` in your terminal.
   - Codex: Run `codex login` in your terminal.
   - Google Antigravity: Run `agy` in your terminal.
-  - OpenCode: Run `opencode /connect` in your terminal.
+  - OpenCode: TermMate starts/discovers a local `opencode serve --service`
+    automatically; if you run the service yourself, set `OPENCODE_SERVER_URL`
+    and `OPENCODE_SERVER_PASSWORD` in TermMate's "env" settings.
   - Pi Agent: Run `pi /login` in your terminal.
 - Open the command palette and type "TermMate: Start Chat".
 

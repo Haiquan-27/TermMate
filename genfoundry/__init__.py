@@ -24,7 +24,6 @@ from .codex_agent import (
 from .pi_agent import PiAgent, query as pi_query, list_pi_sessions
 from .opencode_agent import (
     OpenCodeAgent,
-    query as opencode_query,
     find_opencode_cli,
     find_opencode_v2_service,
     probe_opencode_service,
@@ -61,7 +60,6 @@ __all__ = [
     "pi_query",
     "list_pi_sessions",
     "OpenCodeAgent",
-    "opencode_query",
     "find_opencode_cli",
     "find_opencode_v2_service",
     "probe_opencode_service",

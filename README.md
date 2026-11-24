@@ -77,12 +77,14 @@ codex login
 # Google Antigravity
 agy
 
-# OpenCode
-/connect
+# OpenCode (no interactive login; see note below)
+# TermMate starts/discovers a local v2 service automatically.
 
 # Pi Agent
 /login
 ```
+
+OpenCode v2 runs as a local service (`opencode serve --service`). TermMate starts it and finds its endpoint and password from `service.json` in a private state directory. If you run the service yourself, set `OPENCODE_SERVER_URL` and `OPENCODE_SERVER_PASSWORD` in TermMate's `env` settings (see below).
 
 Alternatively, you can use `env` settings to skip the CLI login. Open the settings file via **Preferences → Package Settings → TermMate → Settings** and add env:
 
@@ -219,7 +221,7 @@ To reset the current conversation history and start a completely fresh context, 
 
 **2. Resume Previous Conversation**
 
-Run **`TermMate: Resume Session`** from the command palette to continue a past conversation. A quick panel lists previous sessions for the current workspace, each showing a short summary and timestamp. Sessions are filtered by the current workspace folder, listing only conversations relevant to your active project. Select one and the agent picks up exactly where it left off.
+Run **`TermMate: Resume Session`** from the command palette to continue a past conversation. A quick panel lists previous sessions with a short summary and timestamp. Sessions are first filtered by the current workspace folder; for OpenCode, if no sessions match there, TermMate falls back to listing all OpenCode sessions so work started from another directory is still reachable. Select one and the agent picks up exactly where it left off.
 
 **3. Rewind Conversation**
 
@@ -312,7 +314,7 @@ Replace `YOUR_RESOURCE_NAME` with your Azure Foundry resource and add the config
 
 **Example: Gemini API key for OpenCode**
 
-OpenCode uses the `GOOGLE_GENERATIVE_AI_API_KEY` environment variable. Set it here to authenticate without modifying your system environment (you may need to remove existing local auth.json via delete `~/.local/share/opencode/auth.json` first):
+OpenCode uses the `GOOGLE_GENERATIVE_AI_API_KEY` environment variable. Set it here to pass the key to the local OpenCode service. TermMate sets a private `XDG_STATE_HOME` for that service and discovers its endpoint and password from `service.json` (or from `OPENCODE_SERVER_URL` / `OPENCODE_SERVER_PASSWORD` in `env`); it does not read OpenCode's `auth.json` files:
 
 ```json
 {
@@ -377,7 +379,7 @@ These settings can be added or changed in `Preferences → Package Settings → 
 
 **TermMate does not send your entire workspace or file contents to any external servers.**
 
-Your data will only be sent to the respective LLM services used by Claude Code, Codex, OpenCode, or Pi under the following specific conditions:
+Your data will only be sent to the respective LLM services used by Claude Code, Codex, OpenCode, Pi, or Google Antigravity under the following specific conditions:
 
 **What data is sent:**
 
@@ -387,8 +389,8 @@ Your data will only be sent to the respective LLM services used by Claude Code, 
 
 **How TermMate interacts with Agents:**
 
-- **Local Execution**: The core plugin logic runs entirely on your local machine. All communication happens locally via the official CLI tools (`claude`, `codex`, or `pi`) installed on your system.
-- **No Data Collection**: TermMate does not collect, store, or transmit any of your source code or usage telemetry to our servers. TermMate does not send data to any third-party middleman servers; data goes directly to Anthropic or OpenAI using your own configured authentication credentials.
+- **Local Execution**: The core plugin logic runs entirely on your local machine. Claude Code, Codex, Pi, and Antigravity are driven through their official CLI tools; OpenCode v2 talks to a local HTTP service started with `opencode serve --service` (managed automatically by TermMate), not to a remote TermMate backend.
+- **No Data Collection**: TermMate does not collect, store, or transmit any of your source code or usage telemetry to our servers. Data goes directly from your machine to the provider configured for the active agent (Anthropic, OpenAI, Google, or your OpenCode/Pi provider) using your own credentials; there is no third-party middleman.
 - Data is only sent when you actively hit command+enter(or ctrl+enter) in the ChatView, or when the agent executes a tool (if you have granted permission via your `Approve Mode` settings).
 
 

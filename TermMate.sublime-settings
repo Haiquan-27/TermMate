@@ -13,7 +13,8 @@
     "disable_ask_user": true,
 
     // Whether to run terminal commands in sandbox mode.
-    // When enabled, adds --sandbox to Antigravity CLI and configures sandbox permissions.
+    // Applies only to Antigravity (adds --sandbox) and Codex (sandbox policy);
+    // OpenCode ignores this setting.
     "sandbox_mode": true,
 
     // Whether to share all open workspace folders with the agent.

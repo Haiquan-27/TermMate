@@ -250,7 +250,7 @@ class TestChatThreadTitles(unittest.TestCase):
         session.start_loading.assert_called_once_with(text="/fork")
         session.stop_loading.assert_called_once()
         notices = self._notice_messages(view)
-        self.assertTrue(any("/fork: boom" in text for text in notices))
+        self.assertTrue(any("/fork: failed to create session" in text for text in notices))
 
     def test_run_new_command_opens_fresh_task_tab(self):
         session, view, _ = self._make_session(SessionRole.PRIMARY)

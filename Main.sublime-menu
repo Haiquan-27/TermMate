@@ -16,7 +16,7 @@
                                 "command": "edit_settings",
                                 "args": {
                                     "base_file": "${packages}/TermMate/TermMate.sublime-settings",
-                                    "default": "{\n\t\"claude_command\": \"\"\n}\n"
+                                    "default": "{\n\t\"claude_command\": \"\",\n\t\"codex_command\": \"\",\n\t\"opencode_command\": \"\",\n\t\"pi_command\": \"\",\n\t\"antigravity_command\": \"\"\n}\n"
                                 },
                                 "caption": "Settings"
                             },

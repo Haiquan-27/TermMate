@@ -40,10 +40,9 @@ import logging
 
 import sublime
 
-from .utils import format_fenced_output
+from .utils import DIAG, format_fenced_output
 
 LOG = logging.getLogger("TermMate")
-DIAG = logging.getLogger("TermMate.Diag")
 
 #: Status row text for command calls that have not finished yet.
 STATUS_LABELS = {

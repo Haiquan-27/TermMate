@@ -144,6 +144,57 @@ def get_input_start(view, default=None):
     return pos
 
 
+def _reset_chat_autoscroll(view):
+    """Reset the tracker so the next append follows the bottom of the view."""
+    if not view:
+        return
+    view.settings().set(CHAT_AUTOSCROLL, True)
+    view.settings().erase(CHAT_LAST_Y)
+
+
+def _clear_chat_session(session):
+    """Reset a chat session and report /clear status consistently."""
+    if not session:
+        sublime.status_message("No active ChatView session found")
+        return False
+    if not session.reset_session():
+        return False
+    sublime.status_message("Clearing chat session...")
+    LOG.info("Cleared chat session via /clear")
+    return True
+
+
+def _agent_provider_for(window, session):
+    """Resolve the active provider without repeating the default everywhere."""
+    return (
+        chat_threads.get_setting_for_session(window, session, CHAT_AGENT, "claude")
+        if window else "claude"
+    )
+
+
+def _think_level_followup(window, view_id, session, agent_provider, model, active_model=None):
+    """Return the reasoning-effort picker that should follow a model choice."""
+    presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
+        active_model
+    )
+    if not presets:
+        return None
+    current_level = (
+        chat_threads.get_setting_for_session(
+            window, session, f"chatview_think_level_{agent_provider}"
+        )
+        if window else None
+    )
+    return TermChatSetThinkLevelListHandler(
+        current_level=current_level,
+        agent_provider=agent_provider,
+        active_model=active_model,
+        selected_model=model,
+        window=window,
+        view_id=view_id,
+    )
+
+
 def format_model_display_name(agent_provider, model, max_length=20):
     """Return a compact model name suitable for UI labels."""
     display_model = model
@@ -2313,10 +2364,13 @@ class ChatSession:
         def on_done(result, error):
             self.stop_loading()
             if error:
-                self._append_slash_notice(f"/fork: {error}", kind="error")
+                LOG.warning("/fork failed: %s", error)
+                self._append_slash_notice(
+                    "/fork: failed to create session", kind="error"
+                )
                 return
             if not result:
-                self._append_slash_notice("/fork: this agent did not return a fork", kind="error")
+                self._append_slash_notice("/fork: no session was returned", kind="error")
                 return
             self._open_forked_session(result)
 
@@ -2328,9 +2382,6 @@ class ChatSession:
 
     def _open_forked_session(self, result):
         fork_id = result.get("session_id") or result.get("id")
-        if not fork_id:
-            self._append_slash_notice("/fork: OpenCode did not return a session id", kind="error")
-            return
         fork_title = result.get("title") or ""
 
         task_num = TermChatNewThreadCommand(self.window)._next_task_number()
@@ -2380,7 +2431,7 @@ class ChatSession:
         if not self.agent_thread:
             self._append_slash_notice("/clear is not available.", kind="warning")
             return False
-        return self.reset_session()
+        return _clear_chat_session(self)
 
     def run_slash_command(self, name, arguments=""):
         """Execute a slash command natively and report failures in the view.
@@ -3227,8 +3278,7 @@ class ChatSession:
         self.tool_outputs.clear()
         quick_popup_manager.close(self.chat_view.id())
         self._reset_markdown_formatter()
-        self.chat_view.settings().erase(CHAT_LAST_Y)
-        self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
+        _reset_chat_autoscroll(self.chat_view)
         self.chat_view.run_command("term_chat_rewind_truncate", {"cut_point": 0})
 
     def _append_resume_history(self, agent, session_id, session_info):
@@ -3236,9 +3286,7 @@ class ChatSession:
         import datetime
         turns = (session_info or {}).get("turns", [])
 
-        self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
-        self.chat_view.settings().erase(CHAT_LAST_Y)
-
+        _reset_chat_autoscroll(self.chat_view)
         self.append_notice(f"Resuming session for {agent}", kind="info")
 
         replayed_events = any(turn.get("events") for turn in turns)
@@ -3266,8 +3314,7 @@ class ChatSession:
         fallback for providers that only expose plain turns.  Pure display —
         no I/O.
         """
-        self.chat_view.settings().set(CHAT_AUTOSCROLL, True)
-        self.chat_view.settings().erase(CHAT_LAST_Y)
+        _reset_chat_autoscroll(self.chat_view)
 
         turns = (session_info or {}).get("turns", [])
         for turn in turns:
@@ -4298,8 +4345,7 @@ class TermChatInputPromptCommand(sublime_plugin.TextCommand):
         self.view.sel().add(sublime.Region(end))
 
         # Reset autoscroll tracker so new turn follows from bottom
-        self.view.settings().set(CHAT_AUTOSCROLL, True)
-        self.view.settings().erase(CHAT_LAST_Y)
+        _reset_chat_autoscroll(self.view)
 
         if session:
             session.input_marker.update()
@@ -4610,13 +4656,7 @@ class TermChatClearSessionCommand(sublime_plugin.WindowCommand):
     """Run /clear for the active chat tab: clear history and start fresh."""
     def run(self, view_id=None):
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
-        if not session:
-            sublime.status_message("No active ChatView session found")
-            return
-
-        if session.reset_session():
-            sublime.status_message("Clearing chat session...")
-            LOG.info("Cleared chat session via /clear")
+        _clear_chat_session(session)
 
     def is_enabled(self):
         # Only enable if there's an active or primary session
@@ -4931,37 +4971,14 @@ class TermChatSetModelListHandler(sublime_plugin.ListInputHandler):
             chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
             if window else None
         )
-        agent_provider = (
-            chat_threads.get_setting_for_session(window, session, CHAT_AGENT, "claude")
-            if window else "claude"
+        agent_provider = _agent_provider_for(window, session)
+        active_model = next(
+            (m for m in known_models(session) if m.get("value") == model),
+            None,
+        ) if session else None
+        return _think_level_followup(
+            window, self.view_id, session, agent_provider, model, active_model
         )
-
-        active_model = {}
-        if session:
-            active_model = next(
-                (m for m in known_models(session) if m.get("value") == model),
-                {},
-            )
-
-        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
-            active_model
-        )
-        if presets:
-            current_level = (
-                chat_threads.get_setting_for_session(
-                    window, session, f"chatview_think_level_{agent_provider}"
-                )
-                if window else None
-            )
-            return TermChatSetThinkLevelListHandler(
-                current_level=current_level,
-                agent_provider=agent_provider,
-                active_model=active_model,
-                selected_model=model,
-                window=window,
-                view_id=self.view_id,
-            )
-        return None
 
     def list_items(self):
         # Get the target ChatSession to access available_models
@@ -5039,39 +5056,17 @@ class TermChatSetModelTextHandler(sublime_plugin.TextInputHandler):
             chat_threads.get_active_or_primary_session(window, view_id=self.view_id)
             if window else None
         )
-        agent_provider = (
-            chat_threads.get_setting_for_session(window, session, CHAT_AGENT, "claude")
-            if window else "claude"
-        )
+        agent_provider = _agent_provider_for(window, session)
 
         # Resolve the typed name against whatever roster is known so the
         # effort picker still follows when the list was unavailable.
-        active_model = None
-        if session:
-            active_model = next(
-                (m for m in known_models(session) if m.get("value") == model),
-                None,
-            )
-
-        presets = BaseChatMessageProcessor.for_provider(agent_provider).get_think_presets(
-            active_model
+        active_model = next(
+            (m for m in known_models(session) if m.get("value") == model),
+            None,
+        ) if session else None
+        return _think_level_followup(
+            window, self.view_id, session, agent_provider, model, active_model
         )
-        if presets:
-            current_level = (
-                chat_threads.get_setting_for_session(
-                    window, session, f"chatview_think_level_{agent_provider}"
-                )
-                if window else None
-            )
-            return TermChatSetThinkLevelListHandler(
-                current_level=current_level,
-                agent_provider=agent_provider,
-                active_model=active_model,
-                selected_model=model,
-                window=window,
-                view_id=self.view_id,
-            )
-        return None
 
     def placeholder(self):
         return "Enter model name (e.g., sonnet, opus, haiku)"
@@ -5197,9 +5192,7 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         level = level.strip() if level else None
 
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
-        agent_provider = chat_threads.get_setting_for_session(
-            self.window, session, CHAT_AGENT, "claude"
-        )
+        agent_provider = _agent_provider_for(self.window, session)
         curr_model = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_model_{agent_provider}"
         )
@@ -5279,9 +5272,7 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
 
             if models:
                 # Get current model to highlight it
-                agent_provider = chat_threads.get_setting_for_session(
-                    self.window, session, CHAT_AGENT, "claude"
-                )
+                agent_provider = _agent_provider_for(self.window, session)
                 current_model = chat_threads.get_setting_for_session(
                     self.window, session, f"chatview_model_{agent_provider}"
                 )
@@ -5307,9 +5298,7 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
         # Fallback to TextInputHandler for manual input
         current_model = None
         if session:
-            agent_provider = chat_threads.get_setting_for_session(
-                self.window, session, CHAT_AGENT, "claude"
-            )
+            agent_provider = _agent_provider_for(self.window, session)
             current_model = chat_threads.get_setting_for_session(
                 self.window, session, f"chatview_model_{agent_provider}"
             )

@@ -35,6 +35,7 @@ from .base_agent import (
     MessageType,
     SlashCommand,
 )
+from .diag import DIAG
 
 
 LOG = logging.getLogger("TermMate")
@@ -50,25 +51,6 @@ class OpenCodeSessionList(list):
 
     error: Optional[str] = None
 
-
-#: TEMPORARY diagnostic channel for tool-row insertion.  Shares the logger
-#: and file handler with ``chatview.utils`` (same name), so only the module
-#: imported first installs the handler.
-DIAG = logging.getLogger("TermMate.Diag")
-if not DIAG.handlers:
-    DIAG.setLevel(logging.DEBUG)
-    DIAG.propagate = False
-    try:
-        _diag_handler = logging.FileHandler(
-            os.path.join(tempfile.gettempdir(), "termmate-tool-rows.log"),
-            mode="w",
-            encoding="utf-8",
-        )
-        _diag_handler.setFormatter(logging.Formatter(
-            "%(asctime)s %(message)s"))
-        DIAG.addHandler(_diag_handler)
-    except OSError:
-        DIAG.addHandler(logging.NullHandler())
 
 _SERVER_URL_RE = re.compile(
     r"(?:opencode\s+)?server listening on\s+(https?://[^\s]+)", re.IGNORECASE
@@ -161,6 +143,55 @@ def get_termmate_opencode_state_dir() -> str:
     return state_dir
 
 
+def _service_json_candidates(
+    source: Dict[str, str],
+    include_config_home: bool = False,
+) -> List[str]:
+    """Return unique service.json paths, TermMate state first.
+
+    ``include_config_home`` keeps the broader password-discovery list used by
+    older installs; endpoint discovery only needs the user state directory.
+    """
+    candidates: List[str] = []
+    seen = set()
+
+    def add(path: str) -> None:
+        key = os.path.normcase(os.path.abspath(path))
+        if key not in seen:
+            seen.add(key)
+            candidates.append(path)
+
+    add(os.path.join(get_termmate_opencode_state_dir(), "opencode", "service.json"))
+    custom_state = source.get("XDG_STATE_HOME")
+    if custom_state:
+        add(os.path.join(custom_state, "opencode", "service.json"))
+
+    home = os.path.expanduser("~")
+    if sys.platform == "win32":
+        keys = ("APPDATA", "LOCALAPPDATA") if include_config_home else (
+            "LOCALAPPDATA", "APPDATA"
+        )
+        for key in keys:
+            value = source.get(key)
+            if value:
+                add(os.path.join(value, "opencode", "service.json"))
+        # OpenCode on Windows honours the XDG layout under the user profile,
+        # not just APPDATA.  Its service.json normally lives here.
+        add(os.path.join(home, ".local", "state", "opencode", "service.json"))
+        add(os.path.join(home, ".config", "opencode", "service.json"))
+    elif include_config_home:
+        config_home = source.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+        state_home = source.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
+        add(os.path.join(config_home, "opencode", "service.json"))
+        add(os.path.join(state_home, "opencode", "service.json"))
+        add(os.path.join(home, ".config", "opencode", "service.json"))
+        add(os.path.join(home, ".local", "state", "opencode", "service.json"))
+    else:
+        add(os.path.join(home, ".local", "state", "opencode", "service.json"))
+
+    return candidates
+
+
 def find_opencode_v2_password(
     extra_env: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
@@ -170,38 +201,7 @@ def find_opencode_v2_password(
         if source.get(key):
             return str(source[key])
 
-    home = os.path.expanduser("~")
-    termmate_state = get_termmate_opencode_state_dir()
-    candidates = [
-        os.path.join(termmate_state, "opencode", "service.json"),
-    ]
-    custom_state = source.get("XDG_STATE_HOME")
-    if custom_state:
-        candidates.append(os.path.join(custom_state, "opencode", "service.json"))
-
-    if sys.platform == "win32":
-        appdata = source.get("APPDATA")
-        localappdata = source.get("LOCALAPPDATA")
-        if appdata:
-            candidates.append(os.path.join(appdata, "opencode", "service.json"))
-        if localappdata:
-            candidates.append(os.path.join(localappdata, "opencode", "service.json"))
-        # OpenCode on Windows honours the XDG layout under the user profile,
-        # not just APPDATA.  Its service.json normally lives here.
-        candidates.extend([
-            os.path.join(home, ".local", "state", "opencode", "service.json"),
-            os.path.join(home, ".config", "opencode", "service.json"),
-        ])
-    else:
-        config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
-        state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
-        candidates.extend([
-            os.path.join(config_home, "opencode", "service.json"),
-            os.path.join(state_home, "opencode", "service.json"),
-            os.path.join(home, ".config", "opencode", "service.json"),
-            os.path.join(home, ".local", "state", "opencode", "service.json"),
-        ])
-    for path_candidate in candidates:
+    for path_candidate in _service_json_candidates(source, include_config_home=True):
         try:
             if os.path.isfile(path_candidate):
                 with open(path_candidate, "r", encoding="utf-8") as f:
@@ -226,36 +226,7 @@ def find_opencode_v2_service(
     url = explicit_url
     password = explicit_password
 
-    # Always prioritize TermMate private state directory
-    termmate_state = get_termmate_opencode_state_dir()
-    state_candidates = [
-        os.path.join(termmate_state, "opencode", "service.json"),
-    ]
-    custom_state = source.get("XDG_STATE_HOME")
-    if custom_state:
-        state_candidates.append(os.path.join(custom_state, "opencode", "service.json"))
-
-    home = os.path.expanduser("~")
-    if sys.platform == "win32":
-        localappdata = source.get("LOCALAPPDATA")
-        appdata = source.get("APPDATA")
-        if localappdata:
-            state_candidates.append(os.path.join(localappdata, "opencode", "service.json"))
-        if appdata:
-            state_candidates.append(os.path.join(appdata, "opencode", "service.json"))
-        # Real-world OpenCode installs on Windows write service.json to the
-        # XDG-style paths below.  Without these, every Sublime restart made
-        # resume unable to find the already running service.
-        state_candidates.extend([
-            os.path.join(home, ".local", "state", "opencode", "service.json"),
-            os.path.join(home, ".config", "opencode", "service.json"),
-        ])
-    else:
-        state_candidates.extend([
-            os.path.join(home, ".local", "state", "opencode", "service.json"),
-        ])
-
-    for path_candidate in state_candidates:
+    for path_candidate in _service_json_candidates(source):
         try:
             if os.path.isfile(path_candidate):
                 with open(path_candidate, "r", encoding="utf-8") as f:
@@ -276,14 +247,25 @@ def find_opencode_v2_service(
     return None
 
 
+def _basic_auth_headers(
+    source: Dict[str, str], password: Optional[str]
+) -> Dict[str, str]:
+    """Build the Basic auth header shared by async and sync HTTP helpers."""
+    if not password:
+        return {}
+    username = source.get("OPENCODE_SERVER_USERNAME", "opencode")
+    token = base64.b64encode(
+        f"{username}:{password}".encode("utf-8")
+    ).decode("ascii")
+    return {"Authorization": f"Basic {token}"}
+
+
 def probe_opencode_service(
     url: str, password: Optional[str] = None, timeout: float = 1.0
 ) -> bool:
     """Check if an OpenCode service endpoint is alive and responsive."""
     headers = {"Accept": "application/json"}
-    if password:
-        token = base64.b64encode(f"opencode:{password}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
+    headers.update(_basic_auth_headers({"OPENCODE_SERVER_USERNAME": "opencode"}, password))
     for check_path in ("/api/info", "/global/health"):
         req = Request(url.rstrip("/") + check_path, headers=headers, method="GET")
         try:
@@ -424,32 +406,11 @@ def ensure_opencode_v2_service(
     existing_proc = _SUBLIME_SERVER_PROCESS
     if existing_proc is None or existing_proc.poll() is not None:
         cmd = [cli, "serve", "--service"]
-        kwargs: Dict[str, Any] = {}
-        job_handle = None
-
-        if sys.platform == "win32":
-            job_handle = _create_win32_job_object()
-            if not job_handle:
-                LOG.warning("Failed to create the OpenCode Windows Job Object")
-            kwargs["creationflags"] = (
-                subprocess.CREATE_NO_WINDOW
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-                | 0x00000004  # CREATE_SUSPENDED
-            )
-        else:
-            cmd = [
-                "/bin/sh",
-                "-c",
-                (
-                    'exec 3<&0; "$@" </dev/null & child=$!; '
-                    '(cat <&3 >/dev/null; kill -TERM -$$ 2>/dev/null) & watcher=$!; '
-                    'wait "$child"; status=$?; '
-                    'kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; '
-                    'exit "$status"'
-                ),
-                "termmate-opencode-wrapper",
-                *cmd,
-            ]
+        job_handle, kwargs = _win32_job_spawn_kwargs(required=False)
+        if sys.platform == "win32" and not job_handle:
+            LOG.warning("Failed to create the OpenCode Windows Job Object")
+        if sys.platform != "win32":
+            cmd = _wrap_with_pipe_watchdog(cmd)
             kwargs["stdin"] = subprocess.PIPE
             kwargs["start_new_session"] = True
 
@@ -496,8 +457,7 @@ def get_sublime_opencode_server(
     Checks in-memory cache first, then private service.json,
     then starts the private daemon via ensure_opencode_v2_service.
     """
-    global _ACTIVE_OPENCODE_SERVER
-    active = _ACTIVE_OPENCODE_SERVER
+    active = get_active_opencode_server()
     if active and probe_opencode_service(active["url"], active.get("password")):
         return dict(active)
 
@@ -508,13 +468,11 @@ def get_sublime_opencode_server(
 
     svc = ensure_opencode_v2_service(cli_path, env)
     if svc:
-        info = {
+        return {
             "url": svc["url"].rstrip("/"),
             "password": svc.get("password") or "",
             "version": 2,
         }
-        _ACTIVE_OPENCODE_SERVER = info
-        return dict(info)
 
     return None
 
@@ -824,6 +782,44 @@ def _resume_win32_process(process: Any) -> bool:
         return False
 
 
+_PIPE_WATCHDOG_SCRIPT = (
+    'exec 3<&0; "$@" </dev/null & child=$!; '
+    '(cat <&3 >/dev/null; kill -TERM -$$ 2>/dev/null) & watcher=$!; '
+    'wait "$child"; status=$?; '
+    'kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; '
+    'exit "$status"'
+)
+
+
+def _win32_job_spawn_kwargs(
+    required: bool = True,
+) -> Tuple[Optional[int], Dict[str, Any]]:
+    """Create the kill-on-close Job and the suspended-start creation flags."""
+    job_handle: Optional[int] = None
+    kwargs: Dict[str, Any] = {}
+    if sys.platform == "win32":
+        job_handle = _create_win32_job_object()
+        if not job_handle and required:
+            raise RuntimeError("Failed to create the OpenCode Windows Job Object")
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NO_WINDOW
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | 0x00000004  # CREATE_SUSPENDED
+        )
+    return job_handle, kwargs
+
+
+def _wrap_with_pipe_watchdog(cmd: List[str]) -> List[str]:
+    """Keep a managed server alive only while the parent holds the pipe."""
+    return [
+        "/bin/sh",
+        "-c",
+        _PIPE_WATCHDOG_SCRIPT,
+        "termmate-opencode-wrapper",
+        *cmd,
+    ]
+
+
 class OpenCodeHTTPError(RuntimeError):
     """An error response returned by the OpenCode server."""
 
@@ -882,15 +878,18 @@ class OpenCodeAgent(BaseAgent):
             or "opencode"
         )
 
-        self.version: int = version or getattr(self.options, "version", None) or 0
+        self.version: int = version or 0
         self.version_str: Optional[str] = None
-        if self.version:
-            self.version_str = f"v{self.version}"
-        elif self.cli_path:
+        self._detected_cli_version: Optional[int] = None
+        if self.cli_path:
             detected, ver_str = detect_opencode_version_info(self.cli_path)
             if detected:
-                self.version = detected
-                self.version_str = ver_str
+                self._detected_cli_version = detected
+                if not self.version:
+                    self.version = detected
+                    self.version_str = ver_str
+        if self.version and not self.version_str:
+            self.version_str = f"v{self.version}"
 
         self.server_url: Optional[str] = None
         self._server_password: Optional[str] = None
@@ -1044,11 +1043,7 @@ class OpenCodeAgent(BaseAgent):
                 self.version_str,
                 protocol,
             )
-        is_explicit_v1 = self.version == 1
-        if self.cli_path and not is_explicit_v1:
-            ver = detect_opencode_version(self.cli_path)
-            if ver == 1:
-                is_explicit_v1 = True
+        is_explicit_v1 = self.version == 1 or self._detected_cli_version == 1
 
         if not is_explicit_v1:
             loop = self._loop or asyncio.get_running_loop()
@@ -1147,36 +1142,11 @@ class OpenCodeAgent(BaseAgent):
         ]
         LOG.info("Starting OpenCode server: %s", " ".join(cmd))
 
-        kwargs: Dict[str, Any] = {}
-        if sys.platform == "win32":
-            # The process must not run before it belongs to the kill-on-close
-            # Job.  Otherwise a fast .cmd launcher can create children which
-            # escape the Job before AssignProcessToJobObject is called.
-            self._job_handle = _create_win32_job_object()
-            if not self._job_handle:
-                raise RuntimeError("Failed to create the OpenCode Windows Job Object")
-            kwargs["creationflags"] = (
-                subprocess.CREATE_NO_WINDOW
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-                | 0x00000004  # CREATE_SUSPENDED
-            )
-        else:
-            # Sublime may terminate plugin_host without completing
-            # plugin_unloaded(). Keep the server behind a pipe watchdog so
-            # losing the parent still sends SIGTERM to the managed group.
-            cmd = [
-                "/bin/sh",
-                "-c",
-                (
-                    'exec 3<&0; "$@" </dev/null & child=$!; '
-                    '(cat <&3 >/dev/null; kill -TERM -$$ 2>/dev/null) & watcher=$!; '
-                    'wait "$child"; status=$?; '
-                    'kill "$watcher" 2>/dev/null; wait "$watcher" 2>/dev/null; '
-                    'exit "$status"'
-                ),
-                "termmate-opencode-wrapper",
-                *cmd,
-            ]
+        # The process must not run before it belongs to the kill-on-close Job,
+        # and on UNIX it stays behind a pipe watchdog if plugin_host dies.
+        self._job_handle, kwargs = _win32_job_spawn_kwargs()
+        if sys.platform != "win32":
+            cmd = _wrap_with_pipe_watchdog(cmd)
             kwargs["stdin"] = asyncio.subprocess.PIPE
             kwargs["start_new_session"] = True
 
@@ -1265,7 +1235,7 @@ class OpenCodeAgent(BaseAgent):
                             pw_match = _SERVER_PASSWORD_RE.search(line_next)
                             if pw_match:
                                 self._server_password = pw_match.group(1).strip()
-                    except (asyncio.TimeoutError, Exception):
+                    except Exception:
                         pass
                 return url
 
@@ -1294,13 +1264,7 @@ class OpenCodeAgent(BaseAgent):
             or source.get("OPENCODE_PASSWORD")
             or find_opencode_v2_password()
         )
-        if not password:
-            return {}
-        username = source.get("OPENCODE_SERVER_USERNAME", "opencode")
-        token = base64.b64encode(
-            f"{username}:{password}".encode("utf-8")
-        ).decode("ascii")
-        return {"Authorization": f"Basic {token}"}
+        return _basic_auth_headers(source, password)
 
     def _build_url(
         self,
@@ -2453,13 +2417,7 @@ class OpenCodeAgent(BaseAgent):
         DIAG.info("emit_shell_finished tool_key=%r background=%r cached=%r",
                   tool_key, dict(self._background_shells),
                   list(self._tool_calls)[:10])
-        lowered = state.strip().lower()
-        succeeded = lowered in ("exited", "completed", "success", "succeeded")
-        if exit_code is not None:
-            try:
-                succeeded = succeeded and int(exit_code) == 0
-            except (TypeError, ValueError):
-                succeeded = False
+        failed = _shell_result_failed(state, exit_code)
         await self._message_queue.put(Message(
             "shell_finished",
             content={
@@ -2469,7 +2427,7 @@ class OpenCodeAgent(BaseAgent):
                 "output": output,
                 "state": state,
                 "exit": exit_code,
-                "failed": not succeeded,
+                "failed": failed,
             },
         ))
         DIAG.info("emit_shell_finished queued shell_id=%r queue_size=%d",
@@ -2601,17 +2559,19 @@ class OpenCodeAgent(BaseAgent):
         )
         behavior = response_data.get("behavior", "deny")
         response = "once" if behavior == "allow" else "reject"
-        body = {"reply": response, "decision": response}
-        if response == "reject" and response_data.get("message"):
-            body["message"] = response_data["message"]
+        message = (
+            response_data.get("message")
+            if response == "reject" and response_data.get("message")
+            else None
+        )
 
         if self.version >= 2:
             try:
                 sid = quote(session_id, safe="")
                 pid = quote(str(permission_id), safe="")
                 reply_body: Dict[str, Any] = {"decision": response}
-                if "message" in body:
-                    reply_body["message"] = body["message"]
+                if message:
+                    reply_body["message"] = message
                 await self._http(
                     "POST",
                     f"/api/session/{sid}/permission/{pid}/reply",
@@ -2623,8 +2583,8 @@ class OpenCodeAgent(BaseAgent):
                     raise
 
         v1_body: Dict[str, Any] = {"reply": response}
-        if "message" in body:
-            v1_body["message"] = body["message"]
+        if message:
+            v1_body["message"] = message
         try:
             await self._http(
                 "POST",
@@ -3203,6 +3163,32 @@ class OpenCodeAgent(BaseAgent):
 
         asyncio.create_task(_fallback())
 
+    def _reset_turn_state(self) -> None:
+        """Clear per-turn caches shared by new_session() and rewind()."""
+        self._turn_active = False
+        self._turn_plan_mode = False
+        self._turn_done.set()
+        self._awaiting_user_message_id = False
+        self._idle_announced = False
+        for name in (
+            "_text_cache",
+            "_v2_text_cache",
+            "_part_types",
+            "_message_roles",
+            "_user_message_ids",
+            "_terminal_tools",
+            "_tool_calls",
+            "_permission_sessions",
+            "_seen_permissions",
+            "_diff_cache",
+            "_running_tools",
+            "_finished_shells",
+            "_shell_commands",
+            "_background_shells",
+        ):
+            getattr(self, name).clear()
+        self._plan_text = ""
+
     async def new_session(self) -> str:
         """Create and switch to a fresh session without reconnecting the client."""
         if not self._is_connected:
@@ -3229,23 +3215,8 @@ class OpenCodeAgent(BaseAgent):
             self._session_title_from_payload(session)
         )
 
-        self._turn_active = False
-        self._turn_plan_mode = False
-        self._turn_done.set()
         self._uses_session_status = False
-        self._awaiting_user_message_id = False
-        self._idle_announced = False
-        self._text_cache.clear()
-        self._v2_text_cache.clear()
-        self._part_types.clear()
-        self._message_roles.clear()
-        self._user_message_ids.clear()
-        self._terminal_tools.clear()
-        self._tool_calls.clear()
-        self._permission_sessions.clear()
-        self._seen_permissions.clear()
-        self._diff_cache.clear()
-        self._plan_text = ""
+        self._reset_turn_state()
 
         await self._message_queue.put(Message(
             "thread_started", content={"session_id": self._session_id}
@@ -3284,19 +3255,7 @@ class OpenCodeAgent(BaseAgent):
                 f"/session/{sid}/revert",
                 body={"messageID": message_id},
             )
-        self._turn_active = False
-        self._turn_plan_mode = False
-        self._awaiting_user_message_id = False
-        self._idle_announced = False
-        self._turn_done.set()
-        self._text_cache.clear()
-        self._v2_text_cache.clear()
-        self._part_types.clear()
-        self._message_roles.clear()
-        self._user_message_ids.clear()
-        self._terminal_tools.clear()
-        self._tool_calls.clear()
-        self._diff_cache.clear()
+        self._reset_turn_state()
         return self._session_id
 
     async def receive_messages(self) -> AsyncIterator[Message]:
@@ -3462,22 +3421,6 @@ class OpenCodeAgent(BaseAgent):
         self._seen_permissions.clear()
 
 
-async def query(
-    prompt: str,
-    options: Optional[AgentOptions] = None,
-) -> AsyncIterator[Message]:
-    """Run a one-shot OpenCode query."""
-    client = OpenCodeAgent(options=options or AgentOptions())
-    try:
-        await client.connect(prompt=prompt)
-        async for message in client.receive_messages():
-            yield message
-            if getattr(message, "type", None) == MessageType.STOP.value:
-                break
-    finally:
-        await client.disconnect()
-
-
 class _SyncOpenCodeServerV1:
     """Legacy synchronous ephemeral server helper for OpenCode v1."""
 
@@ -3527,17 +3470,8 @@ class _SyncOpenCodeServerV1:
                 or ""
             )
 
-        kwargs: Dict[str, Any] = {}
-        if sys.platform == "win32":
-            self._job_handle = _create_win32_job_object()
-            if not self._job_handle:
-                raise RuntimeError("Failed to create the OpenCode Windows Job Object")
-            kwargs["creationflags"] = (
-                subprocess.CREATE_NO_WINDOW
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-                | 0x00000004  # CREATE_SUSPENDED
-            )
-        else:
+        self._job_handle, kwargs = _win32_job_spawn_kwargs()
+        if sys.platform != "win32":
             kwargs["start_new_session"] = True
 
         try:
@@ -3692,6 +3626,7 @@ class _SyncOpenCodeServer:
             self.url = server_info["url"]
             self.password = server_info.get("password") or ""
             self.version = 2
+            set_active_opencode_server(self.url, self.password, version=2)
             LOG.debug("Reusing Sublime OpenCode server at %s", self.url)
             return self
 
@@ -3716,11 +3651,7 @@ def _sync_auth_headers(
         or source.get("OPENCODE_PASSWORD")
         or find_opencode_v2_password()
     )
-    if not effective_password:
-        return {}
-    username = source.get("OPENCODE_SERVER_USERNAME", "opencode")
-    token = base64.b64encode(f"{username}:{effective_password}".encode()).decode("ascii")
-    return {"Authorization": f"Basic {token}"}
+    return _basic_auth_headers(source, effective_password)
 
 
 def _sync_request(
@@ -3750,6 +3681,21 @@ def _sync_request(
     return OpenCodeAgent._unwrap(value)
 
 
+def _session_mtime(session: Dict[str, Any]) -> float:
+    """Normalize OpenCode's updated/created/mtime fields to epoch seconds."""
+    time_dict = session.get("time") if isinstance(session.get("time"), dict) else {}
+    updated = (
+        time_dict.get("updated")
+        or time_dict.get("created")
+        or session.get("mtime")
+        or 0
+    )
+    mtime = float(updated)
+    if mtime > 100000000000:
+        mtime /= 1000.0
+    return mtime
+
+
 def list_opencode_sessions(
     cwd: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
@@ -3769,18 +3715,7 @@ def list_opencode_sessions(
         for session in sessions if isinstance(sessions, list) else []:
             if not isinstance(session, dict) or not session.get("id"):
                 continue
-            time_dict = (
-                session.get("time") if isinstance(session.get("time"), dict) else {}
-            )
-            updated = (
-                time_dict.get("updated")
-                or time_dict.get("created")
-                or session.get("mtime")
-                or 0
-            )
-            mtime = float(updated)
-            if mtime > 100000000000:
-                mtime /= 1000.0
+            mtime = _session_mtime(session)
             location = session.get("location")
             directory = (
                 location.get("directory")
@@ -3908,6 +3843,18 @@ def _shell_synthetic_output(text: str) -> str:
     return text[start + 1:end].lstrip("\r\n").rstrip()
 
 
+def _shell_result_failed(state: Any, exit_code: Any) -> bool:
+    """Return whether a finished shell should be rendered as failed."""
+    lowered = str(state or "").strip().lower()
+    failed = lowered not in ("", "exited", "completed", "success", "succeeded")
+    if exit_code is not None:
+        try:
+            failed = failed or int(exit_code) != 0
+        except (TypeError, ValueError):
+            failed = True
+    return failed
+
+
 def _tool_content_from_state(raw_name: str, state: dict) -> dict:
     """Build the TOOL_USE content dict shared by live events and history replay.
 
@@ -4006,21 +3953,9 @@ def get_opencode_session_info(
                     server.url, f"/session/{sid}/message", cwd, extra_env, server.password
                 )
 
-            if (
-                isinstance(session, dict)
-                and "data" in session
-                and isinstance(session["data"], dict)
-            ):
-                session = session["data"]
+            # _sync_request() already unwraps the v2 {"data": ...} envelope.
             if not isinstance(session, dict) or not session.get("id"):
                 return None
-
-            if (
-                isinstance(messages, dict)
-                and "data" in messages
-                and isinstance(messages["data"], list)
-            ):
-                messages = messages["data"]
 
             turns = []
             current = None
@@ -4130,15 +4065,10 @@ def get_opencode_session_info(
                         metadata = info.get("metadata") or {}
                     if (isinstance(metadata, dict)
                             and str(metadata.get("source") or "") == "shell"):
-                        state = str(metadata.get("state") or "").strip().lower()
                         exit_code = metadata.get("exit")
-                        failed = state not in (
-                            "", "exited", "completed", "success", "succeeded")
-                        if exit_code is not None:
-                            try:
-                                failed = failed or int(exit_code) != 0
-                            except (TypeError, ValueError):
-                                failed = True
+                        failed = _shell_result_failed(
+                            metadata.get("state"), exit_code
+                        )
                         current["events"].append({
                             "kind": "shell",
                             "shell_id": str(
@@ -4159,18 +4089,7 @@ def get_opencode_session_info(
                 turns = turns[-history_limit:]
             last_turn = turns[-1] if turns else {}
 
-            time_dict = (
-                session.get("time") if isinstance(session.get("time"), dict) else {}
-            )
-            updated = (
-                time_dict.get("updated")
-                or time_dict.get("created")
-                or session.get("mtime")
-                or 0
-            )
-            mtime = float(updated)
-            if mtime > 100000000000:
-                mtime /= 1000.0
+            mtime = _session_mtime(session)
             return {
                 "summary": session.get("title"),
                 "mtime": mtime,

@@ -360,6 +360,19 @@ class BaseChatMessageProcessor:
                 })
         return items
 
+    def _record_file_changes(self, block):
+        """Record fileChange diffs for the end-of-turn file changes artifact."""
+        changes = block.get("changes", [])
+        cwd = (self.session.agent_thread.cwd
+               if self.session.agent_thread else self.session.cwd) or ""
+        for change in changes:
+            path = change.get("path", "")
+            if not path:
+                continue
+            abs_path, rel_path = _resolve_rel_path(path, cwd)
+            diff_text = change.get("diff") or ""
+            self.session.record_file_change(abs_path, rel_path, diff_text or None)
+
     def __init__(self, session):
         self.session = session
         self.last_is_tool_call = False
@@ -1356,19 +1369,6 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
 
         return f"⏺ {name}" if name else ""
 
-    def _record_file_changes(self, block):
-        """Record fileChange diffs for the end-of-turn file changes artifact."""
-        changes = block.get("changes", [])
-        cwd = (self.session.agent_thread.cwd
-               if self.session.agent_thread else self.session.cwd) or ""
-        for change in changes:
-            path = change.get("path", "")
-            if not path:
-                continue
-            abs_path, rel_path = _resolve_rel_path(path, cwd)
-            diff_text = change.get("diff") or ""
-            self.session.record_file_change(abs_path, rel_path, diff_text or None)
-
 
 class OpenCodeMessageProcessor(BaseChatMessageProcessor):
     """Render normalized OpenCode server events in the native chat view."""
@@ -1733,19 +1733,6 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         if block.get("status") == "error" and block.get("error"):
             detail = detail or str(block["error"])
         return f"⏺ {display_name} ({detail})" if detail else f"⏺ {display_name}"
-
-    def _record_file_changes(self, block):
-        """Record fileChange diffs for the end-of-turn file changes artifact."""
-        changes = block.get("changes", [])
-        cwd = (self.session.agent_thread.cwd
-               if self.session.agent_thread else self.session.cwd) or ""
-        for change in changes:
-            path = change.get("path", "")
-            if not path:
-                continue
-            abs_path, rel_path = _resolve_rel_path(path, cwd)
-            diff_text = change.get("diff") or ""
-            self.session.record_file_change(abs_path, rel_path, diff_text or None)
 
 
 class PiMessageProcessor(BaseChatMessageProcessor):
