@@ -957,6 +957,10 @@ class OpenCodeAgent(BaseAgent):
         self._terminal_tools = set()
         self._running_tools = set()
         self._background_shells: Dict[str, str] = {}
+        # OpenCode subagents live in child sessions.  Their text events only
+        # carry the child session id, so remember the parent link announced by
+        # session lifecycle events before those text events arrive.
+        self._child_parent_sessions: Dict[str, str] = {}
         self._shell_commands: Dict[str, str] = {}
         self._finished_shells = set()
         self._tool_calls: Dict[str, Dict[str, Any]] = {}
@@ -1506,9 +1510,46 @@ class OpenCodeAgent(BaseAgent):
                         break
         return not session_id or session_id in (self._session_id, "global")
 
-    @staticmethod
-    def _subagent_parent_session(properties: Dict[str, Any]) -> str:
+    def _track_session_lineage(
+        self, event_type: str, properties: Dict[str, Any]
+    ) -> None:
+        """Cache child -> parent session links announced by OpenCode.
+
+        ``session.text.delta`` and ``session.text.ended`` do not carry a
+        parent id.  Without this cache their events look like they belong to
+        an unrelated session and are dropped before rendering.
+        """
+        if event_type not in (
+            "session.created", "session.updated", "session.forked"
+        ):
+            return
+        info = properties.get("info")
+        info = info if isinstance(info, dict) else {}
+        child = (
+            properties.get("sessionID")
+            or info.get("id")
+            or info.get("sessionID")
+        )
+        parent = (
+            properties.get("parentID")
+            or properties.get("parentSessionID")
+            or info.get("parentID")
+            or info.get("parentSessionID")
+        )
+        if not child or not parent or str(child) == str(parent):
+            return
+        self._child_parent_sessions[str(child)] = str(parent)
+        DIAG.info("session lineage child=%r parent=%r", child, parent)
+
+    def _subagent_parent_session(self, properties: Dict[str, Any]) -> str:
         """Return the parent session id when an event comes from a subagent."""
+        session_id = str(
+            properties.get("sessionID") or properties.get("sessionId") or ""
+        )
+        if session_id:
+            mapped = self._child_parent_sessions.get(session_id)
+            if mapped:
+                return mapped
         candidates = [
             properties.get("parentID"),
             properties.get("parentSessionID"),
@@ -1521,7 +1562,7 @@ class OpenCodeAgent(BaseAgent):
                 metadata.get("parentSessionID"),
             ])
         for value in candidates:
-            if value and str(value) != str(properties.get("sessionID")):
+            if value and str(value) != session_id:
                 return str(value)
         return ""
 
@@ -1656,6 +1697,11 @@ class OpenCodeAgent(BaseAgent):
             DIAG.info("event type=%s current_session=%r data=%s",
                       event_type, self._session_id, str(properties)[:800])
 
+        # Child sessions are announced before their first text event.  Record
+        # the link even when this lifecycle event itself does not belong to
+        # the current session, otherwise later subagent text is dropped.
+        self._track_session_lineage(event_type, properties)
+
         from_subagent = (
             self._subagent_parent_session(properties)
             == str(self._session_id or "")
@@ -1663,7 +1709,9 @@ class OpenCodeAgent(BaseAgent):
         if not self._belongs_to_session(properties):
             if from_subagent and event_type in _SUBAGENT_TEXT_EVENTS:
                 # Subagent sessions are separate OpenCode sessions.  Their
-                # text can be attributed to this turn via the parent id.
+                # text is attributed to this turn via the cached parent id.
+                DIAG.info("subagent text event accepted: type=%s child=%r",
+                          event_type, properties.get("sessionID"))
                 pass
             else:
                 if event_type in diag_events:

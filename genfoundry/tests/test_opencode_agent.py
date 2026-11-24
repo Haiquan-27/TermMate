@@ -858,6 +858,99 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[0].type, "subagent_text")
         self.assertEqual(messages[0].content, "working on it")
 
+    async def test_v2_subagent_text_uses_session_created_parent(self):
+        # Real session.text.delta events have no parentID.  The parent link is
+        # announced earlier by session.created and must be cached.
+        await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_child_created",
+                "info": {
+                    "id": "ses_child_created",
+                    "parentID": "ses_v2",
+                },
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_child_created",
+                "assistantMessageID": "child_msg_created",
+                "delta": "from child",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].type, "subagent_text")
+        self.assertEqual(messages[0].content, "from child")
+
+    async def test_v2_subagent_text_uses_session_updated_info_parent(self):
+        await self.agent._dispatch_event({
+            "type": "session.updated",
+            "data": {
+                "sessionID": "ses_child_updated",
+                "info": {
+                    "id": "ses_child_updated",
+                    "parentID": "ses_v2",
+                },
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_child_updated",
+                "assistantMessageID": "child_msg_updated",
+                "delta": "updated child",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].type, "subagent_text")
+        self.assertEqual(messages[0].content, "updated child")
+
+    async def test_v2_subagent_text_ended_uses_cached_parent(self):
+        await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_child_ended",
+                "parentID": "ses_v2",
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.ended",
+            "data": {
+                "sessionID": "ses_child_ended",
+                "assistantMessageID": "child_msg_ended",
+                "text": "complete child answer",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].type, "subagent_text")
+        self.assertEqual(messages[0].content, "complete child answer")
+
+    async def test_v2_child_text_from_other_parent_is_ignored(self):
+        await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_other_child",
+                "parentID": "ses_other_parent",
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_other_child",
+                "assistantMessageID": "other_msg",
+                "delta": "not ours",
+            },
+        })
+
+        self.assertEqual(await self._messages(), [])
+
     async def test_v2_tool_lifecycle_input_started_and_patch(self):
         # Realistic OpenCode v2 flow: name is in input.started, not in called or success
         await self.agent._dispatch_event({

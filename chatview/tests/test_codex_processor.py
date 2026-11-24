@@ -284,6 +284,8 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             show_file_changes_artifact=MagicMock(),
             record_file_change=MagicMock(),
             update_last_prompt_uuid=MagicMock(),
+            tool_outputs=None,
+            record_subagent_tool_call=MagicMock(),
         )
         self.processor = OpenCodeMessageProcessor(self.session)
 
@@ -293,6 +295,26 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
 
         self.session.start_loading.assert_called_once_with()
         append.assert_called_once_with("hello", live=True)
+
+    def test_running_subagent_tool_registers_immediately(self):
+        # OpenCode emits running tool rows with the tool id as the message id.
+        block = {
+            "name": "task",
+            "status": "running",
+            "input": {"description": "Investigate"},
+        }
+        with patch.object(
+            self.processor, "format_tool_call", return_value=("⏺ task", [])
+        ), patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(
+                Message("tool_use", block, msg_id="task_1")
+            )
+
+        self.session.record_subagent_tool_call.assert_called_once_with(
+            "task_1", "task"
+        )
+        append.assert_any_call("\n", is_tool=True)
+        append.assert_any_call("⏺ task\n", is_tool=True, tool_phantoms=None)
 
     def test_manual_compaction_starts_compacting_loader(self):
         self.processor.handle_message(Message(
