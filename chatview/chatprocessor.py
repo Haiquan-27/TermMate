@@ -1232,6 +1232,14 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
     _TOOL_FILE_NAMES = ("fileChange", "ImageView")
     _RISKY_TOOLS = ("command_execution",)
 
+    def __init__(self, session):
+        super().__init__(session)
+        self._text_msg_id = None
+        self._text_trailing_newlines = 1
+        # Item ids whose text was already streamed via agentMessage deltas.
+        # The final AssistantMessage for those items must not be rendered again.
+        self._streamed_text_ids = set()
+
     @classmethod
     def get_default_think_presets(cls) -> list:
         return [
@@ -1254,6 +1262,13 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
     def _handle_typed_message(self, message):
         if message.type == "assistant":
             self.session.start_loading()
+
+            # When deltas already streamed this item's text, the completion
+            # AssistantMessage would render the whole answer a second time.
+            streamed_id = self.message_key(message)
+            if streamed_id and str(streamed_id) in self._streamed_text_ids:
+                self._streamed_text_ids.discard(str(streamed_id))
+                return
 
             # Extract text content
             text_content = ""
@@ -1331,10 +1346,43 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             uuid_to_store = turn_id or (str(turn_index) if turn_index is not None else None)
             if uuid_to_store is not None:
                 self.session.update_last_prompt_uuid(str(uuid_to_store))
+            self._text_msg_id = None
+            self._text_trailing_newlines = 1
+            self._streamed_text_ids.clear()
             self.session.start_loading()
 
-        elif message.type in ("thinking", "text"):
+        elif message.type == "thinking":
             self.session.start_loading()
+
+        elif message.type == "text":
+            self.session.start_loading()
+            content = message.content if isinstance(message.content, str) else ""
+            if not content:
+                return
+            msg_id = self.message_key(message)
+            if msg_id:
+                self._streamed_text_ids.add(str(msg_id))
+                if (self._text_msg_id and msg_id != self._text_msg_id
+                        and not self.last_is_tool_call
+                        and content[:1] not in ("\n", "\r")):
+                    # Separate adjacent codex agentMessage items (e.g.
+                    # commentary followed by final_answer) without merging.
+                    needed = max(0, 2 - self._text_trailing_newlines)
+                    if needed:
+                        content = "\n" * needed + content
+                self._text_msg_id = msg_id
+            if self.last_is_tool_call:
+                if not content.startswith(("\n", "\r\n")):
+                    content = "\n" + content
+                self.last_is_tool_call = False
+            self.append_content(content, live=True)
+            raw = content.replace("\r", "")
+            trailing = len(raw) - len(raw.rstrip("\n"))
+            if trailing == len(raw):
+                self._text_trailing_newlines = min(2, self._text_trailing_newlines + trailing)
+            else:
+                self._text_trailing_newlines = min(2, trailing)
+            return
 
         elif message.type == "stop":
             # Codex agent sends "stop" when its process completes
