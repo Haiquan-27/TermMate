@@ -71,12 +71,12 @@ class _CapturedThreads:
         return thread
 
 
-def _open_panel(cmd, window, threads):
+def _open_panel(cmd, window, threads, run_kwargs=None):
     """Run the command, finish the loader, and return the quick-panel callback."""
     with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
          patch.object(chatview_mod.sublime, "set_timeout",
                       side_effect=lambda fn, delay=0: fn()):
-        cmd.run()
+        cmd.run(**(run_kwargs or {}))
         threads.targets[0].target()
     return window.show_quick_panel.call_args.args[1]
 
@@ -250,12 +250,14 @@ class TestResumeSelectOpensNewTab(unittest.TestCase):
             lambda k, v: self.new_view_settings.__setitem__(k, v)
         )
 
-    def _select(self, cmd, window, index=0, sessions=None, return_items=False):
+    def _select(self, cmd, window, index=0, sessions=None, return_items=False,
+                subagent=False):
         if sessions is None:
             sessions = list(_SESSIONS)
         cmd._load_sessions = MagicMock(return_value=sessions)
         threads = _CapturedThreads()
-        on_select = _open_panel(cmd, window, threads)
+        run_kwargs = {"subagent": True} if subagent else None
+        on_select = _open_panel(cmd, window, threads, run_kwargs=run_kwargs)
         items = window.show_quick_panel.call_args.args[0]
         with patch.object(chatview_mod.chat_threads, "get_active_or_primary_session",
                           return_value=self.old_session), \
@@ -288,6 +290,13 @@ class TestResumeSelectOpensNewTab(unittest.TestCase):
         self.new_session.set_thread_title.assert_called_once_with("first session")
         self.new_session._clear_transcript.assert_called_once_with()
         self.assertTrue(self.new_session.has_sent_message)
+
+    def test_select_forwards_subagent_flag_to_new_view(self):
+        cmd, window = _make_command()
+        create = self._select(cmd, window, subagent=True)
+
+        create.assert_called_once()
+        self.assertIs(create.call_args.kwargs["subagent"], True)
 
     def test_select_does_not_touch_current_tab(self):
         cmd, window = _make_command()

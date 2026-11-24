@@ -13,6 +13,7 @@ LOG = logging.getLogger("TermMate")
 
 PACKAGE_NAME = "TermMate"
 CHAT_VIEW_FLAG = "chatview_chat"
+CHAT_VIEW_SUBAGENT = "chatview_subagent"
 CHAT_VIEW_NAME = "Chat View"
 CHAT_THREAD_NAME = "TermChat"
 CHAT_AGENT = "chatview_agent_provider"
@@ -56,6 +57,13 @@ def get_chat_view_role(view):
 def is_primary_chat_view(view):
     """Return True if view is the window's primary Chat View."""
     return get_chat_view_role(view) == SessionRole.PRIMARY
+
+
+def is_subagent_chat_view(view):
+    """Return True for a read-only Chat View opened from a subagent session."""
+    if not view:
+        return False
+    return view.settings().get(CHAT_VIEW_SUBAGENT, False) is True
 
 
 def is_task_chat_view(view):
@@ -468,14 +476,17 @@ class TermChatRenameThreadCommand(sublime_plugin.WindowCommand):
 
     def is_visible(self, group=-1, index=-1, view_id=None):
         view = self._resolve_target_view(group, index, view_id)
-        return bool(view and is_chat_view(view))
+        return bool(view and is_chat_view(view) and not is_subagent_chat_view(view))
 
     def is_enabled(self, group=-1, index=-1, view_id=None):
         view = self._resolve_target_view(group, index, view_id)
-        return bool(view and is_chat_view(view))
+        return bool(view and is_chat_view(view) and not is_subagent_chat_view(view))
 
     def run(self, title=None, group=-1, index=-1, view_id=None):
         target_view = self._resolve_target_view(group, index, view_id)
+        if is_subagent_chat_view(target_view):
+            sublime.status_message(f"[{PACKAGE_NAME}] Subagent view is read-only")
+            return
         if not target_view:
             sublime.status_message("No view to rename")
             return

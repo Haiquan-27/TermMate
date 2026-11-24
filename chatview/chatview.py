@@ -79,9 +79,16 @@ AGENT_SEPARATOR = "⋅⋅⋅"
 PREFERENCES_CHANGE_KEY = "termmate_chatview_preferences"
 preferences_redraw_scheduled = False
 
+# Tool names used by supported providers when spawning a subagent / task.
+SUBAGENT_TOOL_NAMES = {
+    "Agent", "Task", "agent", "task",
+    "collabAgentToolCall", "spawnAgent",
+}
+
 from .chatthread import (
     SessionRole,
     CHAT_VIEW_NAME,
+    CHAT_VIEW_SUBAGENT,
     CHAT_THREAD_NAME,
     CHAT_THREAD_LABEL,
     CHAT_THREAD_COUNTER,
@@ -99,6 +106,7 @@ from .chatthread import (
     get_chat_view_role,
     is_primary_chat_view,
     is_task_chat_view,
+    is_subagent_chat_view,
     TermChatNewThreadCommand,
     TermChatSwitchThreadCommand,
     TermChatRenameThreadCommand,
@@ -142,6 +150,53 @@ def get_input_start(view, default=None):
     # Re-anchor lazily (view restored from a session, or anchor lost)
     set_input_start(view, pos)
     return pos
+
+
+def _subagent_view_is_target(window, view_id=None):
+    """Return True when the explicit or focused view is a subagent Chat View."""
+    if not window:
+        return False
+    if view_id is not None:
+        try:
+            target_id = int(view_id)
+        except (TypeError, ValueError):
+            target_id = None
+        if target_id is not None:
+            for view in window.views():
+                if view.id() == target_id:
+                    return is_subagent_chat_view(view)
+    return is_subagent_chat_view(window.active_view())
+
+
+def _subagent_session_is_target(window, view_id=None):
+    """Return True when the command would act on a subagent Chat Session."""
+    if _subagent_view_is_target(window, view_id):
+        return True
+    session = chat_threads.get_active_or_primary_session(window, view_id=view_id)
+    return bool(session and is_subagent_chat_view(session.chat_view))
+
+
+def _block_subagent_command(window, view_id=None):
+    """Block mutating commands while a subagent Chat View is the target.
+
+    This deliberately checks the view itself instead of resolving the session
+    again: callers immediately resolve the target session and tests rely on
+    that happening exactly once.
+    """
+    if not _subagent_view_is_target(window, view_id):
+        return False
+    sublime.status_message(f"[{PACKAGE_NAME}] Subagent view is read-only")
+    return True
+
+
+_SUBAGENT_BLOCKED_TEXT_COMMANDS = {
+    "insert", "paste", "insert_characters", "insert_snippet",
+    "append", "yank", "paste_and_indent", "clipboard_history_paste",
+    "left_delete", "right_delete", "delete_word", "delete_word_backward",
+    "delete_to_mark", "run_macro_file", "cut",
+    "undo", "soft_undo", "redo", "soft_redo",
+    "term_chat_send_input", "term_chat_history_up", "term_chat_history_down",
+}
 
 
 def _reset_chat_autoscroll(view):
@@ -205,11 +260,12 @@ def format_model_display_name(agent_provider, model, max_length=20):
     return display_model
 
 
-def format_model_tag_html(display_model, think_level=None):
-    """Return the model button, with the effort level in its tail.
+def format_model_tag_html(display_model, think_level=None, interactive=True):
+    """Return the model tag, with the effort level in its tail.
 
     The level rides inside the model link: clicking it opens the model picker,
-    which lists the current model's levels before the model roster.
+    which lists the current model's levels before the model roster.  Read-only
+    subagent views render a non-clickable span instead.
     """
     think_html = ""
     if think_level:
@@ -217,11 +273,16 @@ def format_model_tag_html(display_model, think_level=None):
             '<span class="think-sep"> · </span>'
             f'<span class="think-value">{html.escape(str(think_level))}</span>'
         )
-    return (
+    open_tag = (
         '<a href="set_model" class="model-tag">'
+        if interactive else '<span class="model-tag">'
+    )
+    close_tag = "</a>" if interactive else "</span>"
+    return (
+        f'{open_tag}'
         '<span class="label">Model:</span>'
         f'<span class="value">{html.escape(display_model)}</span>'
-        f'{think_html}</a>'
+        f'{think_html}{close_tag}'
     )
 
 
@@ -1083,6 +1144,9 @@ class InputPromptMarker:
 
     def update(self):
         """Pin the marker at the input line start."""
+        if is_subagent_chat_view(self.view):
+            self.clear()
+            return
         start = input_editable_start(self.view)
         if start > self.view.size():
             # Input line not created yet (fresh view before term_chat_input_prompt)
@@ -1110,6 +1174,8 @@ class ModelPanel:
 
     def _on_navigate(self, href):
         """Handle actions from links in the model panel."""
+        if is_subagent_chat_view(self.view):
+            return
         view_id = self.view.id() if self.view else None
         if self.view and self.view.is_valid():
             self.window.focus_view(self.view)
@@ -1123,6 +1189,11 @@ class ModelPanel:
             self.window.run_command("term_chat_interrupt", {"confirm": True, "view_id": view_id})
         elif href == "switch_thread":
             self.window.run_command("term_chat_switch_thread")
+        elif href == "show_subagents":
+            self.window.run_command(
+                "term_chat_resume_session",
+                {"view_id": view_id, "subagent": True},
+            )
 
     def set_running(self, running):
         """Show the stop hint only while the agent is processing a turn."""
@@ -1165,8 +1236,13 @@ class ModelPanel:
 
         display_model = format_model_display_name(agent_provider, model)
 
+        read_only = is_subagent_chat_view(self.view)
         display_plan_mode = plan_mode.value
         plan_tag_html = (
+            f'<span class="model-tag">'
+            f'<span class="label">PlanMode:</span>'
+            f'<span class="value">{display_plan_mode}</span></span>'
+            if read_only else
             f'<a href="toggle_plan" class="model-tag">'
             f'<span class="label">PlanMode:</span>'
             f'<span class="value">{display_plan_mode}</span></a>'
@@ -1180,7 +1256,7 @@ class ModelPanel:
             and s.chat_view and s.chat_view.id() != self.view.id()
         ]
         task_tag_html = ""
-        if other_sessions:
+        if other_sessions and not read_only:
             task_tag_html = (
                 f'<span class="model-divider">│</span>'
                 f'<a href="switch_thread" class="model-tag">'
@@ -1188,9 +1264,23 @@ class ModelPanel:
                 f'<span class="thread-count">+{len(other_sessions)}</span></a>'
             )
 
-        stop_hint_html = self.status_hint.render()
+        subagent_count = len(getattr(session, "subagent_tool_keys", ()) or ())
+        subagent_tag_html = ""
+        if subagent_count and not read_only:
+            subagent_tag_html = (
+                f'<span class="model-divider">│</span>'
+                f'<a href="show_subagents" class="model-tag">'
+                f'<span class="label">Subagent</span>'
+                f'<span class="thread-count">+{subagent_count}</span></a>'
+            )
+
+        stop_hint_html = "" if read_only else self.status_hint.render()
 
         agent_tag = (
+            f'<span class="model-tag">'
+            f'<span class="icon">✨</span>'
+            f'<span class="value">{agent_provider}</span></span>'
+            if read_only else
             f'<a href="set_agent" class="model-tag">'
             f'<span class="icon">✨</span>'
             f'<span class="value">{agent_provider}</span></a>'
@@ -1198,12 +1288,16 @@ class ModelPanel:
         think_level = chat_threads.get_setting_for_session(
             self.window, session, f"chatview_think_level_{agent_provider}"
         )
-        model_tag = format_model_tag_html(display_model, think_level)
+        model_tag = format_model_tag_html(
+            display_model, think_level, interactive=not read_only
+        )
 
         tags = [agent_tag, model_tag, plan_tag_html]
         buttons_html = "&nbsp;".join(tags)
         if task_tag_html:
             buttons_html += task_tag_html
+        if subagent_tag_html:
+            buttons_html += subagent_tag_html
 
         panel_html = f"""
         <body id="chatview-model" style="margin: 0; padding: 0;">
@@ -1760,6 +1854,7 @@ class ChatSession:
         self.history = []
         self.history_index = 0
         self.history_stash = ""
+        self.subagent_tool_keys = set()
         self.permission_requests = {} # Map of request_id -> (tool_name, input_data)
         self.available_models = []  # Will be populated from control_response
         self._model_picker_waiting = False  # True while a model refresh is pending
@@ -2067,6 +2162,14 @@ class ChatSession:
         if not self.has_sent_message:
             return
         view.settings().set(CHAT_SESSION_ID, session_id)
+
+    def record_subagent_tool_call(self, key, name):
+        """Remember one subagent launch without counting repeated updates."""
+        identifier = str(key or f"{name}:{len(self.subagent_tool_keys)}")
+        if identifier in self.subagent_tool_keys:
+            return
+        self.subagent_tool_keys.add(identifier)
+        self.model_phantom.update()
 
     def sync_pi_approve_mode(self, mode):
         """Sends a phantom command to pi agent to sync approve mode."""
@@ -2621,7 +2724,7 @@ class ChatSession:
                 "</body>"
             )
             def on_navigate(href, idx=region_index):
-                if href != "rewind":
+                if href != "rewind" or is_subagent_chat_view(self.chat_view):
                     return
                 if self.rewind_confirm_panel.visible:
                     self.rewind_confirm_panel.clear()
@@ -2769,6 +2872,7 @@ class ChatSession:
         self.stop_loading()
         self.token_usage = None
         self.token_summary_phantom.clear()
+        self.subagent_tool_keys.clear()
         self.session_allow_all = False
         self.has_sent_message = False
         # Clear stale models and session_id from previous agent
@@ -3272,6 +3376,7 @@ class ChatSession:
         self.stop_loading()
         self.token_usage = None
         self.token_summary_phantom.clear()
+        self.subagent_tool_keys.clear()
         self.clear_prompt_highlights()
         self.artifact.clear()
         self.table_phantoms.clear()
@@ -3402,6 +3507,10 @@ class ChatSession:
         processor = self.message_processor
         if processor is None:
             return
+        if block.get("name") in SUBAGENT_TOOL_NAMES or block.get("tool") in SUBAGENT_TOOL_NAMES:
+            self.record_subagent_tool_call(
+                key, block.get("name") or block.get("tool")
+            )
         rendered, phantoms = processor.format_tool_call(block, key=key)
         self.chat_view.run_command("term_chat_output_append", {
             "text": (rendered + "\n") if rendered else "",
@@ -3429,6 +3538,7 @@ def _create_chat_view_and_session(
     target_group=None,
     initial_title=None,
     session_id=None,
+    subagent=False,
 ):
     """Create a new chat view, initialize its ChatSession, and focus it."""
     chat_view = window.new_file()
@@ -3457,7 +3567,11 @@ def _create_chat_view_and_session(
         chat_view.settings().set(CHAT_SESSION_ID, session_id)
 
     shortcut = "Command+Enter" if sublime.platform() == "osx" else "Ctrl+Enter"
-    welcome_text = "\nType your message and press %s to send.\n" % shortcut
+    welcome_text = (
+        "\nRead-only subagent session history.\n"
+        if subagent else
+        "\nType your message and press %s to send.\n" % shortcut
+    )
 
     chat_view.run_command("append", {"characters": f"Starting {PACKAGE_NAME} agent\n"})
 
@@ -3486,6 +3600,10 @@ def _create_chat_view_and_session(
         # immediately and allow later reconnects to find it again.
         session.has_sent_message = True
     chat_threads.register(window, chat_view, session)
+    # Enable read-only handling only after the initial buffer setup: the
+    # listener rejects "append", which would otherwise drop the welcome text.
+    if subagent:
+        chat_view.settings().set(CHAT_VIEW_SUBAGENT, True)
     update_agent_model_status(window)
 
     # Show initial prompt (this will also update the model phantom)
@@ -3606,6 +3724,8 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
     Handles the input submission (bound to Ctrl+Enter).
     """
     def run(self, edit):
+        if is_subagent_chat_view(self.view):
+            return
         window = self.view.window()
         if not window:
             return
@@ -3674,6 +3794,8 @@ class TermChatSendInputCommand(sublime_plugin.TextCommand):
 
 class TermChatHistoryUpCommand(sublime_plugin.TextCommand):
     def run(self, edit):
+        if is_subagent_chat_view(self.view):
+            return
         session = chatview_sessions.get(self.view.id())
         if not session:
             return
@@ -3700,6 +3822,8 @@ class TermChatHistoryUpCommand(sublime_plugin.TextCommand):
 
 class TermChatHistoryDownCommand(sublime_plugin.TextCommand):
     def run(self, edit):
+        if is_subagent_chat_view(self.view):
+            return
         session = chatview_sessions.get(self.view.id())
         if not session:
             return
@@ -3878,6 +4002,11 @@ class ChatViewListener(sublime_plugin.EventListener):
         # Only monitor ChatView chat views
         if not is_chat_view(view):
             return None
+
+        # Subagent history views are read-only: keep navigation/copy but reject
+        # every buffer-mutating or prompt-submitting text command.
+        if is_subagent_chat_view(view) and command_name in _SUBAGENT_BLOCKED_TEXT_COMMANDS:
+            return ("noop", {})
 
         # Double-click on a tool call file line → open the file instead of selecting the word
         # Also handles artifact file name lines → open the recorded diff view or plan
@@ -4447,6 +4576,9 @@ class TermChatPromptCommand(sublime_plugin.WindowCommand):
     """Collect a quick prompt outside the command palette and submit it."""
 
     def run(self, prompt=None):
+        if _block_subagent_command(self.window):
+            return
+
         # Capture editor context before the input panel takes focus.  A file
         # is attached only when the user has made a non-empty selection.
         source_view = self.window.active_view()
@@ -4480,6 +4612,9 @@ class TermChatPromptCommand(sublime_plugin.WindowCommand):
         panel.sel().clear()
         panel.sel().add(sublime.Region(caret))
         panel.show(caret)
+
+    def is_enabled(self):
+        return not _subagent_session_is_target(self.window)
 
     def _selected_context_tags(self, view):
         if not view or view.settings().get(CHAT_VIEW_FLAG, False):
@@ -4655,12 +4790,15 @@ class TermChatSetWorkspaceCommand(sublime_plugin.WindowCommand):
 class TermChatClearSessionCommand(sublime_plugin.WindowCommand):
     """Run /clear for the active chat tab: clear history and start fresh."""
     def run(self, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         _clear_chat_session(session)
 
     def is_enabled(self):
         # Only enable if there's an active or primary session
-        return chat_threads.get_active_or_primary_session(self.window) is not None
+        return chat_threads.get_active_or_primary_session(self.window) is not None \
+            and not _subagent_session_is_target(self.window)
 
 
 class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
@@ -4744,8 +4882,10 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
             return list_antigravity_sessions(cwd)
         return list_sessions_for_cwd(cwd)
 
-    def run(self, view_id=None):
+    def run(self, view_id=None, subagent=False):
         import datetime
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         agent = self._get_agent(session)
         cwd = self._get_cwd(session, view_id=view_id)
@@ -4819,6 +4959,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                     cwd=session_cwd,
                     session_id=chosen_id,
                     initial_title=raw_title,
+                    subagent=subagent,
                 )
                 new_view.settings().set(CHAT_THREAD_ID, task_num)
                 new_view.settings().set(CHAT_THREAD_TITLE, raw_title)
@@ -4853,6 +4994,8 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
     Interrupts the current chat session (focused task chat or primary chat).
     """
     def run(self, confirm=False, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         if not session:
             sublime.status_message("No active ChatView session found")
@@ -4888,7 +5031,8 @@ class TermChatInterruptCommand(sublime_plugin.WindowCommand):
 
     def is_enabled(self):
         # Only enable if there's an active or primary session
-        return chat_threads.get_active_or_primary_session(self.window) is not None
+        return chat_threads.get_active_or_primary_session(self.window) is not None \
+            and not _subagent_session_is_target(self.window)
 
 
 def known_models(session):
@@ -5125,6 +5269,8 @@ class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
     Sets the agent provider for the target ChatView session (or window default).
     """
     def run(self, agent, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         if agent:
             session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
             current_agent = chat_threads.get_setting_for_session(
@@ -5140,7 +5286,12 @@ class TermChatSetAgentCommand(sublime_plugin.WindowCommand):
 
             update_agent_model_status(self.window)
 
+    def is_enabled(self, agent=None, view_id=None):
+        return not _subagent_session_is_target(self.window, view_id)
+
     def input(self, args):
+        if _block_subagent_command(self.window, args.get("view_id")):
+            return None
         view_id = args.get("view_id")
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         current_agent = chat_threads.get_setting_for_session(
@@ -5186,6 +5337,8 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
     Sets the model for the target ChatView session (or window default).
     """
     def run(self, model, level=None, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         if not model:
             return
         model = model.strip()
@@ -5241,7 +5394,12 @@ class TermChatSetModelCommand(sublime_plugin.WindowCommand):
 
         update_agent_model_status(self.window)
 
+    def is_enabled(self, model=None, level=None, view_id=None):
+        return not _subagent_session_is_target(self.window, view_id)
+
     def input(self, args):
+        if _block_subagent_command(self.window, args.get("view_id")):
+            return None
         if "model" in args:
             return None
 
@@ -5441,6 +5599,8 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
         return {}
 
     def run(self, level=None, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         if not level:
             return
         level = level.strip()
@@ -5462,7 +5622,12 @@ class TermChatSetThinkLevelCommand(sublime_plugin.WindowCommand):
 
         update_agent_model_status(self.window)
 
+    def is_enabled(self, level=None, view_id=None):
+        return not _subagent_session_is_target(self.window, view_id)
+
     def input(self, args):
+        if _block_subagent_command(self.window, args.get("view_id")):
+            return None
         if "level" in args:
             return None
 
@@ -5567,6 +5732,8 @@ class TermChatApproveModeInputHandler(sublime_plugin.ListInputHandler):
 class TermChatSetApproveModeCommand(sublime_plugin.WindowCommand):
     """Set permission approve mode for the target ChatView session."""
     def run(self, mode, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         chat_threads.set_setting_for_session(self.window, session, CHAT_APPROVE_MODE, mode)
         sublime.status_message(f"Approve mode set to: {mode}")
@@ -5583,7 +5750,12 @@ class TermChatSetApproveModeCommand(sublime_plugin.WindowCommand):
             elif agent == "antigravity":
                 LOG.info("Updated Antigravity approve mode without reconnecting")
 
+    def is_enabled(self, mode=None, view_id=None):
+        return not _subagent_session_is_target(self.window, view_id)
+
     def input(self, args):
+        if _block_subagent_command(self.window, args.get("view_id")):
+            return None
         if "mode" not in args:
             view_id = args.get("view_id")
             session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
@@ -5599,6 +5771,8 @@ class TermChatTogglePlanModeCommand(sublime_plugin.WindowCommand):
     Toggle plan mode for the target ChatView session.
     """
     def run(self, mode, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         if chat_threads.get_setting_for_session(self.window, session, CHAT_PLAN_MODE) == mode:
             return
@@ -5613,7 +5787,12 @@ class TermChatTogglePlanModeCommand(sublime_plugin.WindowCommand):
 
         sublime.status_message(f"Plan mode set to: {plan_mode.value}")
 
+    def is_enabled(self, mode=None, view_id=None):
+        return not _subagent_session_is_target(self.window, view_id)
+
     def input(self, args):
+        if _block_subagent_command(self.window, args.get("view_id")):
+            return None
         if "mode" not in args:
             view_id = args.get("view_id")
             session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
@@ -5629,6 +5808,8 @@ class TermChatPermissionActionCommand(sublime_plugin.WindowCommand):
     Handle permission actions from the phantom UI.
     """
     def run(self, action, request_id, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         if not session or request_id not in session.permission_decisions:
             for candidate in chatview_sessions.values():
@@ -5644,6 +5825,8 @@ class TermChatImplementPlanCommand(sublime_plugin.WindowCommand):
     Trigger the 'Implement the plan.' steering message.
     """
     def run(self, view_id=None):
+        if _block_subagent_command(self.window, view_id):
+            return
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         if session:
             sublime.status_message("Implementing plan...")

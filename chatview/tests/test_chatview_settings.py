@@ -3,7 +3,7 @@ import os
 import sys
 import types
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if repo_dir not in sys.path:
@@ -119,6 +119,31 @@ class TestChatViewSettings(unittest.TestCase):
                 )
 
             self._assert_default_view_settings(settings)
+
+    def test_create_subagent_view_marks_readonly_after_welcome_text(self):
+        window = MagicMock()
+        window.id.return_value = 1
+        window.folders.return_value = []
+        window.settings.return_value = _FakeViewSettings()
+        chat_view, settings = _make_fake_view(view_id=31, window=window)
+        window.new_file.return_value = chat_view
+
+        app_settings = _FakeViewSettings({"share_workspace_folders": False})
+        with patch.object(chatview_mod.sublime, "load_settings", return_value=app_settings), \
+             patch.object(chatview_mod, "ChatSession") as mock_session_cls, \
+             patch.object(chatview_mod, "update_agent_model_status"):
+            mock_session_cls.return_value.role = SessionRole.TASK
+            chatview_mod._create_chat_view_and_session(
+                window, role=SessionRole.TASK, cwd="/tmp", subagent=True
+            )
+
+        self.assertIs(settings.get(chatview_mod.CHAT_VIEW_SUBAGENT), True)
+        appended = "".join(
+            call.args[1]["characters"]
+            for call in chat_view.run_command.call_args_list
+            if call.args[0] == "append"
+        )
+        self.assertIn("Read-only subagent session history.", appended)
 
     def test_reconnect_chat_view_applies_default_settings(self):
         window = MagicMock()
@@ -244,6 +269,196 @@ class TestModelPanelThinkTag(unittest.TestCase):
 
         self.assertIn("&lt;high&gt;", panel_html)
         self.assertNotIn("<high>", panel_html)
+
+
+class TestModelPanelSubagentTag(unittest.TestCase):
+    """The Subagent tag reports launched tasks and opens the resume picker."""
+
+    def setUp(self):
+        chat_threads.clear()
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _render(self, subagent_keys=(), read_only=False):
+        initial_settings = (
+            {chatview_mod.CHAT_VIEW_SUBAGENT: True} if read_only else None
+        )
+        view, _ = _make_fake_view(view_id=88, initial_settings=initial_settings)
+        window = MagicMock()
+        window.id.return_value = 3
+        panel = chatview_mod.ModelPanel(view, window)
+
+        session = MagicMock()
+        session.subagent_tool_keys = set(subagent_keys)
+        sessions = MagicMock()
+        sessions.get.return_value = session
+        sessions.values.return_value = []
+
+        values = {
+            chatview_mod.CHAT_PLAN_MODE: chatview_mod.PlanMode.FAST.value,
+            chatview_mod.CHAT_AGENT: "opencode",
+            "chatview_model_opencode": "opencode/gpt-6.2-astra",
+        }
+
+        def fake_setting(_window, _session, key, default=None):
+            return values.get(key, default)
+
+        with patch.object(chatview_mod, "chatview_sessions", sessions), \
+             patch.object(
+                 chatview_mod.chat_threads,
+                 "get_setting_for_session",
+                 side_effect=fake_setting,
+             ), \
+             patch.object(chatview_mod.chat_threads, "set_setting_for_session"), \
+             patch.object(chatview_mod, "get_input_start", return_value=0), \
+             patch.object(chatview_mod.sublime, "Phantom") as phantom_cls:
+            panel.update()
+
+        return panel, view, window, phantom_cls.call_args.args[1]
+
+    def test_subagent_tag_matches_task_tag_style(self):
+        _panel, _view, _window, panel_html = self._render(
+            subagent_keys=["task-1", "task-2"]
+        )
+
+        tag_start = panel_html.index('href="show_subagents"')
+        tag_end = panel_html.index("</a>", tag_start)
+        tag = panel_html[tag_start:tag_end]
+        self.assertIn('class="model-tag"', tag)
+        self.assertIn('<span class="label">Subagent</span>', tag)
+        self.assertIn('<span class="thread-count">+2</span>', tag)
+        self.assertNotIn("icon", tag)
+
+    def test_subagent_tag_hidden_without_launched_tasks(self):
+        _panel, _view, _window, panel_html = self._render()
+
+        self.assertNotIn('href="show_subagents"', panel_html)
+
+    def test_navigate_opens_resume_command_with_subagent_flag(self):
+        panel, view, window, _panel_html = self._render(
+            subagent_keys=["task-1"]
+        )
+        window.run_command.reset_mock()
+
+        panel._on_navigate("show_subagents")
+
+        window.run_command.assert_called_once_with(
+            "term_chat_resume_session",
+            {"view_id": view.id(), "subagent": True},
+        )
+
+    def test_read_only_view_has_no_clickable_model_buttons(self):
+        _panel, _view, _window, panel_html = self._render(read_only=True)
+
+        self.assertNotIn("href=", panel_html)
+
+    def test_read_only_view_has_no_bottom_prompt_marker(self):
+        view, _ = _make_fake_view(
+            initial_settings={chatview_mod.CHAT_VIEW_SUBAGENT: True}
+        )
+        marker = chatview_mod.InputPromptMarker(view)
+        marker.phantom_set.update.reset_mock()
+
+        with patch.object(chatview_mod.sublime, "Phantom") as phantom_cls:
+            marker.update()
+
+        phantom_cls.assert_not_called()
+        marker.phantom_set.update.assert_called_once_with([])
+
+
+class TestSubagentReadOnlyCommands(unittest.TestCase):
+    """Mutating TermMate commands must be no-ops in a subagent view."""
+
+    def setUp(self):
+        chat_threads.clear()
+        self.view, _ = _make_fake_view(
+            view_id=99,
+            initial_settings={chatview_mod.CHAT_VIEW_SUBAGENT: True},
+        )
+        self.window = MagicMock()
+        self.window.active_view.return_value = self.view
+
+    def tearDown(self):
+        chat_threads.clear()
+
+    def _command(self, cls):
+        cmd = cls(self.window)
+        cmd.window = self.window
+        return cmd
+
+    def test_clear_session_is_blocked(self):
+        cmd = self._command(chatview_mod.TermChatClearSessionCommand)
+        with patch.object(chatview_mod, "_clear_chat_session") as clear:
+            cmd.run(view_id=99)
+        clear.assert_not_called()
+
+    def test_interrupt_is_blocked(self):
+        cmd = self._command(chatview_mod.TermChatInterruptCommand)
+        with patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session") as get_session:
+            cmd.run(view_id=99)
+        get_session.assert_not_called()
+
+    def test_set_model_is_blocked(self):
+        cmd = self._command(chatview_mod.TermChatSetModelCommand)
+        with patch.object(chatview_mod.chat_threads,
+                          "set_setting_for_session") as set_setting:
+            cmd.run("gpt-6", view_id=99)
+        set_setting.assert_not_called()
+
+    def test_quick_prompt_is_blocked(self):
+        cmd = self._command(chatview_mod.TermChatPromptCommand)
+        with patch.object(cmd, "_submit") as submit:
+            cmd.run(prompt="hello")
+        submit.assert_not_called()
+
+    def test_resume_from_subagent_view_is_blocked(self):
+        cmd = self._command(chatview_mod.TermChatResumeSessionCommand)
+        with patch.object(chatview_mod.threading, "Thread") as thread_cls:
+            cmd.run(subagent=True)
+        thread_cls.assert_not_called()
+
+
+class TestSubagentToolCounting(unittest.TestCase):
+    """Subagent tags count unique launches across providers."""
+
+    def test_record_deduplicates_by_tool_call_key(self):
+        session = MagicMock()
+        session.subagent_tool_keys = set()
+        record = chatview_mod.ChatSession.record_subagent_tool_call
+
+        record(session, "call-1", "Task")
+        record(session, "call-1", "Task")
+        record(session, "call-2", "agent")
+
+        self.assertEqual(session.subagent_tool_keys, {"call-1", "call-2"})
+        self.assertEqual(session.model_phantom.update.call_count, 2)
+
+    def test_processor_records_all_provider_tool_names(self):
+        session = MagicMock()
+        recorder = session.record_subagent_tool_call
+        processor = chatview_mod.BaseChatMessageProcessor(session)
+        blocks = (
+            {"name": "Agent"},
+            {"name": "Task"},
+            {"name": "agent"},
+            {"name": "task"},
+            {"name": "collabAgentToolCall", "tool": "spawnAgent"},
+            {"name": "dynamicToolCall", "tool": "spawnAgent"},
+        )
+
+        with patch.object(processor, "format_tool_call",
+                          return_value=("⏺ subagent", [])):
+            for index, block in enumerate(blocks):
+                processor.append_tool_call(block, key=f"call-{index}")
+            processor.append_tool_call({"name": "Read"}, key="read-1")
+
+        self.assertEqual(recorder.call_count, len(blocks))
+        for index, block in enumerate(blocks):
+            name = block.get("name") or block.get("tool")
+            recorder.assert_any_call(f"call-{index}", name)
+        self.assertNotIn(call("read-1", "Read"), recorder.call_args_list)
 
 
 class _FakeListInputItem:

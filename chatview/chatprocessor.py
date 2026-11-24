@@ -23,6 +23,20 @@ _DIFF_TOOL_NAMES = frozenset({
     "patch",
     "write",
 })
+_SUBAGENT_TOOL_NAMES = frozenset({
+    "Agent", "Task", "agent", "task",
+    "collabAgentToolCall", "spawnAgent",
+})
+
+
+def _is_subagent_tool(block):
+    """Return True for a tool call that launches a subagent task."""
+    if not isinstance(block, dict):
+        return False
+    return bool(
+        block.get("name") in _SUBAGENT_TOOL_NAMES
+        or block.get("tool") in _SUBAGENT_TOOL_NAMES
+    )
 
 
 def _is_windows_abs_path(path):
@@ -793,6 +807,10 @@ class BaseChatMessageProcessor:
         """
         is_update = self.has_tool_call(key)
         rendered, phantoms = self.format_tool_call(block, key=key)
+        if _is_subagent_tool(block):
+            recorder = getattr(self.session, "record_subagent_tool_call", None)
+            if recorder:
+                recorder(key or rendered, block.get("name") or block.get("tool"))
         if is_update and phantoms:
             for item in phantoms:
                 item["update"] = True
