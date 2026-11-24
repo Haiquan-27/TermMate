@@ -865,7 +865,11 @@ class BaseChatMessageProcessor:
         if _is_subagent_tool(block):
             recorder = getattr(self.session, "record_subagent_tool_call", None)
             if recorder:
-                recorder(key or rendered, block.get("name") or block.get("tool"))
+                recorder(
+                    key or rendered,
+                    block.get("name") or block.get("tool"),
+                    block.get("status"),
+                )
         if is_update and phantoms:
             for item in phantoms:
                 item["update"] = True
@@ -1026,6 +1030,7 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                                         or getattr(message, "id", None)
                                         or block.get("name"),
                                         block.get("name"),
+                                        block.get("status"),
                                     )
                             rendered, phantoms = self.format_tool_call(block)
                             self.append_content(
@@ -1346,6 +1351,9 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             self.append_content("", flush=True)
             self.ensure_trailing_newline()
             self.session.stop_loading()
+            if getattr(self.session, "subagent_tool_keys", None):
+                self.session.subagent_tool_keys.clear()
+                self.session.model_phantom.update()
             # If Codex plan mode produced a plan, open it in a new view
             if self._plan_text:
                 plan_text = self._plan_text
@@ -1627,6 +1635,9 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             # Keep ``_text_msg_id``: a background shell often resumes with a
             # new assistant message after the stop, which must get its own
             # paragraph instead of joining the previous one.
+            if getattr(self.session, "subagent_tool_keys", None):
+                self.session.subagent_tool_keys.clear()
+                self.session.model_phantom.update()
             if self._plan_text:
                 plan_text = self._plan_text
                 self._plan_text = ""
@@ -2422,6 +2433,9 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
             self.session.stop_loading()
             self.last_is_tool_call = False
             self._pending_tool_params.clear()
+            if getattr(self.session, "subagent_tool_keys", None):
+                self.session.subagent_tool_keys.clear()
+                self.session.model_phantom.update()
 
             # Dual-trigger final sync: scan and update any artifacts on disk
             self._sync_user_artifacts()

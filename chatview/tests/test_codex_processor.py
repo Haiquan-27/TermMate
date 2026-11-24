@@ -335,7 +335,7 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             )
 
         self.session.record_subagent_tool_call.assert_called_once_with(
-            "task_1", "task"
+            "task_1", "task", "running"
         )
         append.assert_any_call("\n", is_tool=True)
         append.assert_any_call("⏺ task\n", is_tool=True, tool_phantoms=None)
@@ -356,7 +356,7 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             )
 
         self.session.record_subagent_tool_call.assert_called_once_with(
-            "subagent_1", "subagent"
+            "subagent_1", "subagent", "running"
         )
         append.assert_any_call("⏺ subagent\n", is_tool=True, tool_phantoms=None)
 

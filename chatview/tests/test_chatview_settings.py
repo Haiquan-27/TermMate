@@ -435,6 +435,17 @@ class TestSubagentToolCounting(unittest.TestCase):
         self.assertEqual(session.subagent_tool_keys, {"call-1", "call-2"})
         self.assertEqual(session.model_phantom.update.call_count, 2)
 
+    def test_record_removes_terminal_subagent_tool_call(self):
+        session = MagicMock()
+        session.subagent_tool_keys = {"call-1", "call-2"}
+        record = chatview_mod.ChatSession.record_subagent_tool_call
+
+        record(session, "call-1", "Task", "completed")
+        self.assertEqual(session.subagent_tool_keys, {"call-2"})
+
+        record(session, "call-2", "agent", "failed")
+        self.assertEqual(session.subagent_tool_keys, set())
+
     def test_processor_records_all_provider_tool_names(self):
         session = MagicMock()
         recorder = session.record_subagent_tool_call
@@ -459,8 +470,11 @@ class TestSubagentToolCounting(unittest.TestCase):
         self.assertEqual(recorder.call_count, len(blocks))
         for index, block in enumerate(blocks):
             name = block.get("name") or block.get("tool")
-            recorder.assert_any_call(f"call-{index}", name)
-        self.assertNotIn(call("read-1", "Read"), recorder.call_args_list)
+            recorder.assert_any_call(f"call-{index}", name, block.get("status"))
+        self.assertNotIn(
+            call("read-1", "Read", None),
+            recorder.call_args_list,
+        )
 
     def test_claude_direct_tool_render_counts_subagent(self):
         session = MagicMock()
@@ -481,7 +495,7 @@ class TestSubagentToolCounting(unittest.TestCase):
             processor.handle_message(message)
 
         session.record_subagent_tool_call.assert_called_once_with(
-            "claude-agent-1", "Agent"
+            "claude-agent-1", "Agent", None
         )
 
 

@@ -900,6 +900,44 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[0].content, "这次换个测法：5 个并发")
         self.assertEqual(self.agent._plan_text, "")
 
+    async def test_v2_plan_text_flushes_before_subagent_tool(self):
+        self.agent._turn_plan_mode = True
+        self.agent._plan_text = "先说明一下。"
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "subagent_1",
+                "name": "subagent",
+                "input": {"description": "Search repo"},
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.type for m in messages], ["plan_delta", "tool_use"])
+        self.assertEqual(messages[0].content, "先说明一下。")
+        self.assertEqual(messages[1].content["name"], "subagent")
+
+    async def test_v2_plan_text_flushes_before_subagent_text(self):
+        self.agent._turn_plan_mode = True
+        self.agent._plan_text = "先说明一下。"
+        self.agent._child_parent_sessions["ses_child"] = "ses_v2"
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_child",
+                "messageID": "msg_child",
+                "partID": "part_child",
+                "field": "text",
+                "delta": "child answer",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual([m.type for m in messages], ["plan_delta", "subagent_text"])
+        self.assertEqual(messages[0].content, "先说明一下。")
+        self.assertEqual(messages[1].content, "child answer")
+
     async def test_v2_subagent_text_from_child_session_is_visible(self):
         await self.agent._dispatch_event({
             "type": "session.text.delta",

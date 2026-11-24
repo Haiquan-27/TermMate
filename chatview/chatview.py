@@ -2165,9 +2165,23 @@ class ChatSession:
             return
         view.settings().set(CHAT_SESSION_ID, session_id)
 
-    def record_subagent_tool_call(self, key, name):
-        """Remember one subagent launch without counting repeated updates."""
+    def record_subagent_tool_call(self, key, name, status=None):
+        """Track active subagent tool calls for the model phantom tag.
+
+        Running/pending calls add to the count; terminal statuses remove them so
+        the tag disappears when all launched subagents have finished.
+        """
         identifier = str(key or f"{name}:{len(self.subagent_tool_keys)}")
+        terminal = str(status or "").lower() in {
+            "completed", "failed", "error", "cancelled", "interrupted",
+            "success", "done",
+        }
+        if terminal:
+            if identifier not in self.subagent_tool_keys:
+                return
+            self.subagent_tool_keys.discard(identifier)
+            self.model_phantom.update()
+            return
         if identifier in self.subagent_tool_keys:
             return
         self.subagent_tool_keys.add(identifier)
@@ -4920,12 +4934,25 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
             # A newer invocation superseded this one; don't open a stale panel.
             if rid != getattr(self, "_resume_request_id", 0):
                 return
+            if subagent:
+                filtered = []
+                for s in sessions or []:
+                    parent_id = s.get("parent_id") or s.get("parentID")
+                    if not parent_id:
+                        continue
+                    if current_session_id and str(parent_id) != str(current_session_id):
+                        continue
+                    filtered.append(s)
+                sessions = filtered
             if not sessions:
-                if error:
+                if error and not subagent:
                     detail = " ".join(str(error).split())
                     sublime.status_message(f"[{agent}] Session lookup failed: {detail}")
                 else:
-                    sublime.status_message("No past sessions found for this workspace")
+                    sublime.status_message(
+                        "No subagent sessions found for this session"
+                        if subagent else "No past sessions found for this workspace"
+                    )
                 return
 
             normalized_cwd = self._normalized_dir(cwd)

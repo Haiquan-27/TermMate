@@ -2286,6 +2286,7 @@ class OpenCodeAgent(BaseAgent):
         if content.get("name") == "command_execution" and not content.get("command"):
             return
         self._running_tools.add(part_id)
+        await self._flush_plan_text()
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=part_id
         ))
@@ -2313,6 +2314,9 @@ class OpenCodeAgent(BaseAgent):
         if not delta:
             return
         if subagent:
+            # Parent plan text should appear before child activity from the
+            # same turn, otherwise the subagent prefix lands first.
+            await self._flush_plan_text()
             await self._message_queue.put(Message(
                 MessageType.SUBAGENT_TEXT.value, content=delta, msg_id=msg_id,
                 thread_id=thread_id or msg_id,
@@ -2330,6 +2334,7 @@ class OpenCodeAgent(BaseAgent):
         """[OpenCode v1] Convert completed tool part into MessageType.TOOL_USE."""
         raw_name = str(part.get("tool") or "tool")
         content = _tool_content_from_state(raw_name, state)
+        await self._flush_plan_text()
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=part.get("id")
         ))
@@ -2352,6 +2357,7 @@ class OpenCodeAgent(BaseAgent):
         if content.get("name") == "command_execution" and not content.get("command"):
             return
         self._running_tools.add(tool_id)
+        await self._flush_plan_text()
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=tool_id
         ))
@@ -2382,6 +2388,7 @@ class OpenCodeAgent(BaseAgent):
                 result = "completed" if int(exit_code or 0) == 0 else "failed"
             except (TypeError, ValueError):
                 result = "completed"
+        await self._flush_plan_text()
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value,
             content={
@@ -2608,6 +2615,7 @@ class OpenCodeAgent(BaseAgent):
             "metadata=%r", tool_id, raw_name, status, shell_id, background,
             metadata)
         content = _tool_content_from_state(raw_name, state)
+        await self._flush_plan_text()
         await self._message_queue.put(Message(
             MessageType.TOOL_USE.value, content=content, msg_id=tool_id
         ))
@@ -3852,6 +3860,7 @@ def list_opencode_sessions(
                 "summary": session.get("title") or session["id"][:8],
                 "mtime": mtime,
                 "directory": directory,
+                "parent_id": session.get("parentID") or session.get("parent_id"),
             })
         return sorted(result, key=lambda item: item["mtime"], reverse=True)
 
