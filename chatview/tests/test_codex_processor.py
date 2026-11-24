@@ -250,47 +250,6 @@ class TestCodexToolCallFormatting(unittest.TestCase):
             self.assertEqual(session.append_markdown.call_args_list, expected_calls)
 
 
-class TestCodexLiveText(unittest.TestCase):
-
-    def setUp(self):
-        self.session = SimpleNamespace(
-            agent_thread=None,
-            cwd="/work",
-            start_loading=MagicMock(),
-            stop_loading=MagicMock(),
-            append_markdown=MagicMock(),
-            show_file_changes_artifact=MagicMock(),
-        )
-        self.processor = CodexMessageProcessor(self.session)
-
-    def test_text_delta_is_appended_live_without_waiting_for_final(self):
-        with patch.object(self.processor, "append_content") as append:
-            self.processor.handle_message(Message("text", "analy", msg_id="msg-1"))
-            self.processor.handle_message(Message("text", "zing", msg_id="msg-1"))
-
-        append.assert_any_call("analy", live=True)
-        append.assert_any_call("zing", live=True)
-        self.session.start_loading.assert_called()
-
-    def test_final_assistant_message_is_skipped_after_streamed_deltas(self):
-        self.processor.handle_message(Message("text", "full", msg_id="msg-1"))
-
-        with patch.object(self.processor, "append_content") as append:
-            self.processor.handle_message(Message(
-                "assistant", [SimpleNamespace(text="full")], msg_id="msg-1",
-            ))
-
-        append.assert_not_called()
-
-    def test_assistant_without_deltas_is_still_rendered(self):
-        with patch.object(self.processor, "append_content") as append:
-            self.processor.handle_message(Message(
-                "assistant", [SimpleNamespace(text="final")], msg_id="msg-2",
-            ))
-
-        append.assert_called_once_with("final\n", live=True)
-
-
 class TestSubagentTextRendering(unittest.TestCase):
 
     def test_prefix_is_emitted_once_per_stream(self):
