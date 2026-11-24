@@ -368,6 +368,24 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         self.session.start_loading.assert_called_once_with(text="compacting")
         self.session.stop_loading.assert_not_called()
 
+    @patch("chatview.chatprocessor.sublime.set_timeout", side_effect=lambda fn, delay: fn())
+    def test_plan_delta_renders_immediately_and_button_only_on_stop(self, _set_timeout):
+        self.session.agent_thread = MagicMock()
+        self.session.agent_thread.anthropic_config = {"plan_mode": True}
+        self.session.show_implement_plan_button = MagicMock()
+
+        with patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(Message(
+                "plan_delta", "先说明一下。"
+            ))
+            self.processor.handle_message(Message("stop"))
+
+        contents = [entry.args[0] for entry in append.call_args_list if entry.args]
+        self.assertIn("先说明一下。", contents)
+        # Rendered incrementally, so stop should not append the plan text again.
+        self.assertEqual(contents.count("先说明一下。"), 1)
+        self.session.show_implement_plan_button.assert_called_once_with("先说明一下。")
+
     def test_manual_compaction_renders_notice_and_stops_loading(self):
         with patch.object(self.processor, "append_content") as append:
             self.processor.handle_message(Message(

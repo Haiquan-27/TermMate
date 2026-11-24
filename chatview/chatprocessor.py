@@ -391,6 +391,7 @@ class BaseChatMessageProcessor:
         self.session = session
         self.last_is_tool_call = False
         self._plan_text = ""
+        self._plan_text_rendered = False
         self._tool_file_re = _make_tool_file_re(self._TOOL_FILE_NAMES) if self._TOOL_FILE_NAMES else None
         self._ends_with_newline = True
         # Message ids whose "Subagent" prefix has already been emitted.
@@ -1332,6 +1333,11 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             content = message.content if isinstance(message.content, str) else ""
             if content:
                 self._plan_text += content
+                if self.last_is_tool_call and not content.startswith(("\n", "\r\n")):
+                    self.append_content("\n")
+                self.last_is_tool_call = False
+                self.append_content(content, live=True)
+                self._plan_text_rendered = True
 
         elif message.type == "turn_started":
             # Extract turnId if available
@@ -1341,6 +1347,8 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             uuid_to_store = turn_id or (str(turn_index) if turn_index is not None else None)
             if uuid_to_store is not None:
                 self.session.update_last_prompt_uuid(str(uuid_to_store))
+            self._plan_text = ""
+            self._plan_text_rendered = False
             self.session.start_loading()
 
         elif message.type in ("thinking", "text"):
@@ -1358,14 +1366,19 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             if self._plan_text:
                 plan_text = self._plan_text
                 self._plan_text = ""
+                rendered = self._plan_text_rendered
+                self._plan_text_rendered = False
 
-                self.append_content("\n")
-                self.append_content(plan_text)
-                self.append_content("\n", flush=True)
+                if not rendered:
+                    self.append_content("\n")
+                    self.append_content(plan_text)
+                    self.append_content("\n", flush=True)
 
                 # Add Implement button if in plan mode
                 if self.session.agent_thread and self.session.agent_thread.anthropic_config.get("plan_mode"):
                     sublime.set_timeout(lambda pt=plan_text: self.session.show_implement_plan_button(pt), 0)
+            else:
+                self._plan_text_rendered = False
             # Show the artifact last so later appends don't land at its fold boundary
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
@@ -1614,11 +1627,26 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             content = message.content if isinstance(message.content, str) else ""
             if content:
                 self._plan_text += content
+                if self.last_is_tool_call and not content.startswith(("\n", "\r\n")):
+                    self.append_content("\n")
+                self.last_is_tool_call = False
+                self.append_content(content, live=True)
+                self._plan_text_rendered = True
+                raw = content.replace("\r", "")
+                trailing = len(raw) - len(raw.rstrip("\n"))
+                if trailing == len(raw):
+                    self._text_trailing_newlines = min(
+                        2, self._text_trailing_newlines + trailing
+                    )
+                else:
+                    self._text_trailing_newlines = min(2, trailing)
         elif message.type == "turn_started":
             self._active_turn_id = None
             self.last_is_tool_call = False
             self._text_trailing_newlines = 1
             self._text_msg_id = None
+            self._plan_text = ""
+            self._plan_text_rendered = False
             self.session.start_loading()
         elif message.type == "user_message_id":
             content = message.content if isinstance(message.content, dict) else {}
@@ -1641,15 +1669,20 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             if self._plan_text:
                 plan_text = self._plan_text
                 self._plan_text = ""
-                self.append_content("\n")
-                self.append_content(plan_text)
-                self.append_content("\n", flush=True)
+                rendered = self._plan_text_rendered
+                self._plan_text_rendered = False
+                if not rendered:
+                    self.append_content("\n")
+                    self.append_content(plan_text)
+                    self.append_content("\n", flush=True)
                 if (self.session.agent_thread
                         and self.session.agent_thread.anthropic_config.get("plan_mode")):
                     sublime.set_timeout(
                         lambda pt=plan_text: self.session.show_implement_plan_button(pt),
                         0,
                     )
+            else:
+                self._plan_text_rendered = False
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
     def apply_shell_finished(self, command, failed=False, output="",
