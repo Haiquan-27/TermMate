@@ -1,11 +1,13 @@
 import asyncio
 import json
+import os
 import signal
 import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import genfoundry.opencode_agent as opencode_agent
 from genfoundry.base_agent import AgentOptions, BaseAgent, SlashCommand
 from genfoundry.opencode_agent import (
     OpenCodeAgent,
@@ -690,6 +692,37 @@ class TestOpenCodeVersionDetection(unittest.TestCase):
                 "builtins.open", unittest.mock.mock_open(read_data=fake_json)
             ):
                 self.assertEqual(find_opencode_v2_password(), "secret_v2_password")
+
+    def test_finds_windows_user_state_service_json(self):
+        """OpenCode on Windows writes service.json under ~\\.local\\state."""
+        home = os.path.join("C:" + os.sep, "Users", "tester")
+        expected = os.path.join(home, ".local", "state", "opencode", "service.json")
+        fake_json = json.dumps({
+            "url": "http://127.0.0.1:28894/",
+            "password": "user_state_password",
+        })
+        env = {
+            "APPDATA": os.path.join("C:" + os.sep, "AppData", "Roaming"),
+            "LOCALAPPDATA": os.path.join("C:" + os.sep, "AppData", "Local"),
+        }
+
+        def only_user_state(path):
+            return os.path.normcase(path) == os.path.normcase(expected)
+
+        with patch.object(opencode_agent.sys, "platform", "win32"), \
+             patch.object(opencode_agent.os.path, "expanduser", return_value=home), \
+             patch.object(
+                 opencode_agent, "get_termmate_opencode_state_dir",
+                 return_value=os.path.join("C:" + os.sep, "Temp", "private"),
+             ), \
+             patch.object(opencode_agent.os.path, "isfile", side_effect=only_user_state), \
+             patch("builtins.open", unittest.mock.mock_open(read_data=fake_json)):
+            service = find_opencode_v2_service(env)
+            password = find_opencode_v2_password(env)
+
+        self.assertEqual(service["url"], "http://127.0.0.1:28894")
+        self.assertEqual(service["password"], "user_state_password")
+        self.assertEqual(password, "user_state_password")
 
 
 class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
@@ -1923,6 +1956,40 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
         self.assertEqual(sessions[0]["session_id"], "ses_v1")
         self.assertEqual(sessions[0]["summary"], "V1 Session")
         self.assertEqual(sessions[0]["mtime"], 1600000000.0)
+
+    def test_list_opencode_sessions_falls_back_to_all_directories(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:49374", password="pwd")
+        other = [{
+            "id": "ses_other",
+            "title": "Other workspace",
+            "time": {"updated": 1700000020000},
+            "directory": "/other/workspace",
+        }]
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            return [] if cwd else other
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls, \
+             patch("genfoundry.opencode_agent._sync_request",
+                   side_effect=fake_request) as request:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            sessions = list_opencode_sessions(
+                "/workspace", include_all_on_empty=True
+            )
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["session_id"], "ses_other")
+        self.assertEqual(sessions[0]["directory"], "/other/workspace")
+        self.assertEqual(request.call_args_list[0].args[2], "/workspace")
+        self.assertIsNone(request.call_args_list[1].args[2])
+
+    def test_list_opencode_sessions_reports_lookup_errors(self):
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer",
+                   side_effect=RuntimeError("OpenCode service is unavailable")):
+            sessions = list_opencode_sessions("/workspace")
+
+        self.assertEqual(sessions, [])
+        self.assertEqual(sessions.error, "OpenCode service is unavailable")
 
     def test_get_opencode_session_info_v2_descending_messages(self):
         mock_server = SimpleNamespace(url="http://127.0.0.1:49374", password="pwd")

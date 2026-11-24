@@ -89,8 +89,10 @@ class TestResumeSessionAsyncLoading(unittest.TestCase):
 
         with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
              patch.object(chatview_mod.sublime, "set_timeout",
-                          side_effect=lambda fn, delay=0: fn()):
-            cmd.run()
+                          side_effect=lambda fn, delay=0: fn()), \
+             patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session", return_value=None):
+            cmd.run(view_id=24)
 
             # Loading has been scheduled but not executed on the UI thread.
             cmd._load_sessions.assert_not_called()
@@ -102,6 +104,7 @@ class TestResumeSessionAsyncLoading(unittest.TestCase):
         cmd._load_sessions.assert_called_once_with(
             "opencode", "/work", chatview_mod.sublime.load_settings.return_value
         )
+        cmd._get_cwd.assert_called_once_with(None, view_id=24)
         window.show_quick_panel.assert_called_once()
         items = window.show_quick_panel.call_args.args[0]
         self.assertEqual(len(items), 2)
@@ -148,6 +151,87 @@ class TestResumeSessionAsyncLoading(unittest.TestCase):
         window.show_quick_panel.assert_not_called()
         status.assert_any_call("No past sessions found for this workspace")
 
+    def test_lookup_error_shows_distinct_status(self):
+        cmd, window = _make_command()
+
+        class _FailedSessions(list):
+            pass
+
+        failed = _FailedSessions()
+        failed.error = "OpenCode service is unavailable; start 'opencode serve'"
+        cmd._load_sessions = MagicMock(return_value=failed)
+        threads = _CapturedThreads()
+
+        with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
+             patch.object(chatview_mod.sublime, "set_timeout",
+                          side_effect=lambda fn, delay=0: fn()), \
+             patch.object(chatview_mod.sublime, "status_message") as status:
+            cmd.run()
+            threads.targets[0].target()
+
+        window.show_quick_panel.assert_not_called()
+        status.assert_any_call(
+            "[opencode] Session lookup failed: "
+            "OpenCode service is unavailable; start 'opencode serve'"
+        )
+
+
+class TestResumeCwdResolution(unittest.TestCase):
+    def _bare_command(self):
+        window = MagicMock()
+        window.settings.return_value.get.side_effect = (
+            lambda key, default=None: (
+                "/workspace" if key == chatview_mod.CHAT_WORKSPACE else default
+            )
+        )
+        cmd = chatview_mod.TermChatResumeSessionCommand(window)
+        cmd.window = window
+        return cmd, window
+
+    def test_chat_view_id_uses_that_chat_views_cwd(self):
+        cmd, window = self._bare_command()
+        chat_view = MagicMock()
+        chat_view.id.return_value = 24
+        active_view = MagicMock()
+        active_view.id.return_value = 17
+        active_view.file_name.return_value = "/active/file.txt"
+        window.views.return_value = [active_view, chat_view]
+        window.active_view.return_value = active_view
+
+        with patch.object(chatview_mod, "is_chat_view",
+                          side_effect=lambda view: view is chat_view), \
+             patch.object(chatview_mod, "get_best_dir",
+                          return_value="/chat-cwd") as best_dir:
+            cwd = cmd._get_cwd(MagicMock(), view_id=24)
+
+        self.assertEqual(cwd, "/chat-cwd")
+        best_dir.assert_called_once_with(chat_view)
+
+    def test_open_file_wins_over_primary_session_and_workspace(self):
+        cmd, window = self._bare_command()
+        view = MagicMock()
+        view.id.return_value = 24
+        file_path = os.path.abspath(os.path.join("workspace", "file.txt"))
+        view.file_name.return_value = file_path
+        window.active_view.return_value = view
+
+        with patch.object(chatview_mod, "is_chat_view", return_value=False):
+            cwd = cmd._get_cwd(MagicMock(), view_id=24)
+
+        self.assertEqual(cwd, os.path.dirname(file_path))
+
+    def test_no_open_file_falls_back_to_window_workspace(self):
+        cmd, window = self._bare_command()
+        view = MagicMock()
+        view.file_name.return_value = None
+        window.active_view.return_value = view
+
+        with patch.object(chatview_mod, "is_chat_view", return_value=False), \
+             patch.object(chatview_mod.os.path, "isdir", return_value=True):
+            cwd = cmd._get_cwd(MagicMock(), view_id=24)
+
+        self.assertEqual(cwd, "/workspace")
+
 
 class TestResumeSelectOpensNewTab(unittest.TestCase):
     def setUp(self):
@@ -166,10 +250,13 @@ class TestResumeSelectOpensNewTab(unittest.TestCase):
             lambda k, v: self.new_view_settings.__setitem__(k, v)
         )
 
-    def _select(self, cmd, window, index=0):
-        cmd._load_sessions = MagicMock(return_value=list(_SESSIONS))
+    def _select(self, cmd, window, index=0, sessions=None, return_items=False):
+        if sessions is None:
+            sessions = list(_SESSIONS)
+        cmd._load_sessions = MagicMock(return_value=sessions)
         threads = _CapturedThreads()
         on_select = _open_panel(cmd, window, threads)
+        items = window.show_quick_panel.call_args.args[0]
         with patch.object(chatview_mod.chat_threads, "get_active_or_primary_session",
                           return_value=self.old_session), \
              patch.object(chatview_mod.TermChatNewThreadCommand,
@@ -179,6 +266,8 @@ class TestResumeSelectOpensNewTab(unittest.TestCase):
              patch.object(chatview_mod.chat_threads, "sessions",
                           {777: self.new_session}):
             on_select(index)
+        if return_items:
+            return create, items
         return create
 
     def test_select_opens_new_task_tab_bound_to_chosen_session(self):
@@ -223,6 +312,25 @@ class TestResumeSelectOpensNewTab(unittest.TestCase):
         cmd, window = _make_command()
         create = self._select(cmd, window, index=0)
         create.assert_called_once()
+
+    def test_other_directory_session_shows_directory_and_resumes_there(self):
+        cmd, window = _make_command()
+        sessions = [{
+            "session_id": "ses_other",
+            "summary": "other workspace",
+            "mtime": 1700000200,
+            "directory": "/other/workspace",
+        }]
+        create, items = self._select(
+            cmd, window, sessions=sessions, return_items=True
+        )
+
+        self.assertIn("[/other/workspace]", items[0][1])
+        self.assertEqual(create.call_args.kwargs["cwd"], "/other/workspace")
+        self.new_session._fetch_resume_history_async.assert_called_once_with(
+            "opencode", "ses_other", "/other/workspace",
+            history_limit=0, render_full=True,
+        )
 
 
 class TestFetchResumeHistoryAsync(unittest.TestCase):

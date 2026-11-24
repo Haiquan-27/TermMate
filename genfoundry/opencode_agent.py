@@ -39,6 +39,18 @@ from .base_agent import (
 
 LOG = logging.getLogger("TermMate")
 
+
+class OpenCodeSessionList(list):
+    """Session list that can carry a non-fatal discovery error.
+
+    ``list_opencode_sessions`` keeps returning a plain-list-compatible value so
+    existing callers/tests are unaffected, while the chat view can surface a
+    connection failure instead of the misleading "no sessions" message.
+    """
+
+    error: Optional[str] = None
+
+
 #: TEMPORARY diagnostic channel for tool-row insertion.  Shares the logger
 #: and file handler with ``chatview.utils`` (same name), so only the module
 #: imported first installs the handler.
@@ -154,6 +166,10 @@ def find_opencode_v2_password(
 ) -> Optional[str]:
     """Search TermMate private state and default locations for OpenCode password."""
     source = {**os.environ, **(extra_env or {})}
+    for key in ("OPENCODE_SERVER_PASSWORD", "OPENCODE_PASSWORD"):
+        if source.get(key):
+            return str(source[key])
+
     home = os.path.expanduser("~")
     termmate_state = get_termmate_opencode_state_dir()
     candidates = [
@@ -164,12 +180,18 @@ def find_opencode_v2_password(
         candidates.append(os.path.join(custom_state, "opencode", "service.json"))
 
     if sys.platform == "win32":
-        appdata = os.environ.get("APPDATA")
-        localappdata = os.environ.get("LOCALAPPDATA")
+        appdata = source.get("APPDATA")
+        localappdata = source.get("LOCALAPPDATA")
         if appdata:
             candidates.append(os.path.join(appdata, "opencode", "service.json"))
         if localappdata:
             candidates.append(os.path.join(localappdata, "opencode", "service.json"))
+        # OpenCode on Windows honours the XDG layout under the user profile,
+        # not just APPDATA.  Its service.json normally lives here.
+        candidates.extend([
+            os.path.join(home, ".local", "state", "opencode", "service.json"),
+            os.path.join(home, ".config", "opencode", "service.json"),
+        ])
     else:
         config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
         state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state")
@@ -215,12 +237,19 @@ def find_opencode_v2_service(
 
     home = os.path.expanduser("~")
     if sys.platform == "win32":
-        localappdata = os.environ.get("LOCALAPPDATA")
-        appdata = os.environ.get("APPDATA")
+        localappdata = source.get("LOCALAPPDATA")
+        appdata = source.get("APPDATA")
         if localappdata:
             state_candidates.append(os.path.join(localappdata, "opencode", "service.json"))
         if appdata:
             state_candidates.append(os.path.join(appdata, "opencode", "service.json"))
+        # Real-world OpenCode installs on Windows write service.json to the
+        # XDG-style paths below.  Without these, every Sublime restart made
+        # resume unable to find the already running service.
+        state_candidates.extend([
+            os.path.join(home, ".local", "state", "opencode", "service.json"),
+            os.path.join(home, ".config", "opencode", "service.json"),
+        ])
     else:
         state_candidates.extend([
             os.path.join(home, ".local", "state", "opencode", "service.json"),
@@ -473,7 +502,9 @@ def get_sublime_opencode_server(
         return dict(active)
 
     env = dict(extra_env or {})
-    env["XDG_STATE_HOME"] = get_termmate_opencode_state_dir()
+    # Respect an explicitly supplied state directory; only default to the
+    # TermMate-private one when the caller did not choose one.
+    env.setdefault("XDG_STATE_HOME", get_termmate_opencode_state_dir())
 
     svc = ensure_opencode_v2_service(cli_path, env)
     if svc:
@@ -3664,7 +3695,10 @@ class _SyncOpenCodeServer:
             LOG.debug("Reusing Sublime OpenCode server at %s", self.url)
             return self
 
-        raise RuntimeError("Failed to connect to OpenCode server")
+        raise RuntimeError(
+            "OpenCode service is unavailable; start 'opencode serve' or check "
+            "the OpenCode CLI installation"
+        )
 
     def __exit__(self, exc_type, exc_value, traceback):
         if self._v1:
@@ -3720,43 +3754,78 @@ def list_opencode_sessions(
     cwd: Optional[str] = None,
     extra_env: Optional[Dict[str, str]] = None,
     cli_path: Optional[str] = None,
-) -> list:
-    """Return OpenCode sessions for a workspace, newest first."""
+    include_all_on_empty: bool = False,
+) -> OpenCodeSessionList:
+    """Return OpenCode sessions for a workspace, newest first.
+
+    OpenCode v2 filters ``/api/session`` by an exact ``directory`` match.  When
+    ``include_all_on_empty`` is set and that filter finds nothing, a second
+    unfiltered request supplies the full history so the resume picker can show
+    sessions created from parent/other workspaces.
+    """
+
+    def to_result(sessions: Any) -> List[Dict[str, Any]]:
+        result: List[Dict[str, Any]] = []
+        for session in sessions if isinstance(sessions, list) else []:
+            if not isinstance(session, dict) or not session.get("id"):
+                continue
+            time_dict = (
+                session.get("time") if isinstance(session.get("time"), dict) else {}
+            )
+            updated = (
+                time_dict.get("updated")
+                or time_dict.get("created")
+                or session.get("mtime")
+                or 0
+            )
+            mtime = float(updated)
+            if mtime > 100000000000:
+                mtime /= 1000.0
+            location = session.get("location")
+            directory = (
+                location.get("directory")
+                if isinstance(location, dict)
+                else session.get("directory")
+            )
+            result.append({
+                "session_id": session["id"],
+                "summary": session.get("title") or session["id"][:8],
+                "mtime": mtime,
+                "directory": directory,
+            })
+        return sorted(result, key=lambda item: item["mtime"], reverse=True)
+
     try:
         with _SyncOpenCodeServer(cwd, extra_env, cli_path) as server:
             path = "/session" if getattr(server, "version", 2) == 1 else "/api/session"
+            request_error: Optional[str] = None
             try:
                 sessions = _sync_request(
                     server.url, path, cwd, extra_env, server.password
                 )
-            except Exception:
+            except Exception as error:
                 sessions = None
+                request_error = str(error)
 
-            result = []
-            for session in sessions if isinstance(sessions, list) else []:
-                if not isinstance(session, dict) or not session.get("id"):
-                    continue
-                time_dict = (
-                    session.get("time") if isinstance(session.get("time"), dict) else {}
-                )
-                updated = (
-                    time_dict.get("updated")
-                    or time_dict.get("created")
-                    or session.get("mtime")
-                    or 0
-                )
-                mtime = float(updated)
-                if mtime > 100000000000:
-                    mtime /= 1000.0
-                result.append({
-                    "session_id": session["id"],
-                    "summary": session.get("title") or session["id"][:8],
-                    "mtime": mtime,
-                })
-            return sorted(result, key=lambda item: item["mtime"], reverse=True)
+            result = to_result(sessions)
+            if include_all_on_empty and not result and cwd:
+                try:
+                    all_sessions = _sync_request(
+                        server.url, path, None, extra_env, server.password
+                    )
+                    result = to_result(all_sessions)
+                    request_error = None
+                except Exception as error:
+                    request_error = str(error)
+
+            if request_error and not result:
+                raise RuntimeError(request_error)
+            return OpenCodeSessionList(result)
     except Exception as error:
         LOG.warning("list_opencode_sessions failed: %s", error)
-        return []
+        failure = OpenCodeSessionList()
+        failure.error = str(error)
+        return failure
 
 
 def _error_text_value(error: Any) -> str:

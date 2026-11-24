@@ -4621,9 +4621,45 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
 
     _PREVIEW_LEN = 80
 
-    def _get_cwd(self, session):
-        if session is not None:
-            return get_best_dir(session.chat_view)
+    @staticmethod
+    def _normalized_dir(path):
+        if not path:
+            return ""
+        try:
+            return os.path.normcase(os.path.abspath(path))
+        except Exception:
+            return str(path)
+
+    def _resolve_view(self, view_id=None):
+        """Resolve the view the command was invoked from."""
+        if view_id is not None:
+            try:
+                view_id = int(view_id)
+            except (TypeError, ValueError):
+                view_id = None
+        if view_id is not None:
+            for view in self.window.views():
+                if view.id() == view_id:
+                    return view
+        return self.window.active_view()
+
+    def _get_cwd(self, session, view_id=None):
+        """Choose the workspace for session discovery.
+
+        Priority:
+          1. an already-started chat view -> that view's own cwd
+          2. an open file -> the file's absolute directory
+          3. no open file -> the window workspace
+        """
+        view = self._resolve_view(view_id)
+        if view is not None and is_chat_view(view):
+            return get_best_dir(view)
+
+        if view is not None:
+            file_name = view.file_name()
+            if file_name:
+                return os.path.dirname(os.path.abspath(file_name))
+
         custom_cwd = self.window.settings().get(CHAT_WORKSPACE)
         if custom_cwd and os.path.isdir(custom_cwd):
             return custom_cwd
@@ -4649,6 +4685,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 cwd,
                 extra_env=settings.get("env", {}),
                 cli_path=settings.get("opencode_command") or None,
+                include_all_on_empty=True,
             )
         if agent == "antigravity":
             return list_antigravity_sessions(cwd)
@@ -4658,7 +4695,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
         import datetime
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         agent = self._get_agent(session)
-        cwd = self._get_cwd(session)
+        cwd = self._get_cwd(session, view_id=view_id)
         settings = sublime.load_settings(f"{PACKAGE_NAME}.sublime-settings")
 
         placeholder = f"[{agent}] Resume previous session"
@@ -4674,21 +4711,29 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
         sublime.status_message(f"[{agent}] Loading sessions…")
 
         def _load():
+            error = None
             try:
                 loaded = self._load_sessions(agent, cwd, settings)
+                error = getattr(loaded, "error", None)
             except Exception as exc:
                 LOG.warning("[resume] failed to list sessions: %s", exc)
                 loaded = []
-            sublime.set_timeout(lambda: _present(loaded, request_id), 0)
+                error = str(exc)
+            sublime.set_timeout(lambda: _present(loaded, request_id, error), 0)
 
-        def _present(sessions, rid):
+        def _present(sessions, rid, error=None):
             # A newer invocation superseded this one; don't open a stale panel.
             if rid != getattr(self, "_resume_request_id", 0):
                 return
             if not sessions:
-                sublime.status_message("No past sessions found for this workspace")
+                if error:
+                    detail = " ".join(str(error).split())
+                    sublime.status_message(f"[{agent}] Session lookup failed: {detail}")
+                else:
+                    sublime.status_message("No past sessions found for this workspace")
                 return
 
+            normalized_cwd = self._normalized_dir(cwd)
             items = []
             for s in sessions:
                 sid = s["session_id"]
@@ -4697,7 +4742,11 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                     summary = summary[:self._PREVIEW_LEN] + "…"
                 dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
                 marker = "  ●" if sid == current_session_id else ""
-                items.append([summary, f"{sid[:8]}  {dt}{marker}"])
+                subtitle = f"{sid[:8]}  {dt}{marker}"
+                directory = s.get("directory")
+                if directory and self._normalized_dir(directory) != normalized_cwd:
+                    subtitle += f"  [{directory}]"
+                items.append([summary, subtitle])
 
             def on_select(index):
                 if index < 0:
@@ -4705,6 +4754,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 chosen = sessions[index]
                 chosen_id = chosen["session_id"]
                 raw_title = chosen.get("summary") or ""
+                session_cwd = chosen.get("directory") or cwd
 
                 # A resume always gets its own tab: the current tab keeps its
                 # own session untouched.  Bind the new tab directly to the
@@ -4713,7 +4763,7 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 new_view = _create_chat_view_and_session(
                     self.window,
                     role=SessionRole.TASK,
-                    cwd=cwd,
+                    cwd=session_cwd,
                     session_id=chosen_id,
                     initial_title=raw_title,
                 )
@@ -4734,7 +4784,8 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 # session, including tool calls and shell output where the
                 # provider exposes them.  No resume banner or footer.
                 new_session._fetch_resume_history_async(
-                    agent, chosen_id, cwd, history_limit=0, render_full=True
+                    agent, chosen_id, session_cwd,
+                    history_limit=0, render_full=True,
                 )
 
                 sublime.status_message(f"Opened session {str(chosen_id)[:8]} in a new tab")
