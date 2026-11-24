@@ -86,9 +86,9 @@ _VERSION_RE = re.compile(
 _COMPACTION_TIMEOUT = 600.0
 
 # Slash commands advertised to the completion popup.  ``compact``, ``rename``
-# and ``fork`` are wired to their native endpoints; the remaining entries are
-# placeholders whose ``run_slash_command`` path keeps the raw text out of the
-# model prompt.
+# and ``fork`` run through their native endpoints here.  ``new`` and ``clear``
+# are handled by ChatSession (new tab / clear current tab) and are kept out of
+# the model prompt by returning False here.
 _OPENCODE_SLASH_COMMANDS = (
     SlashCommand("compact", "Compact the session"),
     SlashCommand("rename", "Rename the session"),
@@ -3010,8 +3010,8 @@ class OpenCodeAgent(BaseAgent):
     async def list_slash_commands(self) -> List[SlashCommand]:
         """Return the commands TermMate currently exposes for OpenCode.
 
-        Command execution is implemented one command at a time; unimplemented
-        entries still appear here so completion remains predictable.
+        ``new`` and ``clear`` are executed by ChatSession, but are advertised
+        here so completion remains predictable.
         """
         return list(_OPENCODE_SLASH_COMMANDS)
 

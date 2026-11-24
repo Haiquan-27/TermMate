@@ -215,7 +215,7 @@ Double-Click any artifact link in chat to open it in Sublime Text. Documents are
 
 **1. Clear Session**
 
-To reset the current conversation history and start a completely fresh context, open the command palette and run **`TermMate: Clear Session`**. This will reload the agent and clear its memory for the current workspace.
+To reset the current conversation history and start a completely fresh context, run **`TermMate: Clear Session`** from the command palette (or type **`/clear`** in the chat input). This clears the visible transcript and starts a fresh agent session; the current tab stays open.
 
 **2. Resume Previous Conversation**
 

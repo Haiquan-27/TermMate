@@ -2346,11 +2346,11 @@ class TestOpenCodeSlashCommands(unittest.IsolatedAsyncioTestCase):
             {"compact", "rename", "fork", "new", "clear"},
         )
 
-    async def test_placeholders_are_not_forwarded_to_the_model(self):
+    async def test_chat_session_commands_are_not_forwarded_to_the_model(self):
         agent = OpenCodeAgent(AgentOptions(cwd="."), version=2)
 
-        # /new is opened in a new tab by ChatSession, so the agent still does
-        # not consume it; /clear remains an unimplemented placeholder.
+        # /new opens a new tab and /clear resets the current tab; both are
+        # handled by ChatSession so the agent never consumes the raw text.
         self.assertFalse(await agent.run_slash_command("new", ""))
         self.assertFalse(await agent.run_slash_command("clear", ""))
 

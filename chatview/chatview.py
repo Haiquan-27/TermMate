@@ -2375,6 +2375,13 @@ class ChatSession:
             self._append_slash_notice(f"/new: {exc}", kind="error")
             return False
 
+    def _run_clear_command(self):
+        """Clear this tab's conversation and start a fresh provider session."""
+        if not self.agent_thread:
+            self._append_slash_notice("/clear is not available.", kind="warning")
+            return False
+        return self.reset_session()
+
     def run_slash_command(self, name, arguments=""):
         """Execute a slash command natively and report failures in the view.
 
@@ -2382,6 +2389,9 @@ class ChatSession:
         """
         if name == "new":
             return self._run_new_command()
+
+        if name == "clear":
+            return self._run_clear_command()
 
         if not self.agent_thread:
             self._append_slash_notice(f"/{name} is not available.", kind="warning")
@@ -2672,29 +2682,36 @@ class ChatSession:
         self.reload_agent(session_id_override=new_session_id, quiet=True)
 
     def reset_session(self):
-        """Reset the chat session by restarting the agent and notifying in UI."""
+        """Clear this tab and start a fresh provider session."""
         if not self.agent_thread:
-            return
+            return False
 
-        # Stop any ongoing loading animation
-        self.stop_loading()
-        self.token_usage = None
-        self.token_summary_phantom.clear()
-        self.clear_prompt_highlights()
-        self.artifact.clear()
+        # Drop every visible trace of the old turn before creating a new
+        # provider session.  _clear_transcript preserves the current input.
+        self._clear_transcript()
+        self.notice_phantom.clear()
+        self.rewind_confirm_panel.clear()
+        self.permission_panel.clear_all()
+        self.implement_plan_phantoms.update([])
+        self.permission_requests.clear()
+        self.pending_response_separator = False
+        if hasattr(self, "message_processor"):
+            self.message_processor._plan_text = ""
+
         self.session_allow_all = False
         self.has_sent_message = False
         self.chat_view.settings().set(CHAT_SESSION_ID, None)
         self.clear_thread_title()
 
-        # Show reset message in the history
         self.append_notice(f"{PACKAGE_NAME} session reset...", kind="info")
         cwd = get_best_dir(self.chat_view)
         if cwd:
             self.append_notice(f"cwd: {cwd}", kind="info")
 
-        # Reset the agent (disconnect and reconnect)
+        # OpenCode/Antigravity switch to a new server session in place; other
+        # providers reconnect.  The agent emits the new session id later.
         self.agent_thread.reset()
+        return True
 
     def switch_agent(self, new_agent_provider):
         """Stop the current agent thread and start a new one with the given provider."""
@@ -4590,20 +4607,16 @@ class TermChatSetWorkspaceCommand(sublime_plugin.WindowCommand):
 
 
 class TermChatClearSessionCommand(sublime_plugin.WindowCommand):
-    """
-    Clears the current chat session by disconnecting and reconnecting the agent.
-    This resets the conversation history similar to Claude Code's reset session.
-    """
+    """Run /clear for the active chat tab: clear history and start fresh."""
     def run(self, view_id=None):
         session = chat_threads.get_active_or_primary_session(self.window, view_id=view_id)
         if not session:
             sublime.status_message("No active ChatView session found")
             return
 
-        # Reset the session (disconnect and reconnect agent)
-        session.reset_session()
-        sublime.status_message("Resetting chat session...")
-        LOG.info("Resetting chat session via disconnect/reconnect")
+        if session.reset_session():
+            sublime.status_message("Clearing chat session...")
+            LOG.info("Cleared chat session via /clear")
 
     def is_enabled(self):
         # Only enable if there's an active or primary session
