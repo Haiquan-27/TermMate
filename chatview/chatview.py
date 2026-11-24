@@ -81,7 +81,7 @@ preferences_redraw_scheduled = False
 
 # Tool names used by supported providers when spawning a subagent / task.
 SUBAGENT_TOOL_NAMES = {
-    "Agent", "Task", "agent", "task",
+    "Agent", "Task", "Subagent", "agent", "task", "subagent",
     "collabAgentToolCall", "spawnAgent",
 }
 

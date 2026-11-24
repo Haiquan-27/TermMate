@@ -842,6 +842,64 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools[0].content["status"], "running")
         self.assertEqual(tools[1].content["status"], "completed")
 
+    async def test_v2_subagent_tool_running_row_is_emitted(self):
+        # OpenCode uses "subagent" as the real tool name.
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "subagent_1",
+                "name": "subagent",
+                "input": {"description": "Search repo"},
+            },
+        })
+
+        tools = [m for m in await self._messages() if m.type == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertEqual(tools[0].id, "subagent_1")
+        self.assertEqual(tools[0].content["name"], "subagent")
+        self.assertEqual(tools[0].content["status"], "running")
+
+    async def test_v2_subagent_tool_result_does_not_duplicate_child_text(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "assistantMessageID": "msg_v2_1",
+                "id": "subagent_done",
+                "name": "subagent",
+                "content": [{
+                    "type": "text",
+                    "text": '<subagent sessionID="ses_child" state="completed">'
+                            'full child answer</subagent>',
+                }],
+            },
+        })
+
+        tools = [m for m in await self._messages() if m.type == "tool_use"]
+        self.assertEqual(len(tools), 1)
+        self.assertIsNone(tools[0].content.get("output"))
+        self.assertEqual(tools[0].content["status"], "completed")
+
+    async def test_v2_failed_plan_turn_publishes_buffered_answer(self):
+        self.agent._turn_plan_mode = True
+        self.agent._plan_text = "这次换个测法：5 个并发"
+        await self.agent._dispatch_event({
+            "type": "session.execution.failed",
+            "data": {
+                "sessionID": "ses_v2",
+                "error": {"message": "Free usage limit reached"},
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual(
+            [m.type for m in messages],
+            ["plan_delta", "stop", "error"],
+        )
+        self.assertEqual(messages[0].content, "这次换个测法：5 个并发")
+        self.assertEqual(self.agent._plan_text, "")
+
     async def test_v2_subagent_text_from_child_session_is_visible(self):
         await self.agent._dispatch_event({
             "type": "session.text.delta",
@@ -2386,6 +2444,20 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
             "content": [{"type": "text", "text": "v2"}],
         })
         self.assertEqual(both["output"], "legacy")
+
+    def test_tool_content_from_state_suppresses_subagent_output(self):
+        from genfoundry.opencode_agent import _tool_content_from_state
+
+        block = _tool_content_from_state("subagent", {
+            "status": "completed",
+            "content": [{
+                "type": "text",
+                "text": '<subagent sessionID="ses_child" state="completed">'
+                        'full child answer</subagent>',
+            }],
+        })
+        self.assertIsNone(block["output"])
+        self.assertEqual(block["status"], "completed")
 
     def test_get_opencode_session_info_includes_v2_tool_result(self):
         mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")

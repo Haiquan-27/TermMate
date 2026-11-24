@@ -535,7 +535,7 @@ _TOOL_NAMES = {
 }
 
 _SUBAGENT_TOOL_NAMES = frozenset({
-    "agent", "task", "collabagenttoolcall", "spawnagent",
+    "agent", "task", "subagent", "collabagenttoolcall", "spawnagent",
 })
 _SUBAGENT_TEXT_EVENTS = frozenset({
     "session.text.delta", "session.text.ended",
@@ -1938,6 +1938,13 @@ class OpenCodeAgent(BaseAgent):
                     self._session_id,
                     error_text,
                 )
+            # The turn never reaches the normal idle path, so flush the
+            # parent answer first and close its loading state.  Without a
+            # buffered answer the error message already ends the loading.
+            had_plan_text = bool(self._plan_text)
+            await self._flush_plan_text()
+            if had_plan_text:
+                await self._message_queue.put(Message(MessageType.STOP.value))
             await self._message_queue.put(Message(
                 MessageType.ERROR.value, content=error_text
             ))
@@ -2036,6 +2043,10 @@ class OpenCodeAgent(BaseAgent):
                     self._session_id,
                     error_text,
                 )
+            had_plan_text = bool(self._plan_text)
+            await self._flush_plan_text()
+            if had_plan_text:
+                await self._message_queue.put(Message(MessageType.STOP.value))
             await self._message_queue.put(Message(
                 MessageType.ERROR.value, content=error_text
             ))
@@ -2174,6 +2185,21 @@ class OpenCodeAgent(BaseAgent):
         await self._emit_token_usage()
         await self._message_queue.put(Message(MessageType.STOP.value))
 
+    async def _flush_plan_text(self) -> None:
+        """Publish buffered plan-mode answer text before the turn ends.
+
+        Plan-mode text is held until ``stop`` so the chat view can show the
+        implement-plan button.  A failed turn used to discard that buffer,
+        losing the parent agent's last visible answer.
+        """
+        if not self._plan_text:
+            return
+        DIAG.info("flush buffered plan answer len=%d", len(self._plan_text))
+        await self._message_queue.put(Message(
+            MessageType.PLAN_DELTA.value, content=self._plan_text
+        ))
+        self._plan_text = ""
+
     async def _finish_turn(self) -> None:
         # _finish_turn can be triggered either by the SSE event stream
         # (session.execution.succeeded / session.execution.interrupted) or by the interrupt
@@ -2183,11 +2209,7 @@ class OpenCodeAgent(BaseAgent):
         if self._awaiting_user_message_id:
             self._awaiting_user_message_id = False
         self._turn_active = False
-        if self._turn_plan_mode and self._plan_text:
-            await self._message_queue.put(Message(
-                MessageType.PLAN_DELTA.value, content=self._plan_text
-            ))
-            self._plan_text = ""
+        await self._flush_plan_text()
         self._turn_plan_mode = False
         self._turn_done.set()
         await self._emit_token_usage()
@@ -2551,6 +2573,11 @@ class OpenCodeAgent(BaseAgent):
         output_text = properties.get("output")
         if output_text is None and isinstance(properties.get("content"), list):
             output_text = properties["content"]
+        if str(raw_name).strip().lower() in _SUBAGENT_TOOL_NAMES:
+            # The child session's answer is streamed separately with a
+            # ``↳ Subagent`` prefix.  Keeping the full tool result here would
+            # paste that answer into the parent transcript a second time.
+            output_text = None
 
         state = {
             "input": input_data,
@@ -3985,6 +4012,11 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
         output_text = _tool_output_text(state.get("content"))
     error_data = state.get("error")
     error_text = _error_text_value(error_data) if error_data else None
+
+    if normalized in _SUBAGENT_TOOL_NAMES:
+        # Same suppression as live v2 events: replayed history must not paste
+        # the whole child answer into the parent chat a second time.
+        output_text = None
 
     if normalized in ("bash", "shell", "command"):
         exit_code = metadata.get("exit")

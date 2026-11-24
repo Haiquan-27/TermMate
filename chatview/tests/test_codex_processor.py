@@ -269,6 +269,30 @@ class TestSubagentTextRendering(unittest.TestCase):
         self.assertIn("work", contents)
         self.assertIn("ing", contents)
 
+    def test_new_child_session_starts_a_new_paragraph(self):
+        session = MagicMock()
+        processor = BaseChatMessageProcessor(session)
+
+        with patch.object(processor, "append_content") as append:
+            processor.handle_message(Message(
+                "subagent_text", "first answer",
+                msg_id="item-1", thread_id="thread-1",
+            ))
+            processor._ends_with_newline = False
+            processor.handle_message(Message(
+                "subagent_text", "second answer",
+                msg_id="item-2", thread_id="thread-2",
+            ))
+
+        contents = [entry.args[0] for entry in append.call_args_list]
+        self.assertIn("↳ Subagent thread-1: ", contents)
+        self.assertIn("↳ Subagent thread-2: ", contents)
+        self.assertIn("\n\n", contents)
+        self.assertLess(
+            contents.index("\n\n"),
+            contents.index("↳ Subagent thread-2: "),
+        )
+
 
 class TestOpenCodeMessageProcessor(unittest.TestCase):
 
@@ -315,6 +339,26 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         )
         append.assert_any_call("\n", is_tool=True)
         append.assert_any_call("⏺ task\n", is_tool=True, tool_phantoms=None)
+
+    def test_running_opencode_subagent_tool_registers_immediately(self):
+        # OpenCode names the tool "subagent", not "task".
+        block = {
+            "name": "subagent",
+            "status": "running",
+            "input": {"description": "Investigate"},
+        }
+        with patch.object(
+            self.processor, "format_tool_call",
+            return_value=("⏺ subagent", [])
+        ), patch.object(self.processor, "append_content") as append:
+            self.processor.handle_message(
+                Message("tool_use", block, msg_id="subagent_1")
+            )
+
+        self.session.record_subagent_tool_call.assert_called_once_with(
+            "subagent_1", "subagent"
+        )
+        append.assert_any_call("⏺ subagent\n", is_tool=True, tool_phantoms=None)
 
     def test_manual_compaction_starts_compacting_loader(self):
         self.processor.handle_message(Message(

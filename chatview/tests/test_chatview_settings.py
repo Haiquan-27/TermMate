@@ -444,6 +444,8 @@ class TestSubagentToolCounting(unittest.TestCase):
             {"name": "Task"},
             {"name": "agent"},
             {"name": "task"},
+            {"name": "subagent"},
+            {"name": "Subagent"},
             {"name": "collabAgentToolCall", "tool": "spawnAgent"},
             {"name": "dynamicToolCall", "tool": "spawnAgent"},
         )

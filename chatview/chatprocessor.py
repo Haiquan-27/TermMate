@@ -24,7 +24,7 @@ _DIFF_TOOL_NAMES = frozenset({
     "write",
 })
 _SUBAGENT_TOOL_NAMES = frozenset({
-    "Agent", "Task", "agent", "task",
+    "Agent", "Task", "Subagent", "agent", "task", "subagent",
     "collabAgentToolCall", "spawnAgent",
 })
 
@@ -521,7 +521,12 @@ class BaseChatMessageProcessor:
         key = thread_id or subagent_id or getattr(message, "id", None) or "subagent"
         key = str(key)
         if key not in self._subagent_text_started:
+            # A different child session is a different answer.  Start it on
+            # its own paragraph instead of concatenating it after the previous
+            # child's last Markdown line.
             if not getattr(self, "_ends_with_newline", True):
+                self.append_content("\n\n")
+            elif self._subagent_text_started:
                 self.append_content("\n")
             label = thread_id or subagent_id
             prefix = "↳ Subagent"
