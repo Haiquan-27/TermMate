@@ -2686,5 +2686,220 @@ class TestOpenCodeSessionTitles(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(titles[0].content["title"], "local task title")
 
 
+class TestOpenCodeTokenUsage(unittest.IsolatedAsyncioTestCase):
+    """OpenCode token counters feed the chat view's TokenSummaryPhantom."""
+
+    TOKENS = {
+        "input": 3100,
+        "output": 217,
+        "reasoning": 35,
+        "cache": {"read": 31488, "write": 12},
+    }
+
+    def _make_agent(self, version):
+        agent = OpenCodeAgent(AgentOptions(cwd="."), version=version)
+        agent._session_id = "ses_tokens"
+        agent._turn_active = True
+        return agent
+
+    async def _messages(self, agent):
+        result = []
+        while not agent._message_queue.empty():
+            result.append(await agent._message_queue.get())
+        return result
+
+    def test_normalize_tokens_maps_opencode_shape(self):
+        normalized = OpenCodeAgent._normalize_opencode_tokens(self.TOKENS)
+
+        self.assertEqual(normalized, {
+            "inputTokens": 34600,
+            "outputTokens": 217,
+            "cachedInputTokens": 31488,
+            "totalTokens": 34852,
+            "reasoningOutputTokens": 35,
+            "activeContextTokens": 34852,
+        })
+
+    def test_normalize_tokens_handles_strings_missing_cache_and_invalid(self):
+        normalized = OpenCodeAgent._normalize_opencode_tokens({
+            "input": "100",
+            "output": "20",
+            "reasoning": None,
+            "cache": "not-a-dict",
+        })
+        self.assertEqual(normalized["inputTokens"], 100)
+        self.assertEqual(normalized["outputTokens"], 20)
+        self.assertEqual(normalized["cachedInputTokens"], 0)
+        self.assertEqual(normalized["totalTokens"], 120)
+
+        self.assertIsNone(OpenCodeAgent._normalize_opencode_tokens(None))
+        self.assertIsNone(OpenCodeAgent._normalize_opencode_tokens("nope"))
+
+    def test_context_window_from_model_variants(self):
+        self.assertEqual(
+            OpenCodeAgent._context_window_from_model({"contextWindow": 258400}),
+            258400,
+        )
+        self.assertEqual(
+            OpenCodeAgent._context_window_from_model({"limit": {"context": 200000}}),
+            200000,
+        )
+        self.assertEqual(OpenCodeAgent._context_window_from_model({}), 0)
+
+    async def test_v2_step_and_usage_events_emit_token_usage_before_stop(self):
+        agent = self._make_agent(2)
+        agent._model_context_windows["anthropic/claude-sonnet"] = 200000
+
+        await agent._dispatch_event({
+            "type": "session.step.started",
+            "data": {
+                "sessionID": "ses_tokens",
+                "model": {"providerID": "anthropic", "id": "claude-sonnet"},
+            },
+        })
+        await agent._dispatch_event({
+            "type": "session.step.ended",
+            "data": {"sessionID": "ses_tokens", "tokens": self.TOKENS},
+        })
+        await agent._dispatch_event({
+            "type": "session.usage.updated",
+            "data": {
+                "sessionID": "ses_tokens",
+                "tokens": {
+                    "input": 6200,
+                    "output": 434,
+                    "reasoning": 70,
+                    "cache": {"read": 62976, "write": 24},
+                },
+            },
+        })
+        await agent._dispatch_event({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses_tokens"},
+        })
+
+        messages = await self._messages(agent)
+        self.assertEqual([m.type for m in messages], ["token_usage", "stop"])
+        usage = messages[0].content
+        self.assertEqual(usage["last"]["totalTokens"], 34852)
+        self.assertEqual(usage["last"]["reasoningOutputTokens"], 35)
+        self.assertEqual(usage["total"]["inputTokens"], 69200)
+        self.assertEqual(usage["modelContextWindow"], 200000)
+
+    async def test_v2_later_step_replaces_earlier_snapshot(self):
+        agent = self._make_agent(2)
+
+        await agent._dispatch_event({
+            "type": "session.step.ended",
+            "data": {"sessionID": "ses_tokens", "tokens": self.TOKENS},
+        })
+        await agent._dispatch_event({
+            "type": "session.step.ended",
+            "data": {
+                "sessionID": "ses_tokens",
+                "tokens": {
+                    "input": 9000,
+                    "output": 800,
+                    "reasoning": 100,
+                    "cache": {"read": 40000, "write": 0},
+                },
+            },
+        })
+        await agent._dispatch_event({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses_tokens"},
+        })
+
+        messages = await self._messages(agent)
+        self.assertEqual(messages[0].content["last"]["totalTokens"], 49900)
+
+    async def test_v1_message_updated_emits_token_usage(self):
+        agent = self._make_agent(1)
+
+        await agent._dispatch_event({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": "msg_assistant",
+                    "sessionID": "ses_tokens",
+                    "role": "assistant",
+                    "providerID": "openai",
+                    "modelID": "gpt-test",
+                    "tokens": self.TOKENS,
+                },
+            },
+        })
+        await agent._dispatch_event({
+            "type": "session.status",
+            "properties": {
+                "sessionID": "ses_tokens",
+                "status": {"type": "idle"},
+            },
+        })
+
+        messages = await self._messages(agent)
+        self.assertEqual([m.type for m in messages], ["token_usage", "stop"])
+        self.assertEqual(messages[0].content["last"]["cachedInputTokens"], 31488)
+        self.assertEqual(messages[0].content["total"], messages[0].content["last"])
+
+    async def test_v1_step_finish_part_is_a_fallback_source(self):
+        agent = self._make_agent(1)
+
+        await agent._dispatch_event({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "part_step",
+                    "sessionID": "ses_tokens",
+                    "messageID": "msg_assistant",
+                    "type": "step-finish",
+                    "tokens": self.TOKENS,
+                },
+            },
+        })
+        await agent._dispatch_event({
+            "type": "session.idle",
+            "properties": {"sessionID": "ses_tokens"},
+        })
+
+        messages = await self._messages(agent)
+        self.assertEqual([m.type for m in messages], ["token_usage", "stop"])
+
+    async def test_no_tokens_means_no_token_usage_message(self):
+        agent = self._make_agent(2)
+
+        await agent._dispatch_event({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses_tokens"},
+        })
+
+        self.assertEqual(
+            [m.type for m in await self._messages(agent)], ["stop"]
+        )
+
+    async def test_token_state_is_reset_between_turns(self):
+        agent = self._make_agent(2)
+        await agent._dispatch_event({
+            "type": "session.step.ended",
+            "data": {"sessionID": "ses_tokens", "tokens": self.TOKENS},
+        })
+        await agent._dispatch_event({
+            "type": "session.execution.succeeded",
+            "data": {"sessionID": "ses_tokens"},
+        })
+        await self._messages(agent)
+
+        agent._turn_active = False
+        agent._turn_done.set()
+        with patch.object(agent, "_ensure_session", return_value="ses_tokens"), \
+             patch.object(agent, "_http", return_value=None), \
+             patch.object(agent, "connect", return_value=None):
+            agent._is_connected = True
+            await agent.send_message("second turn")
+
+        self.assertIsNone(agent._turn_tokens)
+        self.assertEqual("", agent._token_model)
+
+
 if __name__ == "__main__":
     unittest.main()

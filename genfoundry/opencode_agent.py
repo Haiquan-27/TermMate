@@ -885,6 +885,13 @@ class OpenCodeAgent(BaseAgent):
         self._compaction_error: Optional[str] = None
         self._compaction_summary = ""
         self._compaction_tokens: Optional[Dict[str, Any]] = None
+        # Token metrics for TokenSummaryPhantom.  OpenCode reports cumulative
+        # snapshots (v1 ``message.updated`` / v2 ``session.step.ended``), so a
+        # newer snapshot replaces the older one instead of being summed.
+        self._turn_tokens: Optional[Dict[str, Any]] = None
+        self._session_token_total: Optional[Dict[str, Any]] = None
+        self._token_model: str = ""
+        self._model_context_windows: Dict[str, int] = {}
         self._uses_session_status = False
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._event_queue: asyncio.Queue = asyncio.Queue()
@@ -1514,6 +1521,86 @@ class OpenCodeAgent(BaseAgent):
             )
         )
 
+    @staticmethod
+    def _token_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    @classmethod
+    def _normalize_opencode_tokens(
+        cls, raw: Any
+    ) -> Optional[Dict[str, Any]]:
+        """Convert OpenCode token counters to the chat view's usage shape.
+
+        Both v1 ``message.updated.info.tokens`` and v2
+        ``session.step.ended.tokens`` use::
+
+            {"input": n, "output": n, "reasoning": n,
+             "cache": {"read": n, "write": n}}
+
+        ``input`` excludes cached tokens, so ``inputTokens`` includes both
+        cache reads and writes (the same convention Claude/Codex use).  The
+        big ``totalTokens`` figure follows OpenCode's own ``TokenUsage.total``
+        helper and therefore also includes reasoning and cache counters.
+        """
+        if not isinstance(raw, dict):
+            return None
+        cache = raw.get("cache")
+        if not isinstance(cache, dict):
+            cache = {}
+        input_tokens = cls._token_int(raw.get("input"))
+        output_tokens = cls._token_int(raw.get("output"))
+        reasoning = cls._token_int(raw.get("reasoning"))
+        cache_read = cls._token_int(cache.get("read"))
+        cache_write = cls._token_int(cache.get("write"))
+        # v1 may include an explicit total; v2 computes it from the parts.
+        raw_total = raw.get("total")
+        total_tokens = (
+            cls._token_int(raw_total)
+            if raw_total is not None
+            else input_tokens + output_tokens + reasoning + cache_read + cache_write
+        )
+        return {
+            "inputTokens": input_tokens + cache_read + cache_write,
+            "outputTokens": output_tokens,
+            "cachedInputTokens": cache_read,
+            "totalTokens": total_tokens,
+            "reasoningOutputTokens": reasoning,
+            "activeContextTokens": total_tokens,
+        }
+
+    def _record_turn_tokens(self, raw: Any) -> None:
+        normalized = self._normalize_opencode_tokens(raw)
+        if normalized is not None:
+            self._turn_tokens = normalized
+
+    def _record_session_tokens(self, raw: Any) -> None:
+        normalized = self._normalize_opencode_tokens(raw)
+        if normalized is not None:
+            self._session_token_total = normalized
+
+    def _token_usage_message(self) -> Optional[Message]:
+        """Build the end-of-turn token usage message for the chat session."""
+        if not self._turn_tokens:
+            return None
+        payload: Dict[str, Any] = {
+            "last": dict(self._turn_tokens),
+            "total": dict(self._session_token_total or self._turn_tokens),
+        }
+        model = self._token_model or self.options.model or ""
+        context_window = self._model_context_windows.get(model, 0)
+        if context_window > 0:
+            payload["modelContextWindow"] = context_window
+        return Message(MessageType.TOKEN_USAGE.value, content=payload)
+
+    async def _emit_token_usage(self) -> None:
+        """Queue token metrics before the turn's STOP message."""
+        message = self._token_usage_message()
+        if message is not None:
+            await self._message_queue.put(message)
+
     async def _dispatch_event(self, event: Dict[str, Any]) -> None:
         payload = self._event_payload(event)
         event_type = payload.get("type", "")
@@ -1616,6 +1703,24 @@ class OpenCodeAgent(BaseAgent):
                     content=delta,
                     msg_id=msg_id,
                 ))
+            return
+
+        # [v2] Token metrics.  ``session.step.ended`` is a cumulative snapshot
+        # for the step; the last one in a turn approximates the turn total.
+        # ``session.usage.updated`` carries cumulative session usage.
+        if event_type == "session.step.started":
+            model = properties.get("model")
+            if isinstance(model, dict):
+                provider_id = model.get("providerID")
+                model_id = model.get("id") or model.get("modelID")
+                if provider_id and model_id:
+                    self._token_model = f"{provider_id}/{model_id}"
+            return
+        if event_type in ("session.step.ended", "session.step.failed"):
+            self._record_turn_tokens(properties.get("tokens"))
+            return
+        if event_type in ("session.usage.updated", "session.usage.recorded"):
+            self._record_session_tokens(properties.get("tokens"))
             return
 
         # [v2] Prompt inbox lifecycle (resolves user message id)
@@ -1797,6 +1902,14 @@ class OpenCodeAgent(BaseAgent):
                 role = info.get("role")
                 if message_id and role:
                     self._message_roles[message_id] = str(role)
+                if role == "assistant":
+                    # Final assistant message carries the turn's own token
+                    # counters; a newer snapshot wins over earlier partials.
+                    self._record_turn_tokens(info.get("tokens"))
+                    provider_id = info.get("providerID")
+                    model_id = info.get("modelID")
+                    if provider_id and model_id:
+                        self._token_model = f"{provider_id}/{model_id}"
                 if message_id and role == "user":
                     self._user_message_ids.add(message_id)
                     if self._awaiting_user_message_id:
@@ -1820,6 +1933,13 @@ class OpenCodeAgent(BaseAgent):
         # [v1] File diff generated during turn
         if event_type == "session.diff":
             await self._handle_session_diff(properties.get("diff", []))
+            return
+
+        # [v1] Cumulative session usage (independent of message streaming)
+        if event_type == "session.updated":
+            info = properties.get("info")
+            if isinstance(info, dict):
+                self._record_session_tokens(info.get("tokens"))
             return
 
         # [v1] Turn error
@@ -1967,6 +2087,7 @@ class OpenCodeAgent(BaseAgent):
         if self._turn_active:
             await self._finish_turn()
             return
+        await self._emit_token_usage()
         await self._message_queue.put(Message(MessageType.STOP.value))
 
     async def _finish_turn(self) -> None:
@@ -1985,6 +2106,7 @@ class OpenCodeAgent(BaseAgent):
             self._plan_text = ""
         self._turn_plan_mode = False
         self._turn_done.set()
+        await self._emit_token_usage()
         await self._message_queue.put(Message(MessageType.STOP.value))
 
     async def _handle_part_updated(self, properties: Dict[str, Any]) -> None:
@@ -2022,6 +2144,12 @@ class OpenCodeAgent(BaseAgent):
                 await self._message_queue.put(Message(
                     MessageType.THINKING.value, content=delta, msg_id=part_id
                 ))
+            return
+
+        # [v1] Per-step usage; ``message.updated`` is the preferred source but
+        # this keeps metrics available if that event is missed.
+        if part_type == "step-finish":
+            self._record_turn_tokens(part.get("tokens"))
             return
 
         if part_type == "tool":
@@ -2525,6 +2653,21 @@ class OpenCodeAgent(BaseAgent):
                 },
             ))
 
+    @classmethod
+    def _context_window_from_model(cls, item: Dict[str, Any]) -> int:
+        """Read a model's context length from OpenCode's model metadata."""
+        for key in ("contextWindow", "contextLength", "context"):
+            value = cls._token_int(item.get(key))
+            if value > 0:
+                return value
+        limit = item.get("limit")
+        if isinstance(limit, dict):
+            for key in ("context", "input", "contextWindow"):
+                value = cls._token_int(limit.get(key))
+                if value > 0:
+                    return value
+        return 0
+
     async def _fetch_models(self) -> None:
         try:
             if self.version >= 2:
@@ -2552,6 +2695,9 @@ class OpenCodeAgent(BaseAgent):
                         "description": provider_id,
                         "value": f"{provider_id}/{model_id}",
                     }
+                    context_window = self._context_window_from_model(item)
+                    if context_window > 0:
+                        self._model_context_windows[entry["value"]] = context_window
                     # [OpenCode v2] Reasoning levels are exposed as model
                     # variants; forward them so the picker can offer efforts.
                     variant_ids = self._variant_ids(item.get("variants"))
@@ -2598,10 +2744,14 @@ class OpenCodeAgent(BaseAgent):
                     if not model_id:
                         continue
                     model = model if isinstance(model, dict) else {}
+                    value = f"{provider_id}/{model_id}"
+                    context_window = self._context_window_from_model(model)
+                    if context_window > 0:
+                        self._model_context_windows[value] = context_window
                     models.append({
                         "displayName": model.get("name") or model_id,
                         "description": provider_name,
-                        "value": f"{provider_id}/{model_id}",
+                        "value": value,
                     })
             if models:
                 self.available_models = models
@@ -2932,6 +3082,8 @@ class OpenCodeAgent(BaseAgent):
         self._turn_plan_mode = agent_name == "plan"
         self._turn_active = True
         self._idle_announced = False
+        self._turn_tokens = None
+        self._token_model = ""
         self._turn_done.clear()
         self._awaiting_user_message_id = True
         await self._message_queue.put(Message(
