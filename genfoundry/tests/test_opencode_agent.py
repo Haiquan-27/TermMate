@@ -816,6 +816,48 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools[1].content["output"], "file1.txt\nfile2.txt")
         self.assertEqual(tools[1].content["status"], "completed")
 
+    async def test_v2_task_running_tool_is_emitted(self):
+        await self.agent._dispatch_event({
+            "type": "session.tool.called",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "task_1",
+                "name": "task",
+                "input": {"description": "Investigate"},
+            },
+        })
+        await self.agent._dispatch_event({
+            "type": "session.tool.success",
+            "data": {
+                "sessionID": "ses_v2",
+                "id": "task_1",
+                "output": "done",
+            },
+        })
+
+        tools = [m for m in await self._messages() if m.type == "tool_use"]
+        self.assertEqual(len(tools), 2)
+        self.assertEqual(tools[0].id, "task_1")
+        self.assertEqual(tools[0].content["name"], "task")
+        self.assertEqual(tools[0].content["status"], "running")
+        self.assertEqual(tools[1].content["status"], "completed")
+
+    async def test_v2_subagent_text_from_child_session_is_visible(self):
+        await self.agent._dispatch_event({
+            "type": "session.text.delta",
+            "data": {
+                "sessionID": "ses_child",
+                "parentID": "ses_v2",
+                "assistantMessageID": "child_msg",
+                "delta": "working on it",
+            },
+        })
+
+        messages = await self._messages()
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].type, "subagent_text")
+        self.assertEqual(messages[0].content, "working on it")
+
     async def test_v2_tool_lifecycle_input_started_and_patch(self):
         # Realistic OpenCode v2 flow: name is in input.started, not in called or success
         await self.agent._dispatch_event({

@@ -24,6 +24,10 @@ class MarkdownFormatter:
         self.remaining_text = ""
         self.max_width_getter = max_width_getter
         self._html_tables = []
+        # Number of characters in ``remaining_text`` already emitted as a live
+        # preview.  Prevents partial-line streaming from duplicating text when
+        # the next chunk arrives or the line is finally completed.
+        self._live_emitted = 0
 
     def reset(self):
         """Reset internal buffers and code block fence states."""
@@ -33,6 +37,7 @@ class MarkdownFormatter:
         self.code_fence_len = 0
         self.remaining_text = ""
         self._html_tables.clear()
+        self._live_emitted = 0
 
     def char_width(self, char):
         if unicodedata.combining(char):
@@ -563,10 +568,17 @@ class MarkdownFormatter:
             '</div></body>'
         )
 
-    def format(self, text, flush=False):
-        """
-        Process the incoming text chunk.
-        If flush is True, it returns all buffered content formatted.
+    def format(self, text, flush=False, live=False):
+        """Process an incoming text chunk.
+
+        With ``flush=True`` all buffered content is returned, as before.
+
+        With ``live=True`` an unfinished line is emitted immediately instead of
+        waiting for a newline (or for the end-of-turn flush).  The formatter
+        keeps the same buffered text in ``remaining_text`` and only returns the
+        suffix that has not been emitted yet, so streaming chunks never
+        duplicate characters.  Table candidates stay buffered until their line
+        is complete so table alignment is still correct.
         """
         self._html_tables = []
 
@@ -579,6 +591,7 @@ class MarkdownFormatter:
 
         # Combine with leftover from previous chunk
         combined_text = (self.remaining_text + text).expandtabs(4)
+        live_skip = min(self._live_emitted, len(combined_text))
 
         if not flush and combined_text and not combined_text.endswith('\n'):
             last_newline = combined_text.rfind('\n')
@@ -587,13 +600,17 @@ class MarkdownFormatter:
                 process_text = combined_text[:last_newline+1]
             else:
                 self.remaining_text = combined_text
-                return ""
+                process_text = ""
         else:
             process_text = combined_text
             self.remaining_text = ""
 
-        lines = process_text.split('\n')
-        if process_text.endswith('\n'):
+        # Characters already shown as a live preview must not be appended a
+        # second time when their line finally reaches the normal line loop.
+        emit_text = process_text[live_skip:] if live_skip else process_text
+
+        lines = emit_text.split('\n') if emit_text else []
+        if emit_text.endswith('\n'):
             lines = lines[:-1]
 
         output_lines = []
@@ -655,18 +672,37 @@ class MarkdownFormatter:
                 flush_buffer()
                 output_lines.append(line)
 
+        # A table whose separator row has arrived in a live chunk is already
+        # complete enough to render.  Otherwise it would stay hidden until a
+        # following non-table line or the end-of-turn flush.
+        if live and not flush and not self.remaining_text and self.table_buffer:
+            if self._parse_table(self.table_buffer) is not None:
+                flush_buffer()
+
         if flush:
-            if self.remaining_text:
-                rem = (render_inline_math(self.remaining_text)
-                       if not self.in_code_block else self.remaining_text)
-                if rem.strip().startswith('|'):
-                    self.table_buffer.append(rem)
-                else:
-                    flush_buffer()
-                    output_lines.append(rem)
-                self.remaining_text = ""
             flush_buffer()
 
+        preview = ""
+        if flush:
+            self._live_emitted = 0
+        elif process_text:
+            # The previewed prefix is now part of a completed line.  Start a
+            # fresh preview for whatever tail is left in this same chunk.
+            self._live_emitted = 0
+            if (live and self.remaining_text
+                    and not self.remaining_text.lstrip().startswith('|')):
+                preview = self.remaining_text
+                self._live_emitted = len(self.remaining_text)
+        elif live and self.remaining_text:
+            if not self.remaining_text.lstrip().startswith('|'):
+                preview = self.remaining_text[live_skip:]
+                self._live_emitted = len(self.remaining_text)
+            else:
+                # A possible table row: wait for the whole line, then emit it
+                # through the table-aware line loop.
+                self._live_emitted = 0
+
+        res = ""
         if output_lines:
             res = '\n'.join(output_lines)
             for table in html_table_lines:
@@ -682,5 +718,7 @@ class MarkdownFormatter:
                 self._html_tables.append(table)
             if not flush:
                 res += '\n'
-            return res
-        return ""
+
+        if preview:
+            res = preview if not res else res + preview
+        return res

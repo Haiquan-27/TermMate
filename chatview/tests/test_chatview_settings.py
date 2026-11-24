@@ -460,6 +460,28 @@ class TestSubagentToolCounting(unittest.TestCase):
             recorder.assert_any_call(f"call-{index}", name)
         self.assertNotIn(call("read-1", "Read"), recorder.call_args_list)
 
+    def test_claude_direct_tool_render_counts_subagent(self):
+        session = MagicMock()
+        processor = chatview_mod.ClaudeMessageProcessor(session)
+        message = types.SimpleNamespace(
+            type="assistant",
+            id="msg-1",
+            content=[{
+                "type": "tool_use",
+                "name": "Agent",
+                "id": "claude-agent-1",
+                "input": {},
+            }],
+        )
+
+        with patch.object(processor, "format_tool_call",
+                          return_value=("⏺ Agent", [])):
+            processor.handle_message(message)
+
+        session.record_subagent_tool_call.assert_called_once_with(
+            "claude-agent-1", "Agent"
+        )
+
 
 class _FakeListInputItem:
     def __init__(self, text=None, value=None, details=None, annotation=None):

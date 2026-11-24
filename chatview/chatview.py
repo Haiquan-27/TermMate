@@ -2136,13 +2136,15 @@ class ChatSession:
             pass
         return None
 
-    def append_markdown(self, text, flush=False, is_tool=False, tool_phantoms=None):
+    def append_markdown(self, text, flush=False, is_tool=False, tool_phantoms=None,
+                        live=False):
         """Format and append Markdown content to the chat view."""
         if self.pending_response_separator and text:
             self.pending_response_separator = False
             clean = text.lstrip("\r\n")
             text = f"{AGENT_SEPARATOR}\n\n{clean}" if clean else f"{AGENT_SEPARATOR}\n\n"
-        formatted_text = self.markdown_formatter.format(text, flush=flush)
+        formatted_text = self.markdown_formatter.format(text, flush=flush,
+                                                        live=live)
         html_tables = self.markdown_formatter.take_html_tables()
         if formatted_text or tool_phantoms:
             sublime.set_timeout(

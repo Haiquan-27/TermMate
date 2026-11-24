@@ -1332,10 +1332,41 @@ class TestCodexTwoTurns(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(MessageType.THINKING.value, types)
             text_msgs = [m.content for m in messages if m.type == MessageType.TEXT.value]
             self.assertNotIn("Subagent stream chunk", text_msgs)
+            subagent_texts = [
+                m.content for m in messages
+                if m.type == MessageType.SUBAGENT_TEXT.value
+            ]
+            self.assertEqual(subagent_texts, ["Subagent stream chunk"])
             plan_msgs = [m.content for m in messages if m.type == MessageType.PLAN_DELTA.value]
             self.assertEqual(plan_msgs, ["Main plan"])
         finally:
             await agent.disconnect()
+
+    async def test_collab_tool_call_is_emitted_on_start(self):
+        """The launch row must be visible before the subagent finishes."""
+        agent = CodexAgent(options=AgentOptions(
+            cli_path="/usr/bin/true", session_id="thread-001"))
+        agent.thread_id = "thread-001"
+
+        await agent._dispatch({
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "id": "collab-start",
+                    "tool": "spawnAgent",
+                    "receiverThreadIds": ["sub-1"],
+                    "status": "inProgress",
+                },
+            },
+        })
+
+        msg = agent._message_queue.get_nowait()
+        self.assertEqual(msg.type, MessageType.TOOL_USE.value)
+        self.assertEqual(msg.id, "collab-start")
+        self.assertEqual(msg.content["name"], "collabAgentToolCall")
+        self.assertEqual(msg.content["status"], "inProgress")
+        self.assertIn("sub-1", agent._subagent_thread_ids)
 
     async def test_thread_resume_exclude_turns_and_turns_list_hydration(self):
         """Verify thread/resume sends excludeTurns: True and hydrates via thread/turns/list."""

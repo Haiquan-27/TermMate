@@ -393,6 +393,8 @@ class BaseChatMessageProcessor:
         self._plan_text = ""
         self._tool_file_re = _make_tool_file_re(self._TOOL_FILE_NAMES) if self._TOOL_FILE_NAMES else None
         self._ends_with_newline = True
+        # Message ids whose "Subagent" prefix has already been emitted.
+        self._subagent_text_started = set()
 
     def format_model_badge(self, m: dict) -> str:
         """Format a compact reasoning/thinking badge based strictly on structured capabilities."""
@@ -474,6 +476,10 @@ class BaseChatMessageProcessor:
                 self.session.set_thread_title(content.get("title", ""))
             return
 
+        if getattr(message, "type", None) == "subagent_text":
+            self._handle_subagent_text(message)
+            return
+
         if hasattr(message, "type"):
             if message.type == "token_usage":
                 if hasattr(self.session, "set_token_usage"):
@@ -481,6 +487,7 @@ class BaseChatMessageProcessor:
                 return
             if message.type == "turn_started":
                 self._ends_with_newline = True
+                self._subagent_text_started.clear()
             if message.type in ("stop", "result"):
                 outputs = getattr(self.session, "tool_outputs", None)
                 if outputs is not None:
@@ -489,6 +496,41 @@ class BaseChatMessageProcessor:
 
     def _handle_typed_message(self, message):
         raise NotImplementedError
+
+    def _handle_subagent_text(self, message):
+        """Render a subagent text chunk with a one-time prefix.
+
+        Subagent text is a separate message type so it is visible without being
+        mistaken for the parent agent's answer.
+        """
+        content = message.content if isinstance(message.content, str) else ""
+        if not content:
+            return
+        self.session.start_loading()
+        raw = message.raw_data if isinstance(message.raw_data, dict) else {}
+        # Message(**kwargs) stores provider fields in ``raw_data`` using
+        # underscore names, while Codex protocol payloads use camelCase.
+        thread_id = (
+            raw.get("thread_id") or raw.get("threadId")
+            or raw.get("threadID") or ""
+        )
+        subagent_id = (
+            raw.get("subagent_id") or raw.get("subagentId")
+            or raw.get("itemId") or ""
+        )
+        key = thread_id or subagent_id or getattr(message, "id", None) or "subagent"
+        key = str(key)
+        if key not in self._subagent_text_started:
+            if not getattr(self, "_ends_with_newline", True):
+                self.append_content("\n")
+            label = thread_id or subagent_id
+            prefix = "↳ Subagent"
+            if label:
+                prefix += f" {label}"
+            self.append_content(prefix + ": ", live=True)
+            self._subagent_text_started.add(key)
+            self.last_is_tool_call = False
+        self.append_content(content, live=True)
 
     def _render_diff_block(self, diff_text):
         if not diff_text:
@@ -733,23 +775,31 @@ class BaseChatMessageProcessor:
             return text, []
         return text, [call]
 
-    def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None):
-        """Append Markdown content through the chat session."""
+    def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None,
+                       live=False):
+        """Append Markdown content through the chat session.
+
+        ``live`` streams an unfinished line immediately; it is only used for
+        agent text, never for tool rows (which are already appended whole).
+        """
         if text:
             raw = text.replace("\r", "")
             if raw:
                 self._ends_with_newline = raw.endswith("\n")
         if not is_tool and text and text.strip().startswith("⏺"):
             is_tool = True
+        kwargs = {"flush": flush}
+        if live:
+            kwargs["live"] = True
         if is_tool:
             if tool_phantoms:
                 self.session.append_markdown(
-                    text, flush=flush, is_tool=True, tool_phantoms=tool_phantoms
+                    text, is_tool=True, tool_phantoms=tool_phantoms, **kwargs
                 )
             else:
-                self.session.append_markdown(text, flush=flush, is_tool=True)
+                self.session.append_markdown(text, is_tool=True, **kwargs)
         else:
-            self.session.append_markdown(text, flush=flush)
+            self.session.append_markdown(text, **kwargs)
 
     def ensure_trailing_newline(self):
         """Ensure the chat content ends with a newline, without adding extra blank lines."""
@@ -949,7 +999,7 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                             if trailing == 0:
                                 text_content += "\n"
                                 trailing = 1
-                            self.append_content(text_content)
+                            self.append_content(text_content, live=True)
                             text_content = ""
                             need_newline = (trailing < 2)
                         else:
@@ -961,6 +1011,17 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                             if not self.last_is_tool_call and need_newline:
                                 self.append_content("\n", is_tool=True)
                             self.last_is_tool_call = True
+                            if _is_subagent_tool(block):
+                                recorder = getattr(
+                                    self.session, "record_subagent_tool_call", None
+                                )
+                                if recorder:
+                                    recorder(
+                                        block.get("id")
+                                        or getattr(message, "id", None)
+                                        or block.get("name"),
+                                        block.get("name"),
+                                    )
                             rendered, phantoms = self.format_tool_call(block)
                             self.append_content(
                                 (rendered + "\n") if rendered else "",
@@ -971,7 +1032,7 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
             if text_content:
                 if not text_content.endswith("\n"):
                     text_content += "\n"
-                self.append_content(text_content)
+                self.append_content(text_content, live=True)
         elif message.type == "system":
             raw = getattr(message, "raw_data", {}) or {}
             if raw.get("subtype") == "status" and raw.get("status") == "compacting":
@@ -1206,7 +1267,7 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
                         text_content += block.text
 
             if text_content:
-                self.append_content(text_content + "\n")
+                self.append_content(text_content + "\n", live=True)
 
         elif message.type == "tool_use":
             self.session.start_loading()
@@ -1492,7 +1553,7 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                 if not content.startswith(("\n", "\r\n")):
                     self.append_content("\n")
                 self.last_is_tool_call = False
-            self.append_content(content)
+            self.append_content(content, live=True)
             raw = content.replace("\r", "")
             trailing = len(raw) - len(raw.rstrip("\n"))
             if trailing == len(raw):
@@ -1784,7 +1845,7 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                     if "<proposed_plan>" in self._text_buffer:
                         parts = self._text_buffer.split("<proposed_plan>", 1)
                         if parts[0]:
-                            self.append_content(parts[0])
+                            self.append_content(parts[0], live=True)
                         self._in_plan = True
                         self._text_buffer = parts[1]
                         self.append_content("\n\n**Proposed Plan**\n\n")
@@ -1795,14 +1856,14 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                                 flush_index = i
                                 break
                         if flush_index > 0:
-                            self.append_content(self._text_buffer[:flush_index])
+                            self.append_content(self._text_buffer[:flush_index], live=True)
                             self._text_buffer = self._text_buffer[flush_index:]
                         break
                 else:
                     if "</proposed_plan>" in self._text_buffer:
                         parts = self._text_buffer.split("</proposed_plan>", 1)
                         self._plan_text += parts[0]
-                        self.append_content(parts[0])
+                        self.append_content(parts[0], live=True)
                         self._in_plan = False
                         self._text_buffer = parts[1]
                     else:
@@ -1813,7 +1874,7 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                                 break
                         if flush_index > 0:
                             self._plan_text += self._text_buffer[:flush_index]
-                            self.append_content(self._text_buffer[:flush_index])
+                            self.append_content(self._text_buffer[:flush_index], live=True)
                             self._text_buffer = self._text_buffer[flush_index:]
                         break
             return
@@ -1822,7 +1883,7 @@ class PiMessageProcessor(BaseChatMessageProcessor):
             if self._text_buffer:
                 if self._in_plan:
                     self._plan_text += self._text_buffer
-                self.append_content(self._text_buffer)
+                self.append_content(self._text_buffer, live=True)
                 self._text_buffer = ""
             return
             
@@ -2260,7 +2321,7 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
                 self.last_is_tool_call = False
             content = message.content if isinstance(message.content, str) else ""
             if content:
-                self.append_content(content)
+                self.append_content(content, live=True)
             return
 
         if message.type == "tool_use":

@@ -190,6 +190,9 @@ class CodexAgent(BaseAgent):
         self._completed_turn_ids: Set[str] = set()
         self._subagent_thread_ids: Set[str] = set()
         self._subagent_turn_to_root: Dict[str, str] = {}
+        # Item ids whose subagent text was already streamed; the completion
+        # event only fills the gap when no delta was received.
+        self._subagent_text_items: Set[str] = set()
 
         if not self.cli_path:
             raise FileNotFoundError(
@@ -362,6 +365,7 @@ class CodexAgent(BaseAgent):
 
             self._subagent_thread_ids.clear()
             self._subagent_turn_to_root.clear()
+            self._subagent_text_items.clear()
             self._completed_turn_ids.clear()
 
             # Sync turn count from resumed thread so rewind math stays correct
@@ -889,17 +893,30 @@ class CodexAgent(BaseAgent):
                 self._plan_text += delta
 
         elif method == "item/agentMessage/delta":
+            delta = params.get("delta", "")
+            if not delta:
+                return
             if self._is_subagent(
                 thread_id=params.get("threadId"),
                 turn_id=self._extract_turn_id(params),
             ):
-                return
-            delta = params.get("delta", "")
-            if delta:
+                item_id = params.get("itemId")
+                if item_id:
+                    self._subagent_text_items.add(str(item_id))
                 await self._message_queue.put(
-                    Message(MessageType.TEXT.value, content=delta,
-                            msg_id=params.get("itemId"))
+                    Message(
+                        MessageType.SUBAGENT_TEXT.value,
+                        content=delta,
+                        msg_id=item_id,
+                        thread_id=params.get("threadId"),
+                        turn_id=self._extract_turn_id(params),
+                    )
                 )
+                return
+            await self._message_queue.put(
+                Message(MessageType.TEXT.value, content=delta,
+                        msg_id=params.get("itemId"))
+            )
 
         elif method == "item/reasoning/textDelta":
             if self._is_subagent(
@@ -979,6 +996,22 @@ class CodexAgent(BaseAgent):
         if item_type == "collabAgentToolCall":
             for r_id in item.get("receiverThreadIds") or []:
                 self._subagent_thread_ids.add(r_id)
+            # Emit the launch immediately.  The completion event reuses the
+            # same item id, so the chat view updates this row in place and the
+            # "Subagent +N" count becomes visible while the task is running.
+            await self._message_queue.put(Message(
+                MessageType.TOOL_USE.value,
+                content={
+                    "name": "collabAgentToolCall",
+                    "tool": item.get("tool", ""),
+                    "receiverThreadIds": item.get("receiverThreadIds", []),
+                    "prompt": item.get("prompt"),
+                    "model": item.get("model"),
+                    "reasoningEffort": item.get("reasoningEffort"),
+                    "status": item.get("status") or "running",
+                },
+                msg_id=item_id,
+            ))
         elif item_type == "subAgentActivity":
             agent_t_id = item.get("agentThreadId")
             if agent_t_id:
@@ -1015,10 +1048,26 @@ class CodexAgent(BaseAgent):
 
         if item_type == "agentMessage":
             text = item.get("text", "")
-            if text:
-                blocks = [TextBlock(text)]
-                msg = AssistantMessage(content=blocks, msg_id=item.get("id"))
-                await self._message_queue.put(msg)
+            if not text:
+                return
+            if self._is_subagent(
+                thread_id=params.get("threadId"),
+                turn_id=self._extract_turn_id(params),
+            ):
+                item_id = item.get("id")
+                if item_id and str(item_id) in self._subagent_text_items:
+                    return
+                await self._message_queue.put(Message(
+                    MessageType.SUBAGENT_TEXT.value,
+                    content=text,
+                    msg_id=item_id,
+                    thread_id=params.get("threadId"),
+                    turn_id=self._extract_turn_id(params),
+                ))
+                return
+            blocks = [TextBlock(text)]
+            msg = AssistantMessage(content=blocks, msg_id=item.get("id"))
+            await self._message_queue.put(msg)
 
         elif item_type == "commandExecution":
             # Same id as the started item, so the chat view updates the

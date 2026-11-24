@@ -242,12 +242,32 @@ class TestCodexToolCallFormatting(unittest.TestCase):
             )
             processor.handle_message(msg)
             expected_calls = [
-                unittest.mock.call(expected_text_arg, flush=False),
+                unittest.mock.call(expected_text_arg, flush=False, live=True),
             ]
             if expected_extra_nl:
                 expected_calls.append(unittest.mock.call("\n", flush=False, is_tool=True))
             expected_calls.append(unittest.mock.call("⏺ Read a.py\n", flush=False, is_tool=True))
             self.assertEqual(session.append_markdown.call_args_list, expected_calls)
+
+
+class TestSubagentTextRendering(unittest.TestCase):
+
+    def test_prefix_is_emitted_once_per_stream(self):
+        session = MagicMock()
+        processor = BaseChatMessageProcessor(session)
+
+        with patch.object(processor, "append_content") as append:
+            processor.handle_message(Message(
+                "subagent_text", "work", msg_id="item-1", thread_id="thread-2"
+            ))
+            processor.handle_message(Message(
+                "subagent_text", "ing", msg_id="item-1", thread_id="thread-2"
+            ))
+
+        contents = [entry.args[0] for entry in append.call_args_list]
+        self.assertEqual(contents.count("↳ Subagent thread-2: "), 1)
+        self.assertIn("work", contents)
+        self.assertIn("ing", contents)
 
 
 class TestOpenCodeMessageProcessor(unittest.TestCase):
@@ -272,7 +292,7 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
             self.processor.handle_message(Message("text", "hello"))
 
         self.session.start_loading.assert_called_once_with()
-        append.assert_called_once_with("hello")
+        append.assert_called_once_with("hello", live=True)
 
     def test_manual_compaction_starts_compacting_loader(self):
         self.processor.handle_message(Message(

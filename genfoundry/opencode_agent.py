@@ -534,6 +534,13 @@ _TOOL_NAMES = {
     "doom_loop": "DoomLoop",
 }
 
+_SUBAGENT_TOOL_NAMES = frozenset({
+    "agent", "task", "collabagenttoolcall", "spawnagent",
+})
+_SUBAGENT_TEXT_EVENTS = frozenset({
+    "session.text.delta", "session.text.ended",
+})
+
 
 def find_opencode_cli(cli_path: Optional[str] = None) -> Optional[str]:
     """Find the OpenCode CLI from custom path, system PATH, or default install locations."""
@@ -1500,6 +1507,25 @@ class OpenCodeAgent(BaseAgent):
         return not session_id or session_id in (self._session_id, "global")
 
     @staticmethod
+    def _subagent_parent_session(properties: Dict[str, Any]) -> str:
+        """Return the parent session id when an event comes from a subagent."""
+        candidates = [
+            properties.get("parentID"),
+            properties.get("parentSessionID"),
+            properties.get("rootSessionID"),
+        ]
+        metadata = properties.get("metadata")
+        if isinstance(metadata, dict):
+            candidates.extend([
+                metadata.get("parentID"),
+                metadata.get("parentSessionID"),
+            ])
+        for value in candidates:
+            if value and str(value) != str(properties.get("sessionID")):
+                return str(value)
+        return ""
+
+    @staticmethod
     def _message_id(properties: Dict[str, Any]) -> str:
         part = properties.get("part")
         if isinstance(part, dict):
@@ -1630,11 +1656,20 @@ class OpenCodeAgent(BaseAgent):
             DIAG.info("event type=%s current_session=%r data=%s",
                       event_type, self._session_id, str(properties)[:800])
 
+        from_subagent = (
+            self._subagent_parent_session(properties)
+            == str(self._session_id or "")
+        )
         if not self._belongs_to_session(properties):
-            if event_type in diag_events:
-                DIAG.info("event ignored: not this session type=%s",
-                          event_type)
-            return
+            if from_subagent and event_type in _SUBAGENT_TEXT_EVENTS:
+                # Subagent sessions are separate OpenCode sessions.  Their
+                # text can be attributed to this turn via the parent id.
+                pass
+            else:
+                if event_type in diag_events:
+                    DIAG.info("event ignored: not this session type=%s",
+                              event_type)
+                return
 
         # =================================================================
         # 1. OpenCode v2 Protocol Events (received on /api/event)
@@ -1658,7 +1693,10 @@ class OpenCodeAgent(BaseAgent):
                 key = (msg_id, properties.get("ordinal", 0))
                 self._v2_text_cache[key] = (
                     self._v2_text_cache.get(key, "") + delta)
-                await self._emit_text_delta(delta, msg_id)
+                await self._emit_text_delta(
+                    delta, msg_id, subagent=from_subagent,
+                    thread_id=properties.get("sessionID"),
+                )
             return
 
         # [v2] A new text part starts; reset the accumulator for that part.
@@ -1683,7 +1721,10 @@ class OpenCodeAgent(BaseAgent):
                 remainder = self._unstreamed_text(streamed, full_text)
                 self._v2_text_cache[key] = full_text
                 if remainder:
-                    await self._emit_text_delta(remainder, msg_id)
+                    await self._emit_text_delta(
+                        remainder, msg_id, subagent=from_subagent,
+                        thread_id=properties.get("sessionID"),
+                    )
             return
 
         # [v2] Assistant streaming reasoning / thought delta
@@ -2169,9 +2210,10 @@ class OpenCodeAgent(BaseAgent):
         raw_name = str(part.get("tool") or "tool")
         content = _tool_content_from_state(
             raw_name, {**state, "status": "running"})
-        if content.get("name") != "command_execution":
+        is_subagent = str(raw_name).lower() in _SUBAGENT_TOOL_NAMES
+        if content.get("name") != "command_execution" and not is_subagent:
             return
-        if not content.get("command"):
+        if content.get("name") == "command_execution" and not content.get("command"):
             return
         self._running_tools.add(part_id)
         await self._message_queue.put(Message(
@@ -2195,10 +2237,17 @@ class OpenCodeAgent(BaseAgent):
             prefix += 1
         return full_text[prefix:]
 
-    async def _emit_text_delta(self, delta: str, msg_id: Optional[str]) -> None:
+    async def _emit_text_delta(self, delta: str, msg_id: Optional[str],
+                               subagent: bool = False,
+                               thread_id: Optional[str] = None) -> None:
         if not delta:
             return
-        if self._turn_plan_mode:
+        if subagent:
+            await self._message_queue.put(Message(
+                MessageType.SUBAGENT_TEXT.value, content=delta, msg_id=msg_id,
+                thread_id=thread_id or msg_id,
+            ))
+        elif self._turn_plan_mode:
             self._plan_text += delta
         else:
             await self._message_queue.put(Message(
@@ -2227,9 +2276,10 @@ class OpenCodeAgent(BaseAgent):
             return
         content = _tool_content_from_state(
             raw_name, {"input": input_data, "status": "running"})
-        if content.get("name") != "command_execution":
+        is_subagent = str(raw_name).lower() in _SUBAGENT_TOOL_NAMES
+        if content.get("name") != "command_execution" and not is_subagent:
             return
-        if not content.get("command"):
+        if content.get("name") == "command_execution" and not content.get("command"):
             return
         self._running_tools.add(tool_id)
         await self._message_queue.put(Message(

@@ -9,6 +9,7 @@ from enum import Enum
 class MessageType(Enum):
     """Types of messages that can be received from an Agent"""
     TEXT = "text"
+    SUBAGENT_TEXT = "subagent_text"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
     ERROR = "error"

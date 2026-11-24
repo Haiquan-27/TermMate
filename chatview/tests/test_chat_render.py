@@ -147,5 +147,30 @@ class TestMarkdownFormatterEmptyChunk(unittest.TestCase):
         self.assertEqual(formatter.format("\n", flush=False), "partial\n")
 
 
+class TestMarkdownFormatterLiveStreaming(unittest.TestCase):
+
+    def test_partial_line_is_emitted_without_waiting_for_newline(self):
+        formatter = MarkdownFormatter()
+        self.assertEqual(formatter.format("Hel", live=True), "Hel")
+        self.assertEqual(formatter.format("lo", live=True), "lo")
+        self.assertEqual(formatter.format("\nnext", live=True), "\nnext")
+        # Everything was already streamed; the end-of-turn flush adds nothing.
+        self.assertEqual(formatter.format("", flush=True), "")
+
+    def test_flush_does_not_duplicate_streamed_text(self):
+        formatter = MarkdownFormatter()
+        self.assertEqual(formatter.format("answer", live=True), "answer")
+        self.assertEqual(formatter.format("", flush=True), "")
+        self.assertEqual(formatter.format(" tail", live=True), " tail")
+
+    def test_table_candidate_waits_for_complete_line(self):
+        formatter = MarkdownFormatter()
+        self.assertEqual(formatter.format("| a", live=True), "")
+        output = formatter.format(" | b |\n|---|---|\n| 1 | 2 |\n", live=True)
+        self.assertIn("a", output)
+        self.assertIn("b", output)
+        self.assertEqual(output.count("a"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
