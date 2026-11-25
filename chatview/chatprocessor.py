@@ -1270,6 +1270,91 @@ class BaseChatMessageProcessor:
             window.open_file(abs_path)
         return True
 
+    def open_subagent_tool_call(self, line_text, window, view=None, point=None):
+        """Open the subagent chat view for a subagent tool-call line.
+
+        Returns True when the line is a subagent tool header and a matching
+        session was found (or opened).  This lets double-click on a subagent
+        row behave like double-click on a read/edit file row.
+        """
+        text = str(line_text or "").strip()
+        if not text.startswith("⏺"):
+            return False
+        name = text[1:].strip().split(None, 1)[0] if len(text) > 1 else ""
+        if name not in _SUBAGENT_TOOL_NAMES:
+            return False
+
+        session_id = self._extract_subagent_session_id_from_line(text)
+        if not session_id:
+            return False
+
+        # Focus an already-open subagent view for this session.
+        for v in window.views():
+            try:
+                if (v.settings().get("chatview_subagent", False)
+                        and str(v.settings().get("chatview_session_id") or "") == session_id):
+                    window.focus_view(v)
+                    return True
+            except Exception:
+                continue
+
+        self._open_subagent_session_view(window, session_id, text)
+        return True
+
+    def _extract_subagent_session_id_from_line(self, line_text):
+        """Extract a subagent session id from a rendered tool header."""
+        known = set(self._subagent_session_to_tool_key.keys())
+        known.update(self._subagent_tool_key_to_session.values())
+        for sid in known:
+            if sid and sid in line_text:
+                return sid
+        # Fallback: session id appended as the last token.
+        tokens = line_text.rstrip().split()
+        if not tokens:
+            return ""
+        tail = tokens[-1].strip()
+        if re.match(r"^(ses_[A-Za-z0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$", tail):
+            return tail
+        # Generic fallback: long opaque id-like token at end.
+        if len(tail) >= 12 and re.match(r"^[A-Za-z0-9_-]+$", tail):
+            return tail
+        return ""
+
+    def _open_subagent_session_view(self, window, session_id, line_text):
+        """Open a read-only subagent chat view for *session_id*."""
+        from .chatview import (
+            _create_chat_view_and_session, SessionRole, CHAT_THREAD_ID,
+            CHAT_THREAD_TITLE, TermChatNewThreadCommand, chat_threads,
+        )
+        session = self.session
+        cwd = (session.agent_thread.cwd
+               if session.agent_thread and session.agent_thread.cwd
+               else session.cwd) or ""
+        agent = chat_threads.get_setting_for_session(
+            window, session, "chatview_agent_provider", "opencode"
+        )
+        summary = line_text[1:].strip()  # drop "⏺"
+        task_num = TermChatNewThreadCommand(window)._next_task_number()
+        new_view = _create_chat_view_and_session(
+            window,
+            role=SessionRole.TASK,
+            cwd=cwd,
+            session_id=session_id,
+            initial_title=summary,
+            subagent=True,
+        )
+        new_view.settings().set(CHAT_THREAD_ID, task_num)
+        new_view.settings().set(CHAT_THREAD_TITLE, summary)
+        new_session = chat_threads.sessions.get(new_view.id())
+        if new_session is None:
+            return
+        new_session.has_sent_message = True
+        new_session.set_thread_title(summary)
+        new_session._clear_transcript()
+        new_session._fetch_resume_history_async(
+            agent, session_id, cwd, history_limit=0, render_full=True,
+        )
+
     def open_local_file_link(self, line_text, window, view, point):
         """Open the local Markdown link under a double-click."""
         if view is None or point is None:

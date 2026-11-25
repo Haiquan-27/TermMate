@@ -149,6 +149,31 @@ class TestToolContextPipeline(unittest.TestCase):
         self.assertFalse(ctx.has_phantom)
         self.assertGreaterEqual(len(ctx.diffs), 2)
 
+    def test_open_subagent_tool_call_focuses_existing_view(self):
+        self.processor._subagent_session_to_tool_key["ses_child_1"] = "toolu_1"
+        window = MagicMock()
+        target = MagicMock()
+        target.settings.return_value.get.side_effect = lambda k, d=None: {
+            "chatview_subagent": True, "chatview_session_id": "ses_child_1",
+        }.get(k, d)
+        window.views.return_value = [target]
+
+        ok = self.processor.open_subagent_tool_call(
+            "⏺ task explore find files ses_child_1", window
+        )
+        self.assertTrue(ok)
+        window.focus_view.assert_called_once_with(target)
+
+    def test_extract_subagent_session_id_fallback(self):
+        sid = self.processor._extract_subagent_session_id_from_line(
+            "⏺ Agent explore inspect repo ses_abc123XYZ"
+        )
+        self.assertEqual(sid, "ses_abc123XYZ")
+
+    def test_open_subagent_tool_call_ignores_non_subagent(self):
+        ok = self.processor.open_subagent_tool_call("⏺ read foo.py", MagicMock())
+        self.assertFalse(ok)
+
 
 if __name__ == "__main__":
     unittest.main()
