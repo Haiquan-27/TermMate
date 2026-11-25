@@ -5,6 +5,8 @@ import os
 import re
 import urllib.parse
 import xml.etree.ElementTree
+from dataclasses import dataclass, field
+from typing import Optional
 
 import sublime
 
@@ -27,6 +29,80 @@ _SUBAGENT_TOOL_NAMES = frozenset({
     "Agent", "Task", "Subagent", "agent", "task", "subagent",
     "collabAgentToolCall", "spawnAgent",
 })
+
+
+@dataclass
+class ToolContext:
+    """Canonical semantic context for one tool call.
+
+    Built once from a raw (possibly history-normalized) block, then consumed
+    by the unified renderer.  The renderer never inspects the rendered text to
+    guess whether the tool is a diff, a multi-file edit, or a plain row: every
+    such decision is already recorded here as an explicit field.
+    """
+
+    kind: str = "unknown"
+    text: str = ""
+    heading: str = ""
+    summary: str = ""
+    detail: str = ""
+    phase: Optional[str] = None
+    output_summary: str = ""
+    output_detail: str = ""
+    error_detail: str = ""
+    has_output: bool = False
+    show_command: bool = False
+    is_diff: bool = False
+    diff_text: str = ""
+    diffs: list = field(default_factory=list)
+    has_inline_body: bool = False
+    is_multi: bool = False
+    has_phantom: bool = True
+
+
+@dataclass
+class ToolStructure:
+    """Structured facts captured while a provider renders a tool block.
+
+    ``_format_tool_block`` keeps returning a plain string (many callers rely
+    on that), but accepts an optional ``structure`` to record the same facts
+    it already knows while building the string.  This lets the context
+    pipeline stay text-driven only for providers that have not been migrated
+    yet, without changing any externally visible output.
+    """
+
+    kind: str = ""
+    heading: str = ""
+    summary: str = ""
+    detail: str = ""
+    is_diff: bool = False
+    diff_text: str = ""
+    diffs: list = field(default_factory=list)
+    has_inline_body: bool = False
+    is_multi: bool = False
+
+    def set_header(self, heading, summary, detail=None):
+        """Record the tool header explicitly (no text re-parsing needed)."""
+        self.heading = heading
+        self.summary = summary
+        self.detail = detail if detail is not None else f"{heading} {summary}".strip()
+
+    def fill_from_text(self, text, split_header):
+        """Compatibility fallback: derive structure from rendered text.
+
+        Only fills fields the provider did not set explicitly, so migrated
+        providers stop depending on this heuristic entirely.
+        """
+        text = text or ""
+        if not self.detail:
+            self.detail = text.partition("\n")[0].strip()
+        if not self.heading and not self.summary:
+            self.heading, self.summary = split_header(self.detail)
+        if not self.has_inline_body:
+            self.has_inline_body = "\n" in text
+        if not self.is_multi:
+            self.is_multi = text.count("⏺") > 1
+        return self
 
 
 def _is_subagent_tool(block):
@@ -552,9 +628,14 @@ class BaseChatMessageProcessor:
         indented = "\n".join("  " + line for line in diff_text.rstrip().splitlines())
         return f"  ````diff\n{indented}\n  ````"
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name")
-        return f"⏺ {name}" if name else ""
+        text = f"⏺ {name}" if name else ""
+        if structure is not None:
+            if name:
+                structure.set_header(f"⏺ {name}", "")
+            structure.fill_from_text(text, self._split_tool_header)
+        return text
 
     def format_tool_result(self, block, force_collapse=False):
         """Render a completed tool result for the chat view.
@@ -806,6 +887,176 @@ class BaseChatMessageProcessor:
         return isinstance(metadata, dict) and bool(metadata.get("diff"))
 
     @staticmethod
+    def _extract_diffs(block):
+        """Return ``(diff_text, diffs)`` from structured block data.
+
+        ``diffs`` is a list of ``{"header", "diff_text"}`` entries so a
+        multi-file edit is represented explicitly instead of being inferred
+        from how many ``⏺`` characters a rendered string happens to contain.
+        """
+        metadata = block.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        diff_text = metadata.get("diff") or ""
+        filediff = metadata.get("filediff")
+        if not diff_text and isinstance(filediff, dict):
+            diff_text = filediff.get("patch") or ""
+
+        diffs = []
+        changes = block.get("changes")
+        if isinstance(changes, list):
+            for change in changes:
+                if not isinstance(change, dict):
+                    continue
+                path = change.get("path") or ""
+                body = change.get("diff") or ""
+                if path or body:
+                    diffs.append({"header": path, "diff_text": body})
+        if diffs:
+            if not diff_text:
+                diff_text = diffs[0]["diff_text"]
+        elif diff_text:
+            diffs = [{"header": "", "diff_text": diff_text}]
+        return diff_text, diffs
+
+    def _build_tool_context(self, block, key=None):
+        """Build a canonical :class:`ToolContext` from a raw tool block.
+
+        This is the single place where provider-specific text generation and
+        all diff/multi-file decisions happen.  Downstream rendering only reads
+        context fields, so live and history-normalized blocks share one path.
+        """
+        if not isinstance(block, dict):
+            return ToolContext()
+
+        # Command-like tools: the command itself is the detail and the header
+        # is synthesized from the tool name (plus optional workdir label).
+        command = self._command_text(block)
+        if command is not None:
+            heading = self._command_heading(block)
+            summary = self._command_preview(command)
+            detail = command.rstrip("\n")
+            workdir = self._command_workdir(block)
+            if workdir:
+                detail = f"[{workdir}] {detail}"
+            ctx = ToolContext(
+                kind="command",
+                heading=heading,
+                summary=summary,
+                detail=detail,
+                text=f"{heading} {summary}".strip(),
+                show_command=True,
+                phase=_tool_call_phase(block),
+            )
+            if not ctx.phase:
+                self._fill_result_into_context(ctx, block)
+            return ctx
+
+        # Every other tool: the provider renders its text and, in the same
+        # pass, records the structural facts it already knows.  Migrated
+        # providers set these explicitly; the compatibility fallback derives
+        # them from the text once, here, instead of in the renderer.
+        structure = ToolStructure()
+        text = self._format_tool_block(block, structure=structure)
+        diff_text, diffs = self._extract_diffs(block)
+        if diff_text or diffs:
+            structure.diff_text = diff_text
+            structure.diffs = diffs
+        structure.fill_from_text(text, self._split_tool_header)
+        structure.is_diff = self._is_diff_tool(block)
+        if structure.is_diff and structure.diff_text:
+            structure.kind = "diff"
+
+        ctx = ToolContext(
+            kind=("diff" if structure.is_diff and structure.diff_text
+                  else structure.kind or str(
+                      block.get("name") or "unknown").lower()),
+            text=text,
+            heading=structure.heading,
+            summary=structure.summary,
+            detail=structure.detail,
+            is_diff=structure.is_diff,
+            diff_text=structure.diff_text,
+            diffs=structure.diffs,
+            has_inline_body=structure.has_inline_body,
+            is_multi=structure.is_multi,
+            phase=_tool_call_phase(block),
+        )
+        if not text or structure.is_multi or not text.lstrip().startswith("⏺"):
+            ctx.has_phantom = False
+            return ctx
+
+        if ctx.is_diff and ctx.has_inline_body:
+            # Inline diff body: the result summary is computed from the body
+            # itself because format_tool_result suppresses diff results.
+            ctx.has_output = True
+            _, out_summary, out_detail, out_error = self.format_tool_result(
+                block, force_collapse=True)
+            ctx.output_detail = out_detail
+            ctx.error_detail = out_error
+            if not out_summary:
+                body_lines = max(0, len(text.splitlines()) - 1)
+                unit = "line" if body_lines == 1 else "lines"
+                out_summary = f"{body_lines} {unit} {_tool_result_status(block)}"
+            ctx.output_summary = out_summary
+            return ctx
+
+        self._fill_result_into_context(ctx, block)
+        if (not ctx.phase and not ctx.has_output
+                and not any(k in block for k in ("output", "error", "exitCode"))):
+            # A plain tool with no result yet has nothing to show below its
+            # header (running rows above already returned via ctx.phase).
+            ctx.has_phantom = False
+        return ctx
+
+    def _fill_result_into_context(self, ctx, block):
+        """Populate output/error fields on ``ctx`` from a finished result."""
+        _, out_summary, out_detail, out_error = self.format_tool_result(
+            block, force_collapse=True)
+        ctx.output_summary = out_summary
+        ctx.output_detail = out_detail
+        ctx.error_detail = out_error
+        if out_detail or out_error:
+            ctx.has_output = True
+        elif any(k in block for k in ("output", "error", "exitCode")):
+            # Finished but silent: keep a zero-line row so a previous
+            # "running…" status does not simply vanish.
+            ctx.has_output = True
+            ctx.output_summary = f"0 lines {_tool_result_status(block)}"
+            ctx.output_detail = ""
+
+    def _render_tool(self, ctx, key=None):
+        """Render one tool call from its context into ``(text, phantoms)``."""
+        if not ctx.text or not ctx.has_phantom:
+            return ctx.text, []
+
+        call = {
+            "line": 0,
+            "kind": "tool_call",
+            "key": key,
+            "status_only": True,
+            "command": {
+                "heading": ctx.heading,
+                "summary": ctx.summary,
+                "detail": ctx.detail,
+                "show_command": ctx.show_command,
+            },
+            "output": None,
+        }
+        if ctx.phase:
+            call["status"] = ctx.phase
+            return ctx.text, [call]
+
+        if ctx.error_detail:
+            call["error"] = {"detail": ctx.error_detail}
+        if ctx.has_output:
+            call["output"] = {
+                "summary": ctx.output_summary,
+                "detail": ctx.output_detail,
+            }
+        return ctx.text, [call]
+
+    @staticmethod
     def _subagent_session_id(block):
         """Extract child session id for a subagent tool call, if present."""
         if not isinstance(block, dict):
@@ -840,132 +1091,20 @@ class BaseChatMessageProcessor:
              "output": {"summary", "detail"} | None}
 
         ``line`` is a row offset inside ``text``; ``0`` anchors the status row
-        on the appended header line so it renders directly below it. Diff
-        tools keep their body as inline text and do not get a status row.
+        on the appended header line so it renders directly below it.
+
+        Rendering is a two-stage pipeline:
+
+            format_tool_call
+              -> _build_tool_context   (provider text + all decisions)
+              -> _render_tool          (pure context -> text/phantoms)
+
+        Diff detection, multi-file detection and result/phase resolution all
+        live in the context, so the renderer never guesses them from the
+        rendered string.
         """
-        if not isinstance(block, dict):
-            return "", []
-
-        command = self._command_text(block)
-        if command is not None:
-            phase = _tool_call_phase(block)
-            heading = self._command_heading(block)
-            summary = self._command_preview(command)
-            workdir = self._command_workdir(block)
-            detail = command.rstrip("\n")
-            if workdir:
-                detail = f"[{workdir}] {detail}"
-            call = {
-                "line": 0,
-                "kind": "tool_call",
-                "key": key,
-                "status_only": True,
-                "command": {
-                    "heading": heading,
-                    "summary": summary,
-                    "detail": detail,
-                    "show_command": True,
-                },
-                "output": None,
-            }
-            if phase:
-                call["status"] = phase
-            else:
-                _, out_summary, out_detail, out_error = self.format_tool_result(
-                    block, force_collapse=True)
-                if out_error:
-                    call["error"] = {"detail": out_error}
-                if out_detail or out_error:
-                    call["output"] = {
-                        "summary": out_summary,
-                        "detail": out_detail,
-                    }
-                elif any(k in block for k in ("output", "error", "exitCode")):
-                    # A finished command that printed nothing still needs a
-                    # row: otherwise "running…" would simply vanish when it
-                    # completes.
-                    call["output"] = {
-                        "summary": f"0 lines {_tool_result_status(block)}",
-                        "detail": "",
-                    }
-            return f"{heading} {summary}".strip(), [call]
-
-        text = self._format_tool_block(block)
-        has_inline_body = "\n" in text
-        is_diff_inline = self._is_diff_tool(block) and has_inline_body
-        if (not text.startswith("⏺") or text.count("⏺") != 1):
-            # Multi-file blocks keep their per-file headers.
-            return text, []
-        if is_diff_inline:
-            header_line = text.partition("\n")[0]
-            heading, summary = self._split_tool_header(header_line)
-            phase = _tool_call_phase(block)
-            _, out_summary, out_detail, out_error = self.format_tool_result(
-                block, force_collapse=True)
-            if not out_summary:
-                body_lines = max(0, len(text.splitlines()) - 1)
-                unit = "line" if body_lines == 1 else "lines"
-                out_summary = f"{body_lines} {unit} {_tool_result_status(block)}"
-            call = {
-                "line": 0,
-                "kind": "tool_call",
-                "key": key,
-                "status_only": True,
-                "command": {
-                    "heading": heading,
-                    "summary": summary,
-                    "detail": header_line,
-                    "show_command": False,
-                },
-                "output": None,
-            }
-            if phase:
-                call["status"] = phase
-            else:
-                if out_error:
-                    call["error"] = {"detail": out_error}
-                call["output"] = {
-                    "summary": out_summary,
-                    "detail": out_detail,
-                }
-            return text, [call]
-
-        header_line = text.partition("\n")[0]
-        heading, summary = self._split_tool_header(header_line)
-        phase = _tool_call_phase(block)
-        _, out_summary, out_detail, out_error = self.format_tool_result(
-            block, force_collapse=True)
-        call = {
-            "line": 0,
-            "kind": "tool_call",
-            "key": key,
-            "status_only": True,
-            "command": {
-                "heading": heading,
-                "summary": summary,
-                "detail": header_line,
-                "show_command": False,
-            },
-            "output": None,
-        }
-        if phase:
-            call["status"] = phase
-        else:
-            if out_error:
-                call["error"] = {"detail": out_error}
-            if out_detail or out_error:
-                call["output"] = {
-                    "summary": out_summary,
-                    "detail": out_detail,
-                }
-            elif any(k in block for k in ("output", "error", "exitCode")):
-                call["output"] = {
-                    "summary": f"0 lines {_tool_result_status(block)}",
-                    "detail": "",
-                }
-            else:
-                return text, []
-        return text, [call]
+        ctx = self._build_tool_context(block, key)
+        return self._render_tool(ctx, key)
 
     def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None,
                        live=False):
@@ -1344,7 +1483,7 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                 if models:
                     self.set_available_models(models)
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name")
         input_data = block.get("input", {})
 
@@ -1356,23 +1495,23 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                 except Exception:
                     rel_path = file_path
 
-                # Extract offset and limit for line number display
                 offset = input_data.get("offset")
                 limit = input_data.get("limit")
-
                 if offset is not None and limit is not None:
                     start_line = offset
                     end_line = offset + limit - 1
-                    return f"⏺ Read {rel_path}#L{start_line}-L{end_line}"
+                    text = f"⏺ Read {rel_path}#L{start_line}-L{end_line}"
                 elif offset is not None:
-                    return f"⏺ Read {rel_path}#L{offset}"
+                    text = f"⏺ Read {rel_path}#L{offset}"
                 else:
-                    return f"⏺ Read {rel_path}"
+                    text = f"⏺ Read {rel_path}"
+                if structure is not None:
+                    structure.fill_from_text(text, self._split_tool_header)
+                return text
 
         elif name in ("Agent", "Task", "Subagent", "agent", "task", "subagent"):
             description = input_data.get("description", "")
             subagent_type = input_data.get("subagent_type", "")
-
             parts = [f"⏺ {name}"]
             if subagent_type:
                 parts.append(subagent_type)
@@ -1381,8 +1520,11 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
             session_id = self._subagent_session_id(block)
             if session_id:
                 parts.append(str(session_id))
-
-            return " ".join(parts)
+            text = " ".join(parts)
+            if structure is not None:
+                structure.kind = "subagent"
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
 
         elif name == "Bash":
             command = input_data.get("command", "")
@@ -1391,24 +1533,43 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                 if len(lines) > 1:
                     first_line = lines[0]
                     indented_rest = "\n".join("    " + line for line in lines[1:])
-                    return f"⏺ Bash {first_line}\n\n{indented_rest}\n"
+                    text = f"⏺ Bash {first_line}\n\n{indented_rest}\n"
                 elif len(lines) == 1:
-                    return f"⏺ Bash {lines[0]}"
+                    text = f"⏺ Bash {lines[0]}"
+                else:
+                    text = ""
+                if structure is not None and text:
+                    structure.kind = "command"
+                    structure.set_header("⏺ Bash", first_line if len(lines) > 1 else lines[0])
+                    structure.has_inline_body = "\n" in text
+                return text
 
         elif name in ("Grep", "Glob"):
             pattern = input_data.get("pattern")
             if pattern:
-                return f"⏺ {name} {pattern}"
+                text = f"⏺ {name} {pattern}"
+                if structure is not None:
+                    structure.fill_from_text(text, self._split_tool_header)
+                return text
         elif name == "WebFetch":
             url = input_data.get("url", "")
             if url:
-                return f"⏺ WebFetch {url}"
+                text = f"⏺ WebFetch {url}"
+                if structure is not None:
+                    structure.fill_from_text(text, self._split_tool_header)
+                return text
         elif name == "WebSearch":
             query = input_data.get("query", "")
             if query:
-                return f"⏺ WebSearch ({query})"
+                text = f"⏺ WebSearch ({query})"
+                if structure is not None:
+                    structure.fill_from_text(text, self._split_tool_header)
+                return text
 
-        return f"⏺ {name}" if name else ""
+        text = f"⏺ {name}" if name else ""
+        if structure is not None:
+            structure.fill_from_text(text, self._split_tool_header)
+        return text
 
     def _format_edit_result(self, tool_use_result):
         """Render Edit/Write header + diff from tool_use_result data."""
@@ -1605,7 +1766,7 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             # Show the artifact last so later appends don't land at its fold boundary
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name")
 
         if name == "fileChange":
@@ -1614,6 +1775,7 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
                    if self.session.agent_thread else self.session.cwd) or ""
 
             rendered_parts = []
+            header_count = 0
             previous_path = None
             for change in changes:
                 path = change.get("path", "")
@@ -1636,13 +1798,30 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
 
                 if header and rendered_diff:
                     rendered_parts.append(f"{header}\n{rendered_diff}")
+                    header_count += 1
+                    if structure is not None:
+                        structure.diffs.append({"header": header, "diff_text": diff_text})
                 elif header:
                     rendered_parts.append(header)
+                    header_count += 1
+                    if structure is not None:
+                        structure.diffs.append({"header": header, "diff_text": ""})
                 elif rendered_diff:
                     rendered_parts.append(rendered_diff)
 
-            return ("\n\n".join(rendered_parts)
+            text = ("\n\n".join(rendered_parts)
                     if rendered_parts else "⏺ fileChange")
+            if structure is not None:
+                structure.is_diff = True
+                structure.is_multi = header_count > 1
+                structure.has_inline_body = any(
+                    d.get("diff_text") for d in structure.diffs
+                )
+                if not structure.is_multi:
+                    structure.fill_from_text(text, self._split_tool_header)
+                else:
+                    structure.detail = text.partition("\n")[0].strip()
+            return text
         elif name in ("mcpToolCall", "dynamicToolCall"):
             namespace = block.get("server") or block.get("namespace")
             tool = block.get("tool") or "unknown_tool"
@@ -1652,7 +1831,11 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             )
             arguments = block.get("arguments", block.get("input", {}))
             detail = _format_tool_arguments(arguments)
-            return f"⏺ {qualified_name} ({detail})" if detail else f"⏺ {qualified_name}"
+            text = f"⏺ {qualified_name} ({detail})" if detail else f"⏺ {qualified_name}"
+            if structure is not None:
+                structure.set_header(f"⏺ {qualified_name}", f"({detail})" if detail else "")
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
         elif name == "collabAgentToolCall":
             tool = block.get("tool") or "unknown_tool"
             arguments = {}
@@ -1666,7 +1849,11 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
             if block.get("reasoningEffort"):
                 arguments["reasoning"] = block["reasoningEffort"]
             detail = _format_tool_arguments(arguments)
-            return f"⏺ {tool} ({detail})" if detail else f"⏺ {tool}"
+            text = f"⏺ {tool} ({detail})" if detail else f"⏺ {tool}"
+            if structure is not None:
+                structure.set_header(f"⏺ {tool}", f"({detail})" if detail else "")
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
         elif name == "webSearch":
             detail = block.get("query") or ""
             action = block.get("action") or {}
@@ -1683,19 +1870,34 @@ class CodexMessageProcessor(BaseChatMessageProcessor):
                     detail = f"'{pattern}' in {url}"
                 else:
                     detail = pattern or url or detail
-            return f"⏺ {name} ({detail})" if detail else f"⏺ {name}"
+            text = f"⏺ {name} ({detail})" if detail else f"⏺ {name}"
+            if structure is not None:
+                structure.set_header(f"⏺ {name}", f"({detail})" if detail else "")
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
         elif name == "imageView":
             path = block.get("path") or ""
             if path:
                 cwd = (self.session.agent_thread.cwd
                        if self.session.agent_thread else self.session.cwd) or ""
                 _, rel_path = _resolve_rel_path(path, cwd)
-                return f"⏺ {name} {rel_path}"
-            return f"⏺ {name}"
+                text = f"⏺ {name} {rel_path}"
+            else:
+                text = f"⏺ {name}"
+            if structure is not None:
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
         elif name == "imageGeneration":
-            return f"⏺ {name}"
+            text = f"⏺ {name}"
+            if structure is not None:
+                structure.set_header(f"⏺ {name}", "")
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
 
-        return f"⏺ {name}" if name else ""
+        text = f"⏺ {name}" if name else ""
+        if structure is not None:
+            structure.fill_from_text(text, self._split_tool_header)
+        return text
 
 
 class OpenCodeMessageProcessor(BaseChatMessageProcessor):
@@ -1960,13 +2162,14 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         self.append_content("", is_tool=True, tool_phantoms=[phantom])
         utils.DIAG.info("handle_shell_finished append_content done")
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name")
         if name == "fileChange":
             changes = block.get("changes", [])
             cwd = (self.session.agent_thread.cwd
                    if self.session.agent_thread else self.session.cwd) or ""
             rendered_parts = []
+            header_count = 0
             previous_path = None
             for change in changes:
                 path = change.get("path", "")
@@ -1988,12 +2191,29 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
 
                 if header and rendered_diff:
                     rendered_parts.append(f"{header}\n{rendered_diff}")
+                    header_count += 1
+                    if structure is not None:
+                        structure.diffs.append({"header": header, "diff_text": diff_text})
                 elif header:
                     rendered_parts.append(header)
+                    header_count += 1
+                    if structure is not None:
+                        structure.diffs.append({"header": header, "diff_text": ""})
                 elif rendered_diff:
                     rendered_parts.append(rendered_diff)
-            return ("\n\n".join(rendered_parts)
+            text = ("\n\n".join(rendered_parts)
                     if rendered_parts else "⏺ fileChange")
+            if structure is not None:
+                structure.is_diff = True
+                structure.is_multi = header_count > 1
+                structure.has_inline_body = any(
+                    d.get("diff_text") for d in structure.diffs
+                )
+                if not structure.is_multi:
+                    structure.fill_from_text(text, self._split_tool_header)
+                else:
+                    structure.detail = text.partition("\n")[0].strip()
+            return text
 
         input_data = block.get("input") or {}
         if not isinstance(input_data, dict):
@@ -2106,7 +2326,16 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
                 rel_path = f"{rel_path}#L{line_no}"
             header = f"⏺ {display_name} {rel_path}"
             rendered_diff = self._render_diff_block(diff_text)
-            return f"{header}\n{rendered_diff}" if rendered_diff else header
+            text = f"{header}\n{rendered_diff}" if rendered_diff else header
+            if structure is not None:
+                structure.kind = lower_name
+                structure.set_header(f"⏺ {display_name}", rel_path)
+                if rendered_diff:
+                    structure.is_diff = True
+                    structure.has_inline_body = True
+                    structure.diff_text = diff_text
+                    structure.diffs = [{"header": header, "diff_text": diff_text}]
+            return text
 
         is_subagent = lower_name in ("task", "agent", "subagent")
         if is_subagent:
@@ -2120,7 +2349,11 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             session_id = self._subagent_session_id(block)
             if session_id:
                 parts.append(str(session_id))
-            return f"⏺ {' '.join(parts)}"
+            text = f"⏺ {' '.join(parts)}"
+            if structure is not None:
+                structure.kind = "subagent"
+                structure.fill_from_text(text, self._split_tool_header)
+            return text
 
         command_block = block
         if str(block.get("name") or "").lower() != lower_name:
@@ -2129,12 +2362,20 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         if command:
             heading = self._command_heading(command_block)
             preview = self._command_preview(command)
-            return f"{heading} {preview}".strip()
+            text = f"{heading} {preview}".strip()
+            if structure is not None:
+                structure.kind = "command"
+                structure.set_header(heading, preview, detail=command.rstrip("\n"))
+            return text
 
         detail = block.get("title") or _format_tool_arguments(input_data)
         if block.get("status") == "error" and block.get("error"):
             detail = detail or str(block["error"])
-        return f"⏺ {display_name} ({detail})" if detail else f"⏺ {display_name}"
+        text = f"⏺ {display_name} ({detail})" if detail else f"⏺ {display_name}"
+        if structure is not None:
+            structure.kind = lower_name
+            structure.fill_from_text(text, self._split_tool_header)
+        return text
 
 
 class PiMessageProcessor(BaseChatMessageProcessor):
@@ -2323,7 +2564,7 @@ class PiMessageProcessor(BaseChatMessageProcessor):
                 if models:
                     self.set_available_models(models)
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name")
         input_data = block.get("arguments", {})
 
@@ -2770,7 +3011,7 @@ class AntigravityMessageProcessor(BaseChatMessageProcessor):
                 )
             sublime.set_timeout(self.session.show_file_changes_artifact, 0)
 
-    def _format_tool_block(self, block):
+    def _format_tool_block(self, block, structure=None):
         name = block.get("name") or "tool"
         display_name = self._TOOL_DISPLAY_NAMES.get(
             name, "".join(part.capitalize() for part in name.split("_"))
