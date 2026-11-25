@@ -55,6 +55,12 @@ contexts:
         1: punctuation.definition.raw.code-fence.begin.markdown
         2: constant.other.language-name.markdown
       push: diff_block
+    - match: '^[ \t]*(`{3,})((?i:error)\b.*)$'
+      scope: meta.code-fence.definition.begin.markdown-gfm
+      captures:
+        1: punctuation.definition.raw.code-fence.begin.markdown
+        2: constant.other.language-name.markdown
+      push: error_block
     - include: scope:text.html.markdown#markdown
 
   diff_block:
@@ -77,6 +83,12 @@ contexts:
         1: punctuation.definition.inserted.diff
     - match: '^(?:  |) (.*)$'
       scope: meta.diff.line.context
+
+  error_block:
+    - meta_scope: meta.code-fence.body.markdown-gfm markup.raw.code-fence.error.markdown-gfm markup.error markup.deleted
+    - match: '^[ \t]*(`{3,})[ \t]*$'
+      scope: meta.code-fence.definition.end.markdown-gfm punctuation.definition.raw.code-fence.end.markdown
+      pop: true
 
   artifact_file_list:
     - match: '^    (\S.*?)(\s{2,})(\+\d+)(\s+)(-\d+)\s*$'

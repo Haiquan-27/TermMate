@@ -818,6 +818,13 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
 
     async def test_v2_task_running_tool_is_emitted(self):
         await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_child_task",
+                "info": {"id": "ses_child_task", "parentID": "ses_v2"},
+            },
+        })
+        await self.agent._dispatch_event({
             "type": "session.tool.called",
             "data": {
                 "sessionID": "ses_v2",
@@ -845,6 +852,13 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
     async def test_v2_subagent_tool_running_row_is_emitted(self):
         # OpenCode uses "subagent" as the real tool name.
         await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_child_sub_1",
+                "info": {"id": "ses_child_sub_1", "parentID": "ses_v2"},
+            },
+        })
+        await self.agent._dispatch_event({
             "type": "session.tool.called",
             "data": {
                 "sessionID": "ses_v2",
@@ -859,6 +873,70 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tools[0].id, "subagent_1")
         self.assertEqual(tools[0].content["name"], "subagent")
         self.assertEqual(tools[0].content["status"], "running")
+        self.assertEqual(
+            tools[0].content.get("metadata", {}).get("sessionID"),
+            "ses_child_sub_1",
+        )
+
+    async def test_v2_parallel_subagents_emit_running_rows_in_order(self):
+        # Three parallel subagents: session.created arrives in order and assigns
+        # child session ids to pending tool rows. Rows emit in that order with id.
+        subagents = [
+            ("sub_1", "ses_child_1", "Follow-up: sftp_sthell typo"),
+            ("sub_2", "ses_child_2", "Audit icon and theme logic"),
+            ("sub_3", "ses_child_3", "Check packaging readiness"),
+        ]
+
+        for tool_id, child_sid, _ in subagents:
+            await self.agent._dispatch_event({
+                "type": "session.tool.input.started",
+                "data": {
+                    "sessionID": "ses_v2",
+                    "id": tool_id,
+                    "name": "subagent",
+                },
+            })
+
+        # Not enough info to render header with session id yet.
+        self.assertEqual([m for m in await self._messages() if m.type == "tool_use"], [])
+
+        for tool_id, child_sid, _ in subagents:
+            await self.agent._dispatch_event({
+                "type": "session.created",
+                "data": {
+                    "sessionID": child_sid,
+                    "info": {"id": child_sid, "parentID": "ses_v2"},
+                },
+            })
+
+        tools = [m for m in await self._messages() if m.type == "tool_use"]
+        self.assertEqual([t.id for t in tools], ["sub_1", "sub_2", "sub_3"])
+        self.assertEqual(
+            [t.content.get("metadata", {}).get("sessionID") for t in tools],
+            ["ses_child_1", "ses_child_2", "ses_child_3"],
+        )
+
+        for idx, (tool_id, _, desc) in enumerate(subagents, start=1):
+            await self.agent._dispatch_event({
+                "type": "session.tool.called",
+                "data": {
+                    "sessionID": "ses_v2",
+                    "id": tool_id,
+                    "name": "subagent",
+                    "input": {
+                        "agent": "explore",
+                        "description": desc,
+                        "prompt": f"prompt {idx}",
+                    },
+                },
+            })
+
+        tools = [m for m in await self._messages() if m.type == "tool_use"]
+        self.assertEqual([t.id for t in tools], ["sub_1", "sub_2", "sub_3"])
+        self.assertEqual(
+            [t.content.get("input", {}).get("description") for t in tools],
+            [desc for _, _, desc in subagents],
+        )
 
     async def test_v2_subagent_tool_result_does_not_duplicate_child_text(self):
         await self.agent._dispatch_event({
@@ -903,6 +981,13 @@ class TestOpenCodeV2AgentEvents(unittest.IsolatedAsyncioTestCase):
     async def test_v2_plan_text_flushes_before_subagent_tool(self):
         self.agent._turn_plan_mode = True
         self.agent._plan_text = "先说明一下。"
+        await self.agent._dispatch_event({
+            "type": "session.created",
+            "data": {
+                "sessionID": "ses_child_plan",
+                "info": {"id": "ses_child_plan", "parentID": "ses_v2"},
+            },
+        })
         await self.agent._dispatch_event({
             "type": "session.tool.called",
             "data": {
@@ -2474,6 +2559,17 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
         })
         self.assertEqual(block["name"], "command_execution")
         self.assertEqual(block["output"], "a.txt\nb.txt\n")
+
+    def test_tool_content_from_state_preserves_workdir(self):
+        from genfoundry.opencode_agent import _tool_content_from_state
+
+        block = _tool_content_from_state("bash", {
+            "status": "completed",
+            "input": {"command": "python -m unittest -v", "workdir": "/repo/termmate"},
+            "output": "ok\n",
+        })
+        self.assertEqual(block["name"], "command_execution")
+        self.assertEqual(block["workdir"], "/repo/termmate")
 
         # v1 ``output`` still wins when both fields are present.
         both = _tool_content_from_state("read", {

@@ -252,8 +252,39 @@ class TestCodexToolCallFormatting(unittest.TestCase):
 
 class TestSubagentTextRendering(unittest.TestCase):
 
-    def test_prefix_is_emitted_once_per_stream(self):
+    def test_duplicate_tool_call_not_reappended_when_phantom_pending(self):
         session = MagicMock()
+        session.tool_outputs = MagicMock()
+        session.tool_outputs.find.return_value = None  # phantom not registered yet
+        session.start_loading = MagicMock()
+        session.agent_thread = MagicMock(cwd="/tmp")
+        session.get_setting = MagicMock(return_value=0)
+        session.record_subagent_tool_call = MagicMock()
+        processor = BaseChatMessageProcessor(session)
+
+        block = {
+            "name": "subagent",
+            "status": "running",
+            "input": {"description": "Search repo"},
+            "metadata": {"sessionID": "ses_child_1"},
+        }
+        with patch.object(processor, "append_content") as append:
+            processor.append_tool_call(dict(block), key="tool_1")
+            processor.append_tool_call(
+                {**block, "status": "error", "error": "boom"},
+                key="tool_1",
+            )
+
+        # First call renders header once; second updates phantom only.
+        header_appends = [
+            c for c in append.call_args_list
+            if c.args and "⏺" in str(c.args[0])
+        ]
+        self.assertEqual(len(header_appends), 1)
+
+    def test_subagent_text_is_accumulated_not_inlined(self):
+        session = MagicMock()
+        session.tool_outputs = None
         processor = BaseChatMessageProcessor(session)
 
         with patch.object(processor, "append_content") as append:
@@ -264,34 +295,25 @@ class TestSubagentTextRendering(unittest.TestCase):
                 "subagent_text", "ing", msg_id="item-1", thread_id="thread-2"
             ))
 
-        contents = [entry.args[0] for entry in append.call_args_list]
-        self.assertEqual(contents.count("↳ Subagent thread-2: "), 1)
-        self.assertIn("work", contents)
-        self.assertIn("ing", contents)
+        append.assert_not_called()
+        self.assertEqual(processor._subagent_text_buffers.get("thread-2"), "working")
 
-    def test_new_child_session_starts_a_new_paragraph(self):
+    def test_subagent_text_buffers_are_separate_per_session(self):
         session = MagicMock()
+        session.tool_outputs = None
         processor = BaseChatMessageProcessor(session)
 
-        with patch.object(processor, "append_content") as append:
-            processor.handle_message(Message(
-                "subagent_text", "first answer",
-                msg_id="item-1", thread_id="thread-1",
-            ))
-            processor._ends_with_newline = False
-            processor.handle_message(Message(
-                "subagent_text", "second answer",
-                msg_id="item-2", thread_id="thread-2",
-            ))
+        processor.handle_message(Message(
+            "subagent_text", "first answer",
+            msg_id="item-1", thread_id="thread-1",
+        ))
+        processor.handle_message(Message(
+            "subagent_text", "second answer",
+            msg_id="item-2", thread_id="thread-2",
+        ))
 
-        contents = [entry.args[0] for entry in append.call_args_list]
-        self.assertIn("↳ Subagent thread-1: ", contents)
-        self.assertIn("↳ Subagent thread-2: ", contents)
-        self.assertIn("\n\n", contents)
-        self.assertLess(
-            contents.index("\n\n"),
-            contents.index("↳ Subagent thread-2: "),
-        )
+        self.assertEqual(processor._subagent_text_buffers.get("thread-1"), "first answer")
+        self.assertEqual(processor._subagent_text_buffers.get("thread-2"), "second answer")
 
 
 class TestOpenCodeMessageProcessor(unittest.TestCase):
@@ -617,6 +639,128 @@ class TestOpenCodeMessageProcessor(unittest.TestCase):
         })
 
         self.assertEqual(phantoms[0]["status"], "background")
+
+    def test_command_tool_renders_shell_name_and_input_command(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "shell",
+            "input": {"command": "cd termmate && python -c \"print(1)\""},
+            "status": "completed",
+            "output": "ok\n",
+        })
+        self.assertEqual(text, "⏺ command cd termmate && python -c \"print(1)\"")
+        self.assertEqual(len(phantoms), 1)
+
+    def test_command_tool_renders_bash_top_level_command_shape(self):
+        text, _ = self.processor.format_tool_call({
+            "name": "Bash",
+            "command": "cd termmate && python -c \"print(1)\"",
+            "status": "completed",
+            "output": "ok\n",
+        })
+        self.assertEqual(text, "⏺ command cd termmate && python -c \"print(1)\"")
+
+    def test_command_execution_falls_back_to_input_command(self):
+        text, _ = self.processor.format_tool_call({
+            "name": "command_execution",
+            "input": {"command": "echo hi"},
+            "status": "completed",
+            "output": "ok\n",
+        })
+        self.assertEqual(text, "⏺ command echo hi")
+
+    def test_generic_tool_name_inferred_for_edit_error(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "tool",
+            "input": {
+                "filePath": r"E:\repo\chatview\tests\test_codex_processor.py",
+                "oldString": "old",
+                "newString": "new",
+            },
+            "status": "error",
+            "error": "oldString not found",
+        }, key="k1")
+        self.assertTrue(text.startswith("⏺ edit"))
+        self.assertNotIn("oldString:", text.splitlines()[0])
+        self.assertEqual(len(phantoms), 1)
+
+    def test_generic_tool_name_inferred_for_read(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "tool",
+            "input": {"filePath": r"E:\repo\chatview\chatprocessor.py"},
+            "status": "completed",
+            "output": "content\n",
+        }, key="k1")
+        self.assertTrue(text.startswith("⏺ read"))
+        self.assertIn("chatprocessor.py", text)
+        self.assertEqual(len(phantoms), 1)
+
+    def test_generic_tool_command_keeps_command_detail_in_phantom(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "tool",
+            "input": {"command": "cd termmate && python -c \"print(1)\""},
+            "status": "completed",
+            "output": "ok\n",
+        }, key="k1")
+        self.assertTrue(text.startswith("⏺ command"))
+        self.assertEqual(len(phantoms), 1)
+        cmd = phantoms[0].get("command") or {}
+        self.assertTrue(cmd.get("show_command"))
+        self.assertIn("cd termmate && python -c", cmd.get("detail", ""))
+        self.assertTrue((phantoms[0].get("output") or {}).get("detail"))
+
+    def test_command_shows_workdir_when_different_from_cwd(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "python -m unittest chatview.tests.test_codex_processor -v",
+            "workdir": "/Users/sino/workbench/codeform/termmate",
+            "status": "completed",
+            "output": "ok\n",
+        }, key="k1")
+        self.assertIn("[termmate]", text)
+        self.assertTrue(text.startswith("⏺ command [termmate]"))
+        cmd = (phantoms[0].get("command") or {})
+        self.assertIn("[termmate]", cmd.get("detail", ""))
+
+    def test_command_omits_workdir_when_same_as_cwd(self):
+        text, _ = self.processor.format_tool_call({
+            "name": "command_execution",
+            "command": "python -m unittest -v",
+            "workdir": "/Users/sino/workbench/codeform",
+            "status": "completed",
+            "output": "ok\n",
+        }, key="k1")
+        self.assertNotIn("[", text)
+        self.assertTrue(text.startswith("⏺ command python -m unittest"))
+
+    def test_command_workdir_from_input(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "tool",
+            "input": {
+                "command": "python -m unittest chatview.tests.test_codex_processor -v",
+                "workdir": "/Users/sino/workbench/codeform/termmate",
+            },
+            "status": "completed",
+            "output": "ok\n",
+        }, key="k1")
+        self.assertTrue(text.startswith("⏺ command [termmate]"))
+        cmd = (phantoms[0].get("command") or {})
+        self.assertIn("[termmate]", cmd.get("detail", ""))
+
+    def test_edit_error_has_error_block_in_phantom(self):
+        text, phantoms = self.processor.format_tool_call({
+            "name": "edit",
+            "input": {"path": "demo.txt"},
+            "status": "error",
+            "error": "Could not find oldString in demo.txt. It must match exactly.",
+        }, key="e1")
+        self.assertTrue(text.startswith("⏺ edit"))
+        self.assertEqual(len(phantoms), 1)
+        p = phantoms[0]
+        self.assertIn("failed", ((p.get("output") or {}).get("summary") or ""))
+        err = (p.get("error") or {}).get("detail", "")
+        self.assertIn("Could not find oldString", err)
+        # Error should not be duplicated as Return detail.
+        self.assertEqual((p.get("output") or {}).get("detail", ""), "")
 
     def test_separate_assistant_messages_get_a_blank_line(self):
         appended = []
@@ -1091,6 +1235,24 @@ class TestThinkPresets(unittest.TestCase):
         }
         presets = ClaudeMessageProcessor.get_think_presets(active_model)
         self.assertEqual([p["value"] for p in presets], ["low", "high"])
+
+
+class TestCommandRenderingCompatibility(unittest.TestCase):
+    def test_claude_bash_input_command_not_intercepted_by_command_text(self):
+        session = MagicMock()
+        session.agent_thread = MagicMock(cwd="/tmp")
+        session.cwd = "/tmp"
+        session.tool_outputs = None
+        session.get_setting = MagicMock(return_value=0)
+        processor = ClaudeMessageProcessor(session)
+        text, _ = processor.format_tool_call({
+            "name": "Bash",
+            "input": {"command": "echo hi", "description": "desc"},
+            "status": "completed",
+            "output": "ok\n",
+        })
+        self.assertTrue(text.startswith("⏺ Bash"))
+        self.assertIn("echo hi", text)
 
 
 class TestThreadTitleMessage(unittest.TestCase):

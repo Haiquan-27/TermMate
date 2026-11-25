@@ -451,23 +451,26 @@ def _restore_chat_sessions():
 def _normalize_history_tool_block(block):
     """Map a raw history tool block to the shape live events produce.
 
-    OpenCode's history API stores every tool under the generic name "tool"
-    and keeps the real tool type inside ``input``.  Live rendering instead
-    normalises bash/shell/command into ``command_execution`` with a top-level
-    ``command`` field.  Without this mapping the restored tool header renders
-    as ``⏺ tool (command: ...)`` and can never match the saved ``⏺ command ...``
-    line in the buffer.
+    OpenCode's history API may store shell tools as ``tool`` or ``shell`` with
+    the command in ``input``.  Live rendering instead normalises bash/shell/
+    command into ``command_execution`` with a top-level ``command`` field.
+    Without this mapping the restored tool header renders as ``⏺ tool ...`` or
+    loses the command entirely.
     """
     if not isinstance(block, dict):
         return block
     name = str(block.get("name") or "tool").lower()
-    if name != "tool":
+    if name not in ("tool", "shell", "bash", "command"):
         return block
     inp = block.get("input")
     if not isinstance(inp, dict):
-        return block
+        inp = {}
 
-    command = inp.get("command") or inp.get("cmd")
+    command = (
+        block.get("command")
+        or inp.get("command")
+        or inp.get("cmd")
+    )
     if command:
         metadata = block.get("metadata")
         if not isinstance(metadata, dict):
@@ -475,7 +478,13 @@ def _normalize_history_tool_block(block):
         exit_code = metadata.get("exit")
         if exit_code is None:
             exit_code = metadata.get("exit_code", metadata.get("exitCode"))
-        return {
+        workdir = (
+            block.get("workdir")
+            or inp.get("workdir")
+            or inp.get("cwd")
+            or metadata.get("workdir")
+        )
+        normalized = {
             "name": "command_execution",
             "command": command,
             "output": block.get("output"),
@@ -484,6 +493,14 @@ def _normalize_history_tool_block(block):
             "metadata": metadata,
             "exitCode": exit_code,
         }
+        if isinstance(workdir, str) and workdir.strip():
+            normalized["workdir"] = workdir.strip()
+        return normalized
+
+    if name != "tool":
+        return block
+    if not isinstance(block.get("input"), dict):
+        return block
 
     # File readers keep their target in ``input.path``; live rendering maps
     # them to the ``read`` tool and resolves the path relative to the session
@@ -3175,6 +3192,7 @@ class ChatSession:
                         key=item.get("key"),
                         status=item.get("status"),
                         status_only=bool(item.get("status_only")),
+                        error=item.get("error"),
                     )
                     added += 1
 
@@ -4410,6 +4428,7 @@ class TermChatOutputAppendCommand(sublime_plugin.TextCommand):
                         status=item.get("status"),
                         edit=edit,
                         status_only=bool(item.get("status_only")),
+                        error=item.get("error"),
                     )
                 elif kind == "shell_finished":
                     command = item.get("command") or {}

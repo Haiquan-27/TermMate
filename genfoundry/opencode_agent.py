@@ -956,11 +956,17 @@ class OpenCodeAgent(BaseAgent):
         self._awaiting_user_message_id = False
         self._terminal_tools = set()
         self._running_tools = set()
+        self._sparse_running_tools = set()
         self._background_shells: Dict[str, str] = {}
         # OpenCode subagents live in child sessions.  Their text events only
         # carry the child session id, so remember the parent link announced by
         # session lifecycle events before those text events arrive.
         self._child_parent_sessions: Dict[str, str] = {}
+        # FIFO association for parallel subagents when sessionID is not present
+        # on the tool event itself.  Order matters: SSE events arrive in order.
+        self._pending_subagent_tool_ids: List[str] = []
+        self._unassigned_child_sessions: List[str] = []
+        self._tool_session_ids: Dict[str, str] = {}
         self._shell_commands: Dict[str, str] = {}
         self._finished_shells = set()
         self._tool_calls: Dict[str, Dict[str, Any]] = {}
@@ -1512,17 +1518,19 @@ class OpenCodeAgent(BaseAgent):
 
     def _track_session_lineage(
         self, event_type: str, properties: Dict[str, Any]
-    ) -> None:
+    ) -> Optional[str]:
         """Cache child -> parent session links announced by OpenCode.
 
         ``session.text.delta`` and ``session.text.ended`` do not carry a
         parent id.  Without this cache their events look like they belong to
         an unrelated session and are dropped before rendering.
+
+        Returns the subagent tool id that was assigned this child session, if any.
         """
         if event_type not in (
             "session.created", "session.updated", "session.forked"
         ):
-            return
+            return None
         info = properties.get("info")
         info = info if isinstance(info, dict) else {}
         child = (
@@ -1537,9 +1545,14 @@ class OpenCodeAgent(BaseAgent):
             or info.get("parentSessionID")
         )
         if not child or not parent or str(child) == str(parent):
-            return
-        self._child_parent_sessions[str(child)] = str(parent)
+            return None
+        child = str(child)
+        parent = str(parent)
+        self._child_parent_sessions[child] = parent
         DIAG.info("session lineage child=%r parent=%r", child, parent)
+        if parent == str(self._session_id or ""):
+            return self._on_child_session_created(child)
+        return None
 
     def _subagent_parent_session(self, properties: Dict[str, Any]) -> str:
         """Return the parent session id when an event comes from a subagent."""
@@ -1700,7 +1713,11 @@ class OpenCodeAgent(BaseAgent):
         # Child sessions are announced before their first text event.  Record
         # the link even when this lifecycle event itself does not belong to
         # the current session, otherwise later subagent text is dropped.
-        self._track_session_lineage(event_type, properties)
+        assigned_tool_id = self._track_session_lineage(event_type, properties)
+        if assigned_tool_id:
+            cached = self._tool_calls.get(assigned_tool_id)
+            if isinstance(cached, dict):
+                await self._emit_running_tool_v2(assigned_tool_id, cached)
 
         from_subagent = (
             self._subagent_parent_session(properties)
@@ -2274,17 +2291,55 @@ class OpenCodeAgent(BaseAgent):
     async def _emit_running_tool_v1(
         self, part_id: str, part: Dict[str, Any], state: Dict[str, Any]
     ) -> None:
-        """[OpenCode v1] Surface a command that is still running."""
-        if part_id in self._running_tools or part_id in self._terminal_tools:
+        """[OpenCode v1] Surface a command/subagent that is still running."""
+        if part_id in self._terminal_tools:
             return
         raw_name = str(part.get("tool") or "tool")
-        content = _tool_content_from_state(
-            raw_name, {**state, "status": "running"})
         is_subagent = str(raw_name).lower() in _SUBAGENT_TOOL_NAMES
+        input_data = state.get("input")
+        if not isinstance(input_data, dict):
+            input_data = {}
+
+        cached = self._tool_calls.setdefault(part_id, {})
+        merged_cached = {**cached, "name": raw_name, "input": input_data}
+        metadata = state.get("metadata")
+        if isinstance(metadata, dict):
+            merged_cached["metadata"] = {**(cached.get("metadata") or {}), **metadata}
+
+        session_id = ""
+        if is_subagent:
+            session_id = self._resolve_subagent_session_id(part_id, merged_cached)
+
+        if part_id in self._running_tools:
+            if not (is_subagent and part_id in self._sparse_running_tools and input_data):
+                return
+            self._sparse_running_tools.discard(part_id)
+        else:
+            if is_subagent:
+                if not session_id:
+                    if not input_data:
+                        self._sparse_running_tools.add(part_id)
+                    if part_id not in self._pending_subagent_tool_ids:
+                        self._pending_subagent_tool_ids.append(part_id)
+                    return
+                if not input_data:
+                    self._sparse_running_tools.add(part_id)
+            else:
+                if not input_data:
+                    return
+
+        emit_metadata = merged_cached.get("metadata")
+        if not isinstance(emit_metadata, dict):
+            emit_metadata = {}
+        if session_id and "sessionID" not in emit_metadata:
+            emit_metadata = {**emit_metadata, "sessionID": session_id}
+        content = _tool_content_from_state(
+            raw_name, {**state, "input": input_data, "metadata": emit_metadata, "status": "running"})
         if content.get("name") != "command_execution" and not is_subagent:
             return
         if content.get("name") == "command_execution" and not content.get("command"):
-            return
+            if not is_subagent:
+                return
         self._running_tools.add(part_id)
         await self._flush_plan_text()
         await self._message_queue.put(Message(
@@ -2339,23 +2394,117 @@ class OpenCodeAgent(BaseAgent):
             MessageType.TOOL_USE.value, content=content, msg_id=part.get("id")
         ))
 
+    @staticmethod
+    def _extract_tool_session_id(source: Any) -> str:
+        """Best-effort child session id from tool input/metadata/content."""
+        if not isinstance(source, dict):
+            return ""
+        for key in ("sessionID", "sessionId", "session_id", "thread_id", "threadId"):
+            value = source.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _resolve_subagent_session_id(self, tool_id: str, cached: Dict[str, Any]) -> str:
+        if tool_id and tool_id in self._tool_session_ids:
+            return self._tool_session_ids[tool_id]
+        session_id = ""
+        own_session = str(self._session_id or "")
+        for source in (cached.get("metadata"), cached.get("input"), cached):
+            candidate = self._extract_tool_session_id(source)
+            if candidate and candidate not in (own_session, "global"):
+                session_id = candidate
+                break
+        if not session_id and tool_id:
+            # FIFO fallback for parallel subagents: assign the next unassigned
+            # child session created for this parent session.
+            while self._unassigned_child_sessions:
+                candidate = self._unassigned_child_sessions.pop(0)
+                if candidate and candidate not in self._tool_session_ids.values():
+                    session_id = candidate
+                    break
+        if session_id and tool_id:
+            self._tool_session_ids[tool_id] = session_id
+            if tool_id in self._pending_subagent_tool_ids:
+                self._pending_subagent_tool_ids.remove(tool_id)
+            # Keep session id in metadata so processor/header formatting sees it.
+            metadata = cached.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                cached["metadata"] = metadata
+            metadata.setdefault("sessionID", session_id)
+        elif tool_id and tool_id not in self._pending_subagent_tool_ids:
+            self._pending_subagent_tool_ids.append(tool_id)
+        return session_id
+
+    def _on_child_session_created(self, child: str) -> Optional[str]:
+        if not child:
+            return None
+        if child in self._tool_session_ids.values():
+            return None
+        if self._pending_subagent_tool_ids:
+            tool_id = self._pending_subagent_tool_ids.pop(0)
+            self._tool_session_ids[tool_id] = child
+            cached = self._tool_calls.setdefault(tool_id, {})
+            metadata = cached.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                cached["metadata"] = metadata
+            metadata.setdefault("sessionID", child)
+            return tool_id
+        else:
+            if child not in self._unassigned_child_sessions:
+                self._unassigned_child_sessions.append(child)
+            return None
+
     async def _emit_running_tool_v2(
         self, tool_id: str, cached: Dict[str, Any]
     ) -> None:
-        """[OpenCode v2] Emit a running command row once, as soon as it is known."""
-        if tool_id in self._running_tools or tool_id in self._terminal_tools:
+        """[OpenCode v2] Emit a running row for commands/subagents as early as possible."""
+        if tool_id in self._terminal_tools:
             return
         raw_name = str(cached.get("name") or cached.get("tool") or "tool")
-        input_data = cached.get("input")
-        if not isinstance(input_data, dict) or not input_data:
-            return
-        content = _tool_content_from_state(
-            raw_name, {"input": input_data, "status": "running"})
         is_subagent = str(raw_name).lower() in _SUBAGENT_TOOL_NAMES
+        input_data = cached.get("input")
+        if not isinstance(input_data, dict):
+            input_data = {}
+
+        session_id = ""
+        if is_subagent:
+            session_id = self._resolve_subagent_session_id(tool_id, cached)
+
+        if tool_id in self._running_tools:
+            # Allow one rich update when a subagent was first emitted without input.
+            if not (is_subagent and tool_id in self._sparse_running_tools and input_data):
+                return
+            self._sparse_running_tools.discard(tool_id)
+        else:
+            if is_subagent:
+                # Header must include session id (append-only). Wait until known.
+                if not session_id:
+                    if not input_data:
+                        self._sparse_running_tools.add(tool_id)
+                    if tool_id not in self._pending_subagent_tool_ids:
+                        self._pending_subagent_tool_ids.append(tool_id)
+                    return
+                if not input_data:
+                    self._sparse_running_tools.add(tool_id)
+            else:
+                if not input_data:
+                    return
+
+        metadata = cached.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        if session_id and "sessionID" not in metadata:
+            metadata = {**metadata, "sessionID": session_id}
+        content = _tool_content_from_state(
+            raw_name, {"input": input_data, "metadata": metadata, "status": "running"})
         if content.get("name") != "command_execution" and not is_subagent:
             return
         if content.get("name") == "command_execution" and not content.get("command"):
-            return
+            if not is_subagent:
+                return
         self._running_tools.add(tool_id)
         await self._flush_plan_text()
         await self._message_queue.put(Message(
@@ -2576,6 +2725,8 @@ class OpenCodeAgent(BaseAgent):
         input_data = cached.get("input") or properties.get("input", {})
         if not isinstance(input_data, dict):
             input_data = {"value": input_data}
+        if str(raw_name).strip().lower() in _SUBAGENT_TOOL_NAMES and tool_id:
+            self._resolve_subagent_session_id(tool_id, cached)
 
         output_text = properties.get("output")
         if output_text is None and isinstance(properties.get("content"), list):
@@ -3315,9 +3466,14 @@ class OpenCodeAgent(BaseAgent):
             "_seen_permissions",
             "_diff_cache",
             "_running_tools",
+            "_sparse_running_tools",
             "_finished_shells",
             "_shell_commands",
             "_background_shells",
+            "_child_parent_sessions",
+            "_pending_subagent_tool_ids",
+            "_unassigned_child_sessions",
+            "_tool_session_ids",
         ):
             getattr(self, name).clear()
         self._plan_text = ""
@@ -4031,6 +4187,7 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
         exit_code = metadata.get("exit")
         if exit_code is None:
             exit_code = metadata.get("exit_code", metadata.get("exitCode"))
+        workdir = input_data.get("workdir") or input_data.get("cwd")
         content = {
             "name": "command_execution",
             "command": (
@@ -4043,6 +4200,8 @@ def _tool_content_from_state(raw_name: str, state: dict) -> dict:
             "metadata": metadata,
             "exitCode": exit_code,
         }
+        if isinstance(workdir, str) and workdir.strip():
+            content["workdir"] = workdir.strip()
         if input_data.get("background") and str(status or "").strip().lower() in (
                 "running", "pending", "in_progress", "inprogress", "active", "started"):
             # Keep the row in the background state instead of letting turn

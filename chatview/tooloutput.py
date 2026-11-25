@@ -90,7 +90,7 @@ class ToolOutputManager:
         return entry
 
     def add_tool_call(self, anchor, command, output=None, key=None,
-                      status=None, edit=None, status_only=False):
+                      status=None, edit=None, status_only=False, error=None):
         """Register or update a tool call row.
 
         With ``status_only`` the header already lives in the buffer as real
@@ -100,7 +100,8 @@ class ToolOutputManager:
 
         ``command`` is ``{"heading", "summary", "detail", "show_command"}``;
         ``output`` is ``{"summary", "detail"}`` or ``None``; ``status`` is
-        ``"running"``, ``"background"`` or ``None``.
+        ``"running"``, ``"background"`` or ``None``; ``error`` is
+        ``{"detail": ...}`` or ``None``.
 
         When ``key`` already exists the existing row is updated in place
         instead of creating a second phantom. That is how ``running…`` turns
@@ -114,7 +115,7 @@ class ToolOutputManager:
             if existing is not None:
                 return self._update_tool_call(
                     existing, command, output, status, edit,
-                    status_only=status_only)
+                    status_only=status_only, error=error)
         if key is None:
             key = self.REGION_PREFIX + str(self.next_id)
             self.next_id += 1
@@ -133,6 +134,7 @@ class ToolOutputManager:
                 "show_command": command.get("show_command", True),
             },
             "output": None,
+            "error": None,
             "status": status,
             "expanded": False,
         }
@@ -143,6 +145,10 @@ class ToolOutputManager:
                 entry["output"] = {"summary": summary, "detail": detail}
             elif summary:
                 entry["output"] = {"summary": summary, "detail": ""}
+        if error:
+            err_detail = error.get("detail") if isinstance(error, dict) else error
+            if isinstance(err_detail, str) and err_detail:
+                entry["error"] = {"detail": err_detail}
         self.entries.append(entry)
         self._update()
         return entry
@@ -259,7 +265,7 @@ class ToolOutputManager:
         return self.find(key)
 
     def _update_tool_call(self, entry, command, output, status, edit,
-                          status_only=None):
+                          status_only=None, error=None):
         """Apply a later event to an existing tool row in place."""
         if command.get("detail"):
             entry["command"] = {
@@ -277,6 +283,10 @@ class ToolOutputManager:
                 entry["output"] = {"summary": summary, "detail": detail}
             elif summary and not entry.get("output"):
                 entry["output"] = {"summary": summary, "detail": ""}
+        if error is not None:
+            err_detail = error.get("detail") if isinstance(error, dict) else error
+            if isinstance(err_detail, str) and err_detail:
+                entry["error"] = {"detail": err_detail}
         if status_only is not None:
             entry["status_only"] = bool(status_only)
         entry["status"] = status
@@ -353,6 +363,7 @@ class ToolOutputManager:
                 if command_block:
                     sections.append(f"Command\n{command_block}")
             output = entry.get("output")
+            error = entry.get("error")
             if output:
                 output_block = format_fenced_output(output["detail"])
                 if output_block:
@@ -361,6 +372,15 @@ class ToolOutputManager:
                     # A silent background command still needs a Return block
                     # so the row never looks like it lost its output.
                     sections.append("Return\n```text\n(no output)\n```")
+            if error and isinstance(error, dict):
+                error_block = format_fenced_output(
+                    error.get("detail") or "", info="error")
+                if error_block:
+                    indented = "".join(
+                        "  " + line if line.strip() else line
+                        for line in error_block.splitlines(True)
+                    )
+                    sections.append(f"  Error\n{indented}")
         text = "\n".join(sections)
 
         old_regions = self.view.get_regions(entry["detail_key"])
@@ -428,18 +448,35 @@ class ToolOutputManager:
                     {"key": key, "section": section},
                 )
 
+    @staticmethod
+    def _summary_html(summary):
+        text = html.escape(summary or "")
+        for word, cls in (("success", "termmate-status-success"),
+                          ("failed", "termmate-status-failed")):
+            suffix = " " + word
+            if text.endswith(suffix):
+                return (text[: -len(suffix)]
+                        + f" <span class='{cls}'>{word}</span>")
+            if text == word:
+                return f"<span class='{cls}'>{word}</span>"
+        return text
+
     def _tool_call_rows_html(self, entry):
         key = entry["key"]
         label = "hide" if entry["expanded"] else "show"
         output = entry.get("output")
+        error = entry.get("error")
         row_summary = ""
         if output:
             row_summary = output.get("summary") or ""
         elif entry.get("status") in STATUS_LABELS:
             row_summary = STATUS_LABELS[entry["status"]]
         command = entry["command"]
-        can_expand = bool(command.get("show_command")) or bool(
-            (output or {}).get("detail"))
+        can_expand = (
+            bool(command.get("show_command"))
+            or bool((output or {}).get("detail"))
+            or bool((error or {}).get("detail"))
+        )
         links = (f"&nbsp;&nbsp;<a href='toggle:{key}'>{label}</a>"
                  if can_expand else "")
 
@@ -448,7 +485,7 @@ class ToolOutputManager:
                 return ""
             return (
                 "<div class='termmate-tool-row'>"
-                f"<span>⎿ {html.escape(row_summary)}</span>"
+                f"<span>⎿ {self._summary_html(row_summary)}</span>"
                 f"{links}"
                 "</div>"
             )
@@ -465,17 +502,17 @@ class ToolOutputManager:
         if row_summary:
             rows.append(
                 "<div class='termmate-tool-row'>"
-                f"<span>⎿ {html.escape(row_summary)}</span>"
+                f"<span>⎿ {self._summary_html(row_summary)}</span>"
                 f"{links}"
                 "</div>"
             )
         return "".join(rows)
 
     def _output_row_html(self, entry):
-        summary = html.escape(entry.get("summary") or "")
+        summary = entry.get("summary") or ""
         toggle_label = "hide" if entry["expanded"] else "show"
         key = entry["key"]
-        body = f"<span>⎿ {summary}</span>"
+        body = f"<span>⎿ {self._summary_html(summary)}</span>"
         links = f"&nbsp;&nbsp;<a href='toggle:{key}'>{toggle_label}</a>"
         return f"<div class='termmate-tool-row'>{body}{links}</div>"
 
@@ -509,6 +546,8 @@ class ToolOutputManager:
             ".termmate-tool-row a,.termmate-command-row a{color:var(--bluish);"
             "text-decoration:none;}"
             ".termmate-shell-finished{color:var(--bluish);}"
+            ".termmate-status-success{color:var(--greenish);}"
+            ".termmate-status-failed{color:var(--redish);}"
             ".termmate-tool-row a:hover,.termmate-command-row a:hover"
             "{text-decoration:underline;}"
             "</style>"

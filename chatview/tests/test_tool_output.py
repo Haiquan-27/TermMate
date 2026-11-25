@@ -312,7 +312,8 @@ class TestToolOutputManager(unittest.TestCase):
         html = self.manager._row_html(entry)
         self.assertNotIn("class='termmate-command-row'", html)
         self.assertNotIn("⏺ read", html)
-        self.assertIn("⎿ 10 lines success", html)
+        self.assertIn("⎿ 10 lines", html)
+        self.assertIn("termmate-status-success", html)
         self.assertIn(f"toggle:{entry['key']}", html)
 
     def test_status_only_running_row_keeps_show(self):
@@ -338,6 +339,60 @@ class TestToolOutputManager(unittest.TestCase):
         self.manager.toggle(None, entry["key"])
         self.assertNotIn("Command", self.view.text)
         self.assertIn("Return\n```text\nout line\n```\n", self.view.text)
+
+    def test_success_and_failed_summary_colors(self):
+        ok = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ read", "summary": "a.py",
+             "detail": "⏺ read a.py", "show_command": False},
+            {"summary": "2 lines success", "detail": "ok"},
+            status_only=True,
+            key="k-ok",
+        )
+        fail = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ read", "summary": "b.py",
+             "detail": "⏺ read b.py", "show_command": False},
+            {"summary": "3 lines failed", "detail": "bad"},
+            status_only=True,
+            key="k-fail",
+        )
+        ok_html = self.manager._row_html(ok)
+        fail_html = self.manager._row_html(fail)
+        self.assertIn("termmate-status-success", ok_html)
+        self.assertIn(">success<", ok_html)
+        self.assertIn("termmate-status-failed", fail_html)
+        self.assertIn(">failed<", fail_html)
+
+    def test_error_block_rendered_when_expanded(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ edit", "summary": "demo.txt",
+             "detail": "⏺ edit demo.txt", "show_command": False},
+            {"summary": "1 line failed", "detail": ""},
+            status_only=True,
+            error={"detail": "Could not find oldString in demo.txt"},
+        )
+        self.manager.toggle(None, entry["key"])
+        self.assertNotIn("Command", self.view.text)
+        self.assertIn(
+            "  Error\n  ```error\n  Could not find oldString in demo.txt\n  ```\n",
+            self.view.text)
+        self.assertNotIn("Return\n```text\nCould not find oldString", self.view.text)
+
+    def test_error_makes_row_expandable(self):
+        entry = self.manager.add_tool_call(
+            self.anchor,
+            {"heading": "⏺ edit", "summary": "demo.txt",
+             "detail": "⏺ edit demo.txt", "show_command": False},
+            {"summary": "1 line failed", "detail": ""},
+            status_only=True,
+            error={"detail": "No changes to apply"},
+        )
+        html = self.manager._row_html(entry)
+        self.assertIn(f"toggle:{entry['key']}", html)
+        self.assertIn("⎿ 1 line", html)
+        self.assertIn("termmate-status-failed", html)
 
     def test_shell_finished_row_has_no_toggle_and_is_blue(self):
         entry = self.manager.add_shell_finished(
@@ -429,7 +484,8 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertEqual(len(self.manager.entries), 1)
         html = self.manager._row_html(entry)
         self.assertNotIn("running…", html)
-        self.assertIn("⎿ 2 lines success", html)
+        self.assertIn("⎿ 2 lines", html)
+        self.assertIn("termmate-status-success", html)
 
     def test_update_refreshes_expanded_detail(self):
         command = {"heading": "⏺ command", "summary": "npm test", "detail": "npm test"}
@@ -488,7 +544,8 @@ class TestToolOutputManager(unittest.TestCase):
         self.assertIsNone(entry["status"])
         html = self.manager._row_html(entry)
         self.assertNotIn("running in background", html)
-        self.assertIn("⎿ 0 lines success", html)
+        self.assertIn("⎿ 0 lines", html)
+        self.assertIn("termmate-status-success", html)
 
     def test_truncate_drops_rows_at_or_after_cut_point(self):
         first = self.manager.add(sublime.Region(2, 2), "1 line", "a")
@@ -526,41 +583,44 @@ class TestFormatToolResult(unittest.TestCase):
         return self.processor.format_tool_result(block)
 
     def test_short_output_is_inline(self):
-        inline, summary, detail = self._result(
+        inline, summary, detail, error = self._result(
             name="command_execution",
             output="ok\ndone",
             status="completed",
         )
         self.assertIn("```text", inline)
         self.assertIn("ok\ndone", inline)
-        self.assertEqual((summary, detail), ("", ""))
+        self.assertEqual((summary, detail, error), ("", "", ""))
 
     def test_long_output_is_collapsed(self):
         output = "\n".join(f"line {i}" for i in range(10))
-        inline, summary, detail = self._result(
+        inline, summary, detail, error = self._result(
             name="command_execution", output=output, status="completed"
         )
         self.assertEqual(inline, "")
         self.assertEqual(summary, "10 lines success")
         self.assertEqual(detail, output)
+        self.assertEqual(error, "")
 
     def test_error_summary_is_marked_failed(self):
         output = "\n".join(f"err {i}" for i in range(6))
-        _, summary, _ = self._result(
+        _, summary, detail, error = self._result(
             name="command_execution", output="", error=output, status="error"
         )
         self.assertEqual(summary, "6 lines failed")
+        self.assertEqual(detail, "")
+        self.assertEqual(error, output)
 
     def test_uppercase_error_status_is_failed(self):
         output = "\n".join(f"err {i}" for i in range(6))
-        _, summary, _ = self._result(
+        _, summary, _, _ = self._result(
             name="command_execution", output=output, status="ERROR"
         )
         self.assertEqual(summary, "6 lines failed")
 
     def test_nonzero_exit_code_is_failed(self):
         output = "\n".join(f"line {i}" for i in range(6))
-        _, summary, _ = self._result(
+        _, summary, _, _ = self._result(
             name="command_execution",
             output=output,
             status="completed",
@@ -569,20 +629,20 @@ class TestFormatToolResult(unittest.TestCase):
         self.assertEqual(summary, "6 lines failed")
 
     def test_edit_tool_is_not_rendered_twice(self):
-        inline, summary, detail = self._result(
+        inline, summary, detail, error = self._result(
             name="edit",
             input={"path": "a.py"},
             output="Edited a.py",
             metadata={"diff": "@@ -1 +1 @@"},
             status="completed",
         )
-        self.assertEqual((inline, summary, detail), ("", "", ""))
+        self.assertEqual((inline, summary, detail, error), ("", "", "", ""))
 
     def test_empty_output_renders_nothing(self):
-        self.assertEqual(self._result(output="", status="completed"), ("", "", ""))
+        self.assertEqual(self._result(output="", status="completed"), ("", "", "", ""))
 
     def test_ansi_is_stripped(self):
-        inline, _, detail = self._result(
+        inline, _, detail, _ = self._result(
             output="\x1b[32mgreen\x1b[0m", status="completed"
         )
         self.assertIn("green", inline)
@@ -667,7 +727,7 @@ class TestFormatToolCall(unittest.TestCase):
         self.assertEqual(call["output"]["summary"], "10 lines success")
         self.assertEqual(call["output"]["detail"], output)
 
-    def test_edit_tool_output_is_not_duplicated(self):
+    def test_edit_tool_with_diff_gets_status_phantom(self):
         text, phantoms = self.processor.format_tool_call({
             "name": "edit",
             "input": {"path": "a.py"},
@@ -676,7 +736,11 @@ class TestFormatToolCall(unittest.TestCase):
             "status": "completed",
         })
         self.assertTrue(text.startswith("⏺ edit"))
-        self.assertEqual(phantoms, [])
+        self.assertEqual(len(phantoms), 1)
+        call = phantoms[0]
+        self.assertTrue(call.get("status_only"))
+        self.assertIn("success", (call.get("output") or {}).get("summary", ""))
+        self.assertEqual((call.get("output") or {}).get("detail", ""), "")
 
     def test_read_with_long_output_keeps_header_row(self):
         output = "\n".join(f"line {i}" for i in range(10))

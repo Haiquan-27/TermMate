@@ -394,8 +394,15 @@ class BaseChatMessageProcessor:
         self._plan_text_rendered = False
         self._tool_file_re = _make_tool_file_re(self._TOOL_FILE_NAMES) if self._TOOL_FILE_NAMES else None
         self._ends_with_newline = True
-        # Message ids whose "Subagent" prefix has already been emitted.
-        self._subagent_text_started = set()
+        # Accumulated subagent text keyed by child session / subagent key.
+        self._subagent_text_buffers = {}
+        self._subagent_session_to_tool_key = {}
+        self._subagent_tool_key_to_session = {}
+        self._subagent_tool_blocks = {}
+        # Tool call keys already rendered in this view.  This avoids a race where
+        # the ST main thread hasn't registered the phantom yet but a terminal
+        # update arrives and would otherwise append a duplicate row.
+        self._rendered_tool_keys = set()
 
     def format_model_badge(self, m: dict) -> str:
         """Format a compact reasoning/thinking badge based strictly on structured capabilities."""
@@ -488,7 +495,11 @@ class BaseChatMessageProcessor:
                 return
             if message.type == "turn_started":
                 self._ends_with_newline = True
-                self._subagent_text_started.clear()
+                self._subagent_text_buffers.clear()
+                self._subagent_session_to_tool_key.clear()
+                self._subagent_tool_key_to_session.clear()
+                self._subagent_tool_blocks.clear()
+                # Keep _rendered_tool_keys: tool rows persist in the buffer across turns.
             if message.type in ("stop", "result"):
                 outputs = getattr(self.session, "tool_outputs", None)
                 if outputs is not None:
@@ -499,18 +510,12 @@ class BaseChatMessageProcessor:
         raise NotImplementedError
 
     def _handle_subagent_text(self, message):
-        """Render a subagent text chunk with a one-time prefix.
-
-        Subagent text is a separate message type so it is visible without being
-        mistaken for the parent agent's answer.
-        """
+        """Accumulate subagent text; show it behind the tool-call phantom on result."""
         content = message.content if isinstance(message.content, str) else ""
         if not content:
             return
         self.session.start_loading()
         raw = message.raw_data if isinstance(message.raw_data, dict) else {}
-        # Message(**kwargs) stores provider fields in ``raw_data`` using
-        # underscore names, while Codex protocol payloads use camelCase.
         thread_id = (
             raw.get("thread_id") or raw.get("threadId")
             or raw.get("threadID") or ""
@@ -519,24 +524,25 @@ class BaseChatMessageProcessor:
             raw.get("subagent_id") or raw.get("subagentId")
             or raw.get("itemId") or ""
         )
-        key = thread_id or subagent_id or getattr(message, "id", None) or "subagent"
-        key = str(key)
-        if key not in self._subagent_text_started:
-            # A different child session is a different answer.  Start it on
-            # its own paragraph instead of concatenating it after the previous
-            # child's last Markdown line.
-            if not getattr(self, "_ends_with_newline", True):
-                self.append_content("\n\n")
-            elif self._subagent_text_started:
-                self.append_content("\n")
-            label = thread_id or subagent_id
-            prefix = "↳ Subagent"
-            if label:
-                prefix += f" {label}"
-            self.append_content(prefix + ": ", live=True)
-            self._subagent_text_started.add(key)
-            self.last_is_tool_call = False
-        self.append_content(content, live=True)
+        session_key = str(thread_id or subagent_id or getattr(message, "id", None) or "subagent")
+        self._subagent_text_buffers[session_key] = (
+            self._subagent_text_buffers.get(session_key, "") + content
+        )
+
+        # If the tool call is already rendered and terminal, update its output.
+        tool_key = self._subagent_session_to_tool_key.get(session_key)
+        if not tool_key:
+            return
+        outputs = getattr(self.session, "tool_outputs", None)
+        if outputs is None or not outputs.find(str(tool_key)):
+            return
+        block = getattr(self, "_subagent_tool_blocks", {}).get(str(tool_key))
+        if not isinstance(block, dict):
+            return
+        status = str(block.get("status") or "").lower()
+        if status in ("running", "pending", "in_progress", "inprogress", ""):
+            return
+        self.append_tool_call(block, key=str(tool_key))
 
     def _render_diff_block(self, diff_text):
         if not diff_text:
@@ -553,28 +559,34 @@ class BaseChatMessageProcessor:
     def format_tool_result(self, block, force_collapse=False):
         """Render a completed tool result for the chat view.
 
-        Returns ``(inline_text, summary, detail)``:
+        Returns ``(inline_text, summary, detail, error_detail)``:
 
         - ``inline_text``: fenced block to append directly to the transcript
           (short output, stays selectable and searchable)
         - ``summary`` / ``detail``: data for a collapsed phantom row
           (long output is only written to the buffer when expanded)
+        - ``error_detail``: error text for a separate Error block when the
+          tool failed; empty when no error block should be shown
 
         ``force_collapse`` keeps even short output behind the phantom row.
         Command tool calls use it so their success/failed row never vanishes.
 
-        Edit-like tools return three empty strings because ``_format_tool_block``
+        Edit-like tools return four empty strings because ``_format_tool_block``
         already renders their diff.
         """
         if not isinstance(block, dict):
-            return "", "", ""
+            return "", "", "", ""
 
         name = str(block.get("name") or "").lower()
         metadata = block.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
-        if metadata.get("diff") or name in _DIFF_TOOL_NAMES:
-            return "", "", ""
+        has_diff = bool(metadata.get("diff")) or name in _DIFF_TOOL_NAMES
+        raw_error = block.get("error")
+        status = str(block.get("status") or "").lower()
+        is_error = bool(raw_error) or status in ("error", "failed", "failure")
+        if has_diff and not is_error:
+            return "", "", "", ""
 
         output = block.get("output")
         if isinstance(output, list):
@@ -583,7 +595,32 @@ class BaseChatMessageProcessor:
                 for item in output
                 if isinstance(item, dict) and item.get("type") == "text"
             )
-        text = output if output else block.get("error")
+        error = block.get("error")
+        if isinstance(output, str):
+            output = output
+        elif output is None:
+            output = ""
+        else:
+            output = str(output)
+        if isinstance(error, str):
+            error_text = error
+        elif isinstance(error, dict):
+            error_text = (
+                error.get("message")
+                or error.get("error")
+                or error.get("detail")
+                or str(error)
+            )
+            if not isinstance(error_text, str):
+                error_text = str(error_text)
+        elif error is None:
+            error_text = ""
+        else:
+            error_text = str(error)
+
+        has_real_output = bool(output.strip())
+        has_error = bool(error_text.strip()) or _tool_result_status(block) == "failed"
+        text = output if has_real_output else error_text
         if not isinstance(text, str):
             text = "" if text is None else str(text)
 
@@ -605,20 +642,53 @@ class BaseChatMessageProcessor:
             text, inline_lines, inline_max_chars
         )
         if mode is None:
-            return "", "", ""
+            if has_error and error_text.strip():
+                # Failed tool with no classifiable output - still show Error.
+                _, err_cleaned = utils.classify_tool_output(
+                    error_text, 0, 0
+                )
+                if err_cleaned:
+                    err_lines = len(err_cleaned.splitlines())
+                    err_unit = "line" if err_lines == 1 else "lines"
+                    return "", f"{err_lines} {err_unit} failed", "", err_cleaned
+            return "", "", "", ""
 
         line_count = len(cleaned.splitlines())
         unit = "line" if line_count == 1 else "lines"
         summary = f"{line_count} {unit} {_tool_result_status(block)}"
 
-        if mode == "inline" and not force_collapse:
-            return utils.format_fenced_output(cleaned), "", ""
-        return "", summary, cleaned
+        error_detail = ""
+        if has_error and error_text.strip():
+            _, err_cleaned = utils.classify_tool_output(
+                error_text, 0, 0
+            )
+            error_detail = err_cleaned or error_text
+            # Avoid duplicating the same text in Return and Error blocks.
+            if not has_real_output and error_detail.strip() == cleaned.strip():
+                cleaned_for_return = ""
+            else:
+                cleaned_for_return = cleaned if has_real_output else ""
+        else:
+            cleaned_for_return = cleaned
+
+        if mode == "inline" and not force_collapse and not error_detail:
+            return utils.format_fenced_output(cleaned), "", "", ""
+        return "", summary, cleaned_for_return, error_detail
 
     def _command_text(self, block):
         """Return the raw command for command-like tools, else None."""
         name = str(block.get("name") or "").lower()
-        if name == "command_execution":
+        if name in ("command_execution", "shell", "command"):
+            value = block.get("command")
+            if not isinstance(value, str) or not value.strip():
+                inp = block.get("input")
+                if isinstance(inp, dict):
+                    value = inp.get("command") or inp.get("cmd")
+        elif name == "bash":
+            # Only intercept command_execution-shaped Bash blocks (top-level
+            # command). Claude Bash uses input.command and is formatted by
+            # ClaudeMessageProcessor._format_tool_block; intercepting it would
+            # regress its rendering.
             value = block.get("command")
         elif name in ("run_command", "runcommand"):
             params = block.get("parameters")
@@ -632,15 +702,67 @@ class BaseChatMessageProcessor:
                 or params.get("cmd")
                 or block.get("command")
             )
+        elif name in ("tool", "unknown", ""):
+            value = block.get("command")
+            if not isinstance(value, str) or not value.strip():
+                inp = block.get("input")
+                if isinstance(inp, dict):
+                    value = inp.get("command") or inp.get("cmd")
+                else:
+                    value = None
         else:
             return None
         if not isinstance(value, str) or not value.strip():
             return None
         return value.replace("\r\n", "\n").replace("\r", "\n")
 
+    def _command_workdir(self, block):
+        """Return workdir label when it differs from session cwd, else ''."""
+        if not isinstance(block, dict):
+            return ""
+        workdir = block.get("workdir")
+        if not isinstance(workdir, str) or not workdir.strip():
+            inp = block.get("input")
+            if isinstance(inp, dict):
+                workdir = inp.get("workdir") or inp.get("cwd")
+            else:
+                workdir = ""
+        if not isinstance(workdir, str) or not workdir.strip():
+            meta = block.get("metadata")
+            if isinstance(meta, dict):
+                workdir = meta.get("workdir") or meta.get("cwd")
+        if not isinstance(workdir, str) or not workdir.strip():
+            return ""
+        workdir = workdir.strip()
+        cwd = ""
+        try:
+            cwd = (self.session.agent_thread.cwd
+                   if self.session and self.session.agent_thread else getattr(self.session, "cwd", "")) or ""
+        except Exception:
+            cwd = ""
+        if cwd:
+            try:
+                norm_wd = os.path.normcase(os.path.normpath(workdir))
+                norm_cwd = os.path.normcase(os.path.normpath(cwd))
+                if norm_wd == norm_cwd:
+                    return ""
+                # Show relative path when inside cwd for readability
+                try:
+                    rel = os.path.relpath(workdir, cwd)
+                    if not rel.startswith(".."):
+                        workdir = rel
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        return workdir.replace("\\", "/").rstrip("/")
+
     def _command_heading(self, block):
         name = str(block.get("name") or "").lower()
         label = "RunCommand" if name in ("run_command", "runcommand") else "command"
+        workdir = self._command_workdir(block)
+        if workdir:
+            return f"⏺ {label} [{workdir}]"
         return f"⏺ {label}"
 
     def _command_preview(self, command, limit=_COMMAND_PREVIEW_MAX_CHARS):
@@ -683,6 +805,24 @@ class BaseChatMessageProcessor:
         metadata = block.get("metadata")
         return isinstance(metadata, dict) and bool(metadata.get("diff"))
 
+    @staticmethod
+    def _subagent_session_id(block):
+        """Extract child session id for a subagent tool call, if present."""
+        if not isinstance(block, dict):
+            return ""
+        input_data = block.get("input") or {}
+        if not isinstance(input_data, dict):
+            input_data = {}
+        metadata = block.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        for source in (block, input_data, metadata):
+            for key in ("sessionID", "sessionId", "session_id", "thread_id", "threadId"):
+                value = source.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return ""
+
     def format_tool_call(self, block, key=None):
         """Return ``(text, phantoms)`` for one tool call.
 
@@ -711,6 +851,10 @@ class BaseChatMessageProcessor:
             phase = _tool_call_phase(block)
             heading = self._command_heading(block)
             summary = self._command_preview(command)
+            workdir = self._command_workdir(block)
+            detail = command.rstrip("\n")
+            if workdir:
+                detail = f"[{workdir}] {detail}"
             call = {
                 "line": 0,
                 "kind": "tool_call",
@@ -719,7 +863,7 @@ class BaseChatMessageProcessor:
                 "command": {
                     "heading": heading,
                     "summary": summary,
-                    "detail": command.rstrip("\n"),
+                    "detail": detail,
                     "show_command": True,
                 },
                 "output": None,
@@ -727,11 +871,15 @@ class BaseChatMessageProcessor:
             if phase:
                 call["status"] = phase
             else:
-                _, out_summary, out_detail = self.format_tool_result(
+                _, out_summary, out_detail, out_error = self.format_tool_result(
                     block, force_collapse=True)
-                if out_detail:
+                if out_error:
+                    call["error"] = {"detail": out_error}
+                if out_detail or out_error:
                     call["output"] = {
-                        "summary": out_summary, "detail": out_detail}
+                        "summary": out_summary,
+                        "detail": out_detail,
+                    }
                 elif any(k in block for k in ("output", "error", "exitCode")):
                     # A finished command that printed nothing still needs a
                     # row: otherwise "running…" would simply vanish when it
@@ -743,17 +891,49 @@ class BaseChatMessageProcessor:
             return f"{heading} {summary}".strip(), [call]
 
         text = self._format_tool_block(block)
-        if (self._is_diff_tool(block) or not text.startswith("⏺")
-                or text.count("⏺") != 1):
-            # Diff blocks are document-like and stay inline text. Multi-file
-            # blocks keep their per-file headers instead of collapsing into
-            # one row.
+        has_inline_body = "\n" in text
+        is_diff_inline = self._is_diff_tool(block) and has_inline_body
+        if (not text.startswith("⏺") or text.count("⏺") != 1):
+            # Multi-file blocks keep their per-file headers.
             return text, []
+        if is_diff_inline:
+            header_line = text.partition("\n")[0]
+            heading, summary = self._split_tool_header(header_line)
+            phase = _tool_call_phase(block)
+            _, out_summary, out_detail, out_error = self.format_tool_result(
+                block, force_collapse=True)
+            if not out_summary:
+                body_lines = max(0, len(text.splitlines()) - 1)
+                unit = "line" if body_lines == 1 else "lines"
+                out_summary = f"{body_lines} {unit} {_tool_result_status(block)}"
+            call = {
+                "line": 0,
+                "kind": "tool_call",
+                "key": key,
+                "status_only": True,
+                "command": {
+                    "heading": heading,
+                    "summary": summary,
+                    "detail": header_line,
+                    "show_command": False,
+                },
+                "output": None,
+            }
+            if phase:
+                call["status"] = phase
+            else:
+                if out_error:
+                    call["error"] = {"detail": out_error}
+                call["output"] = {
+                    "summary": out_summary,
+                    "detail": out_detail,
+                }
+            return text, [call]
 
         header_line = text.partition("\n")[0]
         heading, summary = self._split_tool_header(header_line)
         phase = _tool_call_phase(block)
-        _, out_summary, out_detail = self.format_tool_result(
+        _, out_summary, out_detail, out_error = self.format_tool_result(
             block, force_collapse=True)
         call = {
             "line": 0,
@@ -770,15 +950,21 @@ class BaseChatMessageProcessor:
         }
         if phase:
             call["status"] = phase
-        elif out_detail:
-            call["output"] = {"summary": out_summary, "detail": out_detail}
-        elif any(k in block for k in ("output", "error", "exitCode")):
-            call["output"] = {
-                "summary": f"0 lines {_tool_result_status(block)}",
-                "detail": "",
-            }
         else:
-            return text, []
+            if out_error:
+                call["error"] = {"detail": out_error}
+            if out_detail or out_error:
+                call["output"] = {
+                    "summary": out_summary,
+                    "detail": out_detail,
+                }
+            elif any(k in block for k in ("output", "error", "exitCode")):
+                call["output"] = {
+                    "summary": f"0 lines {_tool_result_status(block)}",
+                    "detail": "",
+                }
+            else:
+                return text, []
         return text, [call]
 
     def append_content(self, text, flush=False, is_tool=False, tool_phantoms=None,
@@ -815,8 +1001,12 @@ class BaseChatMessageProcessor:
 
     def has_tool_call(self, key):
         """Return True when a phantom row was already rendered for ``key``."""
+        if not key:
+            return False
+        if key in getattr(self, "_rendered_tool_keys", set()):
+            return True
         outputs = getattr(self.session, "tool_outputs", None)
-        return bool(key and outputs and outputs.find(key) is not None)
+        return bool(outputs and outputs.find(key) is not None)
 
     @staticmethod
     def message_key(message):
@@ -853,6 +1043,25 @@ class BaseChatMessageProcessor:
             },
         }
 
+    def _attach_subagent_output(self, block, key=None, session_id=""):
+        """Attach accumulated subagent text as tool output on terminal status."""
+        if not isinstance(block, dict):
+            return
+        status = str(block.get("status") or "").lower()
+        if status in ("running", "pending", "in_progress", "inprogress"):
+            return
+        session_id = str(session_id or self._subagent_session_id(block) or "")
+        if not session_id and key:
+            session_id = str(self._subagent_tool_key_to_session.get(str(key)) or "")
+        if not session_id:
+            return
+        text = self._subagent_text_buffers.get(session_id)
+        if not isinstance(text, str) or not text.strip():
+            return
+        # Preserve explicit error; otherwise expose subagent answer as output.
+        if not block.get("output") and not block.get("error"):
+            block["output"] = text
+
     def append_tool_call(self, block, key=None):
         """Append one tool call, or update its existing phantom row.
 
@@ -861,6 +1070,15 @@ class BaseChatMessageProcessor:
         row's position and, when the row is expanded, refreshes the visible
         ``Command`` / ``Return`` blocks.
         """
+        if _is_subagent_tool(block):
+            session_id = self._subagent_session_id(block)
+            if session_id and key:
+                self._subagent_session_to_tool_key[str(session_id)] = str(key)
+                self._subagent_tool_key_to_session[str(key)] = str(session_id)
+            if key:
+                self._subagent_tool_blocks[str(key)] = block
+            self._attach_subagent_output(block, key=key, session_id=session_id)
+
         is_update = self.has_tool_call(key)
         rendered, phantoms = self.format_tool_call(block, key=key)
         if _is_subagent_tool(block):
@@ -871,6 +1089,8 @@ class BaseChatMessageProcessor:
                     block.get("name") or block.get("tool"),
                     block.get("status"),
                 )
+        if key:
+            self._rendered_tool_keys.add(str(key))
         if is_update and phantoms:
             for item in phantoms:
                 item["update"] = True
@@ -1149,7 +1369,7 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                 else:
                     return f"⏺ Read {rel_path}"
 
-        elif name in ("Agent", "Task"):
+        elif name in ("Agent", "Task", "Subagent", "agent", "task", "subagent"):
             description = input_data.get("description", "")
             subagent_type = input_data.get("subagent_type", "")
 
@@ -1158,6 +1378,9 @@ class ClaudeMessageProcessor(BaseChatMessageProcessor):
                 parts.append(subagent_type)
             if description:
                 parts.append(description)
+            session_id = self._subagent_session_id(block)
+            if session_id:
+                parts.append(str(session_id))
 
             return " ".join(parts)
 
@@ -1776,6 +1999,34 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
         if not isinstance(input_data, dict):
             input_data = {"value": input_data}
         lower_name = (name or "tool").lower()
+        if lower_name in ("tool", "unknown", ""):
+            inferred = ""
+            alt = block.get("tool") or block.get("toolName") or block.get("tool_name")
+            if isinstance(alt, str) and alt.strip() and alt.strip().lower() not in ("tool", "unknown"):
+                inferred = alt.strip()
+            if not inferred:
+                if "oldString" in input_data or "newString" in input_data:
+                    inferred = "edit"
+                elif "patch" in input_data or "patchText" in input_data:
+                    inferred = "apply_patch"
+                elif "command" in input_data or "cmd" in input_data:
+                    cmd_val = input_data.get("command") or input_data.get("cmd")
+                    if isinstance(cmd_val, str) and cmd_val.strip():
+                        inferred = "shell"
+                elif input_data.get("filePath") or input_data.get("file_path") or input_data.get("path"):
+                    if "content" in input_data and "oldString" not in input_data:
+                        inferred = "write"
+                    else:
+                        inferred = "read"
+                elif "query" in input_data and ("url" in input_data or "urls" in input_data):
+                    inferred = "webfetch"
+                elif "query" in input_data:
+                    inferred = "websearch"
+                elif "pattern" in input_data:
+                    inferred = "glob"
+            if inferred:
+                name = inferred
+                lower_name = str(inferred).lower()
         display_name = {
             "apply_patch": "edit",
             "webfetch": "webFetch",
@@ -1856,6 +2107,29 @@ class OpenCodeMessageProcessor(BaseChatMessageProcessor):
             header = f"⏺ {display_name} {rel_path}"
             rendered_diff = self._render_diff_block(diff_text)
             return f"{header}\n{rendered_diff}" if rendered_diff else header
+
+        is_subagent = lower_name in ("task", "agent", "subagent")
+        if is_subagent:
+            subagent_type = input_data.get("subagent_type") or input_data.get("agent") or ""
+            description = input_data.get("description") or ""
+            parts = [str(display_name)]
+            if subagent_type:
+                parts.append(str(subagent_type))
+            if description:
+                parts.append(str(description))
+            session_id = self._subagent_session_id(block)
+            if session_id:
+                parts.append(str(session_id))
+            return f"⏺ {' '.join(parts)}"
+
+        command_block = block
+        if str(block.get("name") or "").lower() != lower_name:
+            command_block = {**block, "name": name}
+        command = self._command_text(command_block)
+        if command:
+            heading = self._command_heading(command_block)
+            preview = self._command_preview(command)
+            return f"{heading} {preview}".strip()
 
         detail = block.get("title") or _format_tool_arguments(input_data)
         if block.get("status") == "error" and block.get("error"):
