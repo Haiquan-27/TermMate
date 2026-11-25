@@ -176,6 +176,102 @@ class TestResumeSessionAsyncLoading(unittest.TestCase):
         )
 
 
+class TestResumeSessionMarkersAndSelection(unittest.TestCase):
+    def _open_items(self, cmd, window, threads, sessions=None):
+        if sessions is None:
+            sessions = list(_SESSIONS)
+        cmd._load_sessions = MagicMock(return_value=sessions)
+        with patch.object(chatview_mod.threading, "Thread", side_effect=threads), \
+             patch.object(chatview_mod.sublime, "set_timeout",
+                          side_effect=lambda fn, delay=0: fn()):
+            cmd.run(view_id=24)
+            threads.targets[0].target()
+        args = window.show_quick_panel.call_args.args
+        kwargs = window.show_quick_panel.call_args.kwargs
+        return args[0], kwargs
+
+    def test_working_session_gets_dot_marker(self):
+        cmd, window = _make_command()
+        threads = _CapturedThreads()
+        working = MagicMock()
+        working.chat_view.is_valid.return_value = True
+        working.chat_view.settings.return_value.get.side_effect = (
+            lambda k, d=None: "ses_222222" if k == chatview_mod.CHAT_SESSION_ID else d
+        )
+        working.loading_animation.is_loading = True
+        working.agent_thread.session_id = "ses_222222"
+
+        with patch.object(chatview_mod.chat_threads, "sessions", {99: working}), \
+             patch.object(chatview_mod, "chatview_sessions", {99: working}), \
+             patch.object(chatview_mod, "is_chat_view", return_value=False), \
+             patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session", return_value=None):
+            items, _ = self._open_items(cmd, window, threads)
+
+        self.assertNotIn("●", items[0][1])
+        self.assertIn("●", items[1][1])
+
+    def test_current_session_is_preselected_not_marked(self):
+        cmd, window = _make_command()
+        threads = _CapturedThreads()
+        target_view = MagicMock()
+        target_view.id.return_value = 24
+        window.views.return_value = [target_view]
+        current_session = MagicMock()
+        current_session.chat_view.settings.return_value.get.side_effect = (
+            lambda k, d=None: "ses_222222" if k == chatview_mod.CHAT_SESSION_ID else d
+        )
+        current_session.agent_thread.session_id = "ses_222222"
+        current_session.loading_animation.is_loading = False
+
+        with patch.object(chatview_mod, "chatview_sessions", {24: current_session}), \
+             patch.object(chatview_mod, "is_chat_view",
+                          side_effect=lambda v: v is target_view), \
+             patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session", return_value=current_session):
+            items, kwargs = self._open_items(cmd, window, threads)
+
+        self.assertNotIn("●", items[1][1])
+        self.assertEqual(kwargs.get("selected_index"), 1)
+
+    def test_non_chat_view_has_no_preselection(self):
+        cmd, window = _make_command()
+        threads = _CapturedThreads()
+        view = MagicMock()
+        view.id.return_value = 24
+        window.views.return_value = [view]
+        window.active_view.return_value = view
+
+        with patch.object(chatview_mod, "chatview_sessions", {}), \
+             patch.object(chatview_mod, "is_chat_view", return_value=False), \
+             patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session", return_value=None):
+            _, kwargs = self._open_items(cmd, window, threads)
+
+        self.assertEqual(kwargs.get("selected_index", -1), -1)
+
+    def test_missing_current_session_has_no_preselection(self):
+        cmd, window = _make_command()
+        threads = _CapturedThreads()
+        target_view = MagicMock()
+        target_view.id.return_value = 24
+        window.views.return_value = [target_view]
+        current_session = MagicMock()
+        current_session.chat_view.settings.return_value.get.side_effect = (
+            lambda k, d=None: "ses_999999" if k == chatview_mod.CHAT_SESSION_ID else d
+        )
+        current_session.agent_thread.session_id = "ses_999999"
+        current_session.loading_animation.is_loading = False
+
+        with patch.object(chatview_mod, "chatview_sessions", {24: current_session}), \
+             patch.object(chatview_mod, "is_chat_view", return_value=True), \
+             patch.object(chatview_mod.chat_threads,
+                          "get_active_or_primary_session", return_value=current_session):
+            _, kwargs = self._open_items(cmd, window, threads)
+
+        self.assertEqual(kwargs.get("selected_index", -1), -1)
+
+
 class TestResumeCwdResolution(unittest.TestCase):
     def _bare_command(self):
         window = MagicMock()

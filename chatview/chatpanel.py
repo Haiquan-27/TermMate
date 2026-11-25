@@ -2,7 +2,7 @@ import logging
 import html
 import sublime
 
-from .utils import format_token_count
+from .utils import format_token_count, loading_log
 
 
 LOG = logging.getLogger("TermMate")
@@ -271,19 +271,47 @@ class LoadingAnimation:
     """
     Manages a loading animation phantom with start/stop control.
     """
-    def __init__(self, view):
+    def __init__(self, view, on_tick=None):
         self.view = view
         self.phantom_set = sublime.PhantomSet(view, "chatview_loading")
         self.is_loading = False
         self.loading_text = None
         self.frame_index = 0
         self.frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self.on_tick = on_tick
+
+    def current_frame(self):
+        """Return the current spinner frame, or idle marker when not loading."""
+        if not self.is_loading:
+            return "▣"
+        return self.frames[self.frame_index % len(self.frames)]
+
+    def _notify_tick(self, frame):
+        """Notify listeners so tab titles/status bars can follow the spinner."""
+        if not callable(self.on_tick):
+            return
+
+        def _fire():
+            try:
+                self.on_tick(frame)
+            except Exception as exc:
+                LOG.warning("loading indicator callback failed: %s", exc)
+
+        sublime.set_timeout(_fire, 0)
 
     def start(self, region, text=None):
         """Start the loading animation at the specified region."""
         # ALWAYS update the region provider, even if already loading
         self.region_provider = region
         self.loading_text = text
+
+        loading_log(
+            "loading_animation_start",
+            view_id=self.view.id(),
+            view_name=self.view.name(),
+            text=text,
+            was_loading=self.is_loading,
+        )
 
         if not self.is_loading:
             self.is_loading = True
@@ -292,13 +320,41 @@ class LoadingAnimation:
 
     def stop(self):
         """Stop the loading animation and clear the phantom."""
+        loading_log(
+            "loading_animation_stop",
+            view_id=self.view.id(),
+            view_name=self.view.name(),
+            was_loading=self.is_loading,
+        )
         self.is_loading = False
+        self._notify_tick("▣")
         # Clear on next tick to avoid thread issues if called from background
-        sublime.set_timeout(lambda: self.phantom_set.update([]), 0)
+        def clear():
+            loading_log(
+                "loading_animation_clear_phantom",
+                view_id=self.view.id(),
+                view_name=self.view.name(),
+                is_loading=self.is_loading,
+            )
+            self.phantom_set.update([])
+
+        sublime.set_timeout(clear, 0)
 
     def _update_animation(self):
         """Update the loading animation frame."""
         if not self.is_loading:
+            loading_log(
+                "loading_animation_tick_bail",
+                view_id=self.view.id(),
+                view_name=self.view.name(),
+            )
+            return
+        try:
+            if not self.view.is_valid():
+                self.is_loading = False
+                return
+        except Exception:
+            self.is_loading = False
             return
 
         # Resolve current region
@@ -333,6 +389,7 @@ class LoadingAnimation:
             html,
             sublime.LAYOUT_BLOCK
         )])
+        self._notify_tick(frame)
 
         # Schedule next frame
         self.frame_index += 1

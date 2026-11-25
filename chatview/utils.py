@@ -12,6 +12,35 @@ except ImportError:  # chatview is also imported as a top-level test package
 
 LOG = logging.getLogger("TermMate")
 
+LOADING_LOG_PATH = "/tmp/termmate-loading.log"
+
+
+def loading_log(event, **fields):
+    """Append a JSON line to the loading debug log. Best-effort, never raises."""
+    try:
+        import json
+        import os
+        import threading
+        import time
+
+        fields["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        fields["event"] = event
+        fields["pid"] = os.getpid()
+        fields["thread"] = threading.current_thread().name
+        try:
+            import sublime
+
+            win = sublime.active_window()
+            view = win.active_view() if win else None
+            fields["active_view_id"] = view.id() if view else None
+            fields["active_view_name"] = view.name() if view else None
+        except Exception:
+            pass
+        with open(LOADING_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(fields, ensure_ascii=False, default=str) + "\n")
+    except Exception:
+        pass
+
 
 def get_log_level(level_name):
     """Maps log level names to logging constants."""

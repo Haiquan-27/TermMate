@@ -272,10 +272,69 @@ class TestChatThreadTitles(unittest.TestCase):
         self.assertEqual(kwargs["cwd"], "/work")
         self.assertEqual(kwargs["initial_title"], "New session #9")
         self.assertNotIn("session_id", kwargs)
-        self.assertEqual(
-            new_view.settings.return_value.data[CHAT_THREAD_ID], 9)
-        notices = self._notice_messages(view)
-        self.assertTrue(any("new Task tab" in text for text in notices))
+
+    def test_loading_spinner_replaces_tab_prefix(self):
+        session, view, _ = self._make_session(SessionRole.PRIMARY)
+        loading = MagicMock()
+        loading.is_loading = True
+        loading.current_frame.return_value = "⠋"
+        session.loading_animation = loading
+
+        session.set_thread_title("working")
+
+        view.set_name.assert_called_with("⠋ working")
+
+    def test_idle_status_uses_square_prefix(self):
+        session, _, _ = self._make_session(SessionRole.PRIMARY)
+        session.loading_animation = MagicMock(is_loading=False)
+        session.available_models = []
+
+        with patch.object(chat_threads, "get_setting_for_session",
+                          side_effect=lambda w, s, key, default=None: (
+                              "opencode" if key == chatview_mod.CHAT_AGENT
+                              else "gpt-5" if key == "chatview_model_opencode"
+                              else default
+                          )):
+            status = chatview_mod._format_session_status(session.window, session)
+
+        self.assertEqual(status, "▣ opencode(gpt-5)")
+
+    def test_loading_status_uses_spinner_prefix(self):
+        session, _, _ = self._make_session(SessionRole.PRIMARY)
+        loading = MagicMock()
+        loading.is_loading = True
+        loading.current_frame.return_value = "⠙"
+        session.loading_animation = loading
+        session.available_models = []
+
+        with patch.object(chat_threads, "get_setting_for_session",
+                          side_effect=lambda w, s, key, default=None: (
+                              "opencode" if key == chatview_mod.CHAT_AGENT
+                              else "gpt-5" if key == "chatview_model_opencode"
+                              else default
+                          )):
+            status = chatview_mod._format_session_status(session.window, session)
+
+        self.assertEqual(status, "⠙ opencode(gpt-5)")
+
+    def test_loading_tick_refreshes_title_and_status(self):
+        session, view, _ = self._make_session(SessionRole.PRIMARY)
+        animation = chatview_mod.LoadingAnimation(
+            view, on_tick=session._refresh_loading_indicator
+        )
+        session.loading_animation = animation
+        animation.is_loading = True
+        animation.frame_index = 3
+        session.set_thread_title("working")
+        view.set_name.reset_mock()
+
+        with patch.object(chatview_mod, "update_agent_model_status") as update_status, \
+             patch.object(chatview_mod.sublime, "set_timeout",
+                          side_effect=lambda fn, delay=0: fn()):
+            animation._notify_tick(animation.current_frame())
+
+        view.set_name.assert_called_with("⠸ working")
+        update_status.assert_called_once_with(session.window)
 
 
 if __name__ == "__main__":

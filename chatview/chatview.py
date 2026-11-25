@@ -308,7 +308,11 @@ def _format_session_status(window, session):
     if think_level and has_annotation:
         display_model = f"{display_model} :{think_level}"
 
-    return f"▣ {agent_provider}({display_model})"
+    prefix = "▣"
+    loading = getattr(session, "loading_animation", None)
+    if loading and loading.is_loading:
+        prefix = loading.current_frame()
+    return f"{prefix} {agent_provider}({display_model})"
 
 
 def update_agent_model_status(window, view=None):
@@ -1843,7 +1847,9 @@ class ChatSession:
         self._reset_markdown_formatter()
         self.cwd = cwd
         self.add_dirs = add_dirs or []
-        self.loading_animation = LoadingAnimation(self.chat_view)
+        self.loading_animation = LoadingAnimation(
+            self.chat_view, on_tick=self._refresh_loading_indicator
+        )
         self.table_phantoms = TablePhantomManager(self.chat_view)
         self.tool_outputs = ToolOutputManager(
             self.chat_view, get_input_start, set_input_start
@@ -1998,14 +2004,21 @@ class ChatSession:
             return self._normalize_thread_title(title)
         return ""
 
+    def _loading_prefix(self):
+        loading = getattr(self, "loading_animation", None)
+        if loading and loading.is_loading:
+            return loading.current_frame()
+        return "▣"
+
     def _thread_display_name(self):
         title = ""
         if self.chat_view:
             title = self._normalize_thread_title(
                 self.chat_view.settings().get(CHAT_THREAD_TITLE, "")
             )
+        prefix = self._loading_prefix()
         if not title and self._untitled_after_reset:
-            return f"{THREAD_TITLE_PREFIX}{UNTITLED_LABEL}"
+            return f"{prefix} {UNTITLED_LABEL}"
         if not title and self.role == SessionRole.TASK:
             base = self._primary_thread_title() or UNTITLED_LABEL
             number = self.chat_view.settings().get(CHAT_THREAD_ID) if self.chat_view else None
@@ -2015,7 +2028,19 @@ class ChatSession:
                 title = base
         if not title:
             title = UNTITLED_LABEL
-        return f"{THREAD_TITLE_PREFIX}{title}"
+        return f"{prefix} {title}"
+
+    def _refresh_loading_indicator(self, frame=None):
+        """Refresh tab name and status bar while the loading spinner advances."""
+        if not self.chat_view:
+            return
+        try:
+            if not self.chat_view.is_valid():
+                return
+        except Exception:
+            pass
+        self.chat_view.set_name(self._thread_display_name())
+        update_agent_model_status(self.window)
 
     def set_thread_title(self, title):
         """Store the raw server title and refresh the chat tab name."""
@@ -2374,6 +2399,13 @@ class ChatSession:
 
     def _handle_agent_message(self, message):
         """Handle messages received from the agent thread."""
+        plugin.loading_log(
+            "session_received_agent_message",
+            view_id=self.chat_view.id() if self.chat_view else None,
+            view_name=self.chat_view.name() if self.chat_view else None,
+            message_type=str(getattr(message, "type", "") or "")
+            if not isinstance(message, tuple) else f"tuple:{message[0]}",
+        )
         self.message_processor.handle_message(message)
 
     def set_token_usage(self, usage: dict):
@@ -2384,7 +2416,25 @@ class ChatSession:
 
     def start_loading(self, text=None):
         """Start the loading animation."""
+        plugin.loading_log(
+            "chat_session_start_loading_queued",
+            view_id=self.chat_view.id() if self.chat_view else None,
+            view_name=self.chat_view.name() if self.chat_view else None,
+            session_id=str(self.chat_view.settings().get(CHAT_SESSION_ID) or "")
+            if self.chat_view else "",
+            text=text,
+            already_loading=self.loading_animation.is_loading,
+            has_sent_message=self.has_sent_message,
+        )
+
         def start():
+            plugin.loading_log(
+                "chat_session_start_loading_run",
+                view_id=self.chat_view.id() if self.chat_view else None,
+                view_name=self.chat_view.name() if self.chat_view else None,
+                text=text,
+                already_loading=self.loading_animation.is_loading,
+            )
             self.token_summary_phantom.clear()
             self.loading_animation.start(self.loading_region, text)
             self.model_phantom.set_running(True)
@@ -2392,7 +2442,23 @@ class ChatSession:
         sublime.set_timeout(start, 0)
 
     def stop_loading(self):
+        plugin.loading_log(
+            "chat_session_stop_loading_queued",
+            view_id=self.chat_view.id() if self.chat_view else None,
+            view_name=self.chat_view.name() if self.chat_view else None,
+            session_id=str(self.chat_view.settings().get(CHAT_SESSION_ID) or "")
+            if self.chat_view else "",
+            was_loading=self.loading_animation.is_loading,
+            has_sent_message=self.has_sent_message,
+        )
+
         def stop():
+            plugin.loading_log(
+                "chat_session_stop_loading_run",
+                view_id=self.chat_view.id() if self.chat_view else None,
+                view_name=self.chat_view.name() if self.chat_view else None,
+                was_loading=self.loading_animation.is_loading,
+            )
             quick_popup_manager.finish(self.chat_view.id())
             self.loading_animation.stop()
             self.model_phantom.set_running(False)
@@ -4991,19 +5057,50 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
                 return
 
             normalized_cwd = self._normalized_dir(cwd)
+            working_session_ids = set()
+            for sess in chatview_sessions.values():
+                try:
+                    if not (sess and sess.chat_view and sess.chat_view.is_valid()):
+                        continue
+                    if not (sess.loading_animation and sess.loading_animation.is_loading):
+                        continue
+                    sid = sess.chat_view.settings().get(CHAT_SESSION_ID)
+                    if not sid and sess.agent_thread:
+                        sid = sess.agent_thread.session_id
+                    if sid:
+                        working_session_ids.add(str(sid))
+                except Exception:
+                    pass
+
+            selected_index = -1
+            target_view = self._resolve_view(view_id)
+            current_view_sid = None
+            if target_view is not None and is_chat_view(target_view):
+                target_session = chatview_sessions.get(target_view.id())
+                if target_session and target_session.chat_view:
+                    current_view_sid = target_session.chat_view.settings().get(CHAT_SESSION_ID)
+                    if not current_view_sid and target_session.agent_thread:
+                        current_view_sid = target_session.agent_thread.session_id
+                if not current_view_sid:
+                    current_view_sid = target_view.settings().get(CHAT_SESSION_ID)
+                if current_view_sid:
+                    current_view_sid = str(current_view_sid)
+
             items = []
-            for s in sessions:
-                sid = s["session_id"]
-                summary = s["summary"] or "(empty)"
+            for idx, s in enumerate(sessions):
+                sid = str(s.get("session_id") or "")
+                summary = s.get("summary") or "(empty)"
                 if len(summary) > self._PREVIEW_LEN:
                     summary = summary[:self._PREVIEW_LEN] + "…"
                 dt = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
-                marker = "  ●" if sid == current_session_id else ""
+                marker = "  ●" if sid and sid in working_session_ids else ""
                 subtitle = f"{sid[:8]}  {dt}{marker}"
                 directory = s.get("directory")
                 if directory and self._normalized_dir(directory) != normalized_cwd:
                     subtitle += f"  [{directory}]"
                 items.append([summary, subtitle])
+                if current_view_sid and sid == current_view_sid:
+                    selected_index = idx
 
             def on_select(index):
                 if index < 0:
@@ -5048,7 +5145,12 @@ class TermChatResumeSessionCommand(sublime_plugin.WindowCommand):
 
                 sublime.status_message(f"Opened session {str(chosen_id)[:8]} in a new tab")
 
-            self.window.show_quick_panel(items, on_select, placeholder=placeholder)
+            self.window.show_quick_panel(
+                items,
+                on_select,
+                selected_index=selected_index,
+                placeholder=placeholder,
+            )
 
         threading.Thread(target=_load, daemon=True).start()
 

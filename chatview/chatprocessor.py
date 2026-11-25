@@ -539,6 +539,20 @@ class BaseChatMessageProcessor:
 
     def handle_message(self, message):
         """Dispatch agent message to appropriate handler."""
+        try:
+            utils.loading_log(
+                "agent_message",
+                view_id=self.session.chat_view.id() if self.session.chat_view else None,
+                view_name=self.session.chat_view.name() if self.session.chat_view else None,
+                session_id=str(self.session.chat_view.settings().get("chatview_session_id") or "")
+                if self.session.chat_view else "",
+                message_type=str(getattr(message, "type", "") or "")
+                if not isinstance(message, tuple) else f"tuple:{message[0]}",
+                loading=self.session.loading_animation.is_loading
+                if getattr(self.session, "loading_animation", None) else None,
+            )
+        except Exception:
+            pass
         # Handle error strings passed from thread wrapper
         if message == "error":
             pass
@@ -590,7 +604,6 @@ class BaseChatMessageProcessor:
         content = message.content if isinstance(message.content, str) else ""
         if not content:
             return
-        self.session.start_loading()
         raw = message.raw_data if isinstance(message.raw_data, dict) else {}
         thread_id = (
             raw.get("thread_id") or raw.get("threadId")
