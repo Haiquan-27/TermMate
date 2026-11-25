@@ -2645,6 +2645,134 @@ class TestOpenCodeSessionsAndResumption(unittest.TestCase):
         self.assertEqual(tool_block["name"], "command_execution")
         self.assertEqual(tool_block["output"], "3 passed\n")
 
+    def test_get_opencode_session_info_includes_compaction_summary(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")
+        session = {"id": "ses_c", "title": "Compacted",
+                   "time": {"updated": 1600000060000}}
+        messages = [
+            {
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": "Hello"}],
+                "time": {"created": 1600000010000},
+            },
+            {
+                "info": {"role": "assistant"},
+                "parts": [{"type": "text", "text": "Hi there"}],
+                "time": {"created": 1600000020000},
+            },
+            {
+                "info": {"role": "user", "summary": {"diffs": []}},
+                "parts": [{"type": "compaction", "auto": True}],
+                "time": {"created": 1600000030000},
+            },
+            {
+                "info": {
+                    "role": "assistant",
+                    "mode": "compaction",
+                    "agent": "compaction",
+                    "summary": True,
+                },
+                "parts": [
+                    {"type": "step-start"},
+                    {"type": "text", "text": "## Summary\n\n- Did work"},
+                ],
+                "time": {"created": 1600000031000},
+            },
+            {
+                "info": {"role": "user"},
+                "parts": [{"type": "text", "text": "Continue"}],
+                "time": {"created": 1600000040000},
+            },
+            {
+                "info": {"role": "assistant"},
+                "parts": [{"type": "text", "text": "Continuing"}],
+                "time": {"created": 1600000050000},
+            },
+        ]
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            if path == "/api/session/ses_c":
+                return session
+            if path == "/api/session/ses_c/message":
+                return messages
+            return None
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            with patch(
+                "genfoundry.opencode_agent._sync_request", side_effect=fake_request
+            ):
+                info = get_opencode_session_info("ses_c", cwd="/workspace")
+
+        self.assertIsNotNone(info)
+        turns = info["turns"]
+        self.assertEqual(len(turns), 2)
+        self.assertEqual(turns[0]["prompt"], "Hello")
+        self.assertEqual(turns[1]["prompt"], "Continue")
+        compaction_events = [
+            e for e in turns[0]["events"] if e.get("kind") == "compaction"
+        ]
+        self.assertEqual(len(compaction_events), 1)
+        self.assertTrue(compaction_events[0]["auto"])
+        self.assertIn("Did work", compaction_events[0]["summary"])
+        self.assertNotIn("Did work", turns[0].get("response") or "")
+
+    def test_get_opencode_session_info_fork_without_user_turns(self):
+        mock_server = SimpleNamespace(url="http://127.0.0.1:50000", password="")
+        session = {"id": "ses_fork", "title": "Fork",
+                   "time": {"updated": 1600000090000}}
+        messages = [
+            {
+                "type": "assistant",
+                "content": [
+                    {"type": "tool", "id": "tool_1", "state": {
+                        "status": "completed",
+                        "input": {"filePath": "a.py"},
+                        "content": [{"type": "text", "text": "1 line"}],
+                    }},
+                ],
+                "time": {"created": 1600000010000},
+            },
+            {
+                "type": "compaction",
+                "status": "completed",
+                "reason": "auto",
+                "summary": "## Summary\n\nForked context.",
+                "time": {"created": 1600000020000},
+            },
+            {
+                "type": "assistant",
+                "content": [{"type": "text", "text": "Done."}],
+                "time": {"created": 1600000030000},
+            },
+            {"type": "idle", "time": {"created": 1600000040000}},
+        ]
+
+        def fake_request(base_url, path, cwd, extra_env, password=None):
+            if path == "/api/session/ses_fork":
+                return session
+            if path == "/api/session/ses_fork/message":
+                return messages
+            return None
+
+        with patch("genfoundry.opencode_agent._SyncOpenCodeServer") as mock_cls:
+            mock_cls.return_value.__enter__.return_value = mock_server
+            with patch(
+                "genfoundry.opencode_agent._sync_request", side_effect=fake_request
+            ):
+                info = get_opencode_session_info("ses_fork", cwd="/workspace")
+
+        self.assertIsNotNone(info)
+        turns = info["turns"]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["prompt"], "")
+        events = turns[0]["events"]
+        self.assertEqual([e["kind"] for e in events],
+                         ["tool", "compaction", "assistant"])
+        self.assertTrue(events[1]["auto"])
+        self.assertIn("Forked context.", events[1]["summary"])
+        self.assertEqual(events[2]["text"], "Done.")
+
     def test_probe_opencode_service(self):
         class _MockContext:
             def __enter__(self):

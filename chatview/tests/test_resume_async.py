@@ -524,6 +524,29 @@ class TestRenderFullHistory(unittest.TestCase):
         chatview_mod.ChatSession._render_full_history(session, None)
         self.assertEqual(self._appended_texts(session), [])
 
+    def test_replays_compaction_summary_event(self):
+        session = MagicMock()
+        session.markdown_formatter.format.side_effect = lambda text, **kw: text
+        session.markdown_formatter.take_html_tables.return_value = []
+        session._replay_prompt = MagicMock()
+        turn = {
+            "events": [
+                {"kind": "user", "text": "question"},
+                {
+                    "kind": "compaction",
+                    "summary": "## Prior context\n\nCondensed history.",
+                    "auto": True,
+                },
+            ]
+        }
+
+        chatview_mod.ChatSession._replay_turn_events(session, turn)
+
+        texts = "\n".join(self._appended_texts(session))
+        self.assertIn("Context auto-compacted", texts)
+        self.assertIn("Condensed history.", texts)
+        self.assertNotIn("Session compacted", texts)
+
 
 class TestReplayToolResult(unittest.TestCase):
     def test_replayed_tool_call_keeps_result_for_show_link(self):

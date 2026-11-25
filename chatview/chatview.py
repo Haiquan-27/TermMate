@@ -3497,7 +3497,20 @@ class ChatSession:
                 )
                 separator_pending = False
 
-            if kind == "assistant":
+            if kind == "compaction":
+                auto = bool(event.get("auto"))
+                heading = "Context auto-compacted" if auto else "Session compacted"
+                summary_text = str(event.get("summary") or "").strip()
+                block = f"\n🗜️ **{heading}**\n"
+                if summary_text:
+                    block += f"\n{summary_text}\n\n"
+                formatter = self.markdown_formatter
+                rendered = formatter.format(block, flush=True)
+                self.chat_view.run_command("term_chat_output_append", {
+                    "text": rendered,
+                    "html_tables": formatter.take_html_tables(),
+                })
+            elif kind == "assistant":
                 text = event.get("text")
                 if text:
                     formatter = self.markdown_formatter

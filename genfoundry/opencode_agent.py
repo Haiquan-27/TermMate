@@ -4332,14 +4332,37 @@ def get_opencode_session_info(
                             event["shell_id"] = str(metadata["shellID"])
                         turn["events"].append(event)
 
+            pending_compaction_auto = None
+
+            def _ensure_turn() -> dict:
+                nonlocal current
+                if current is None:
+                    current = {"prompt": "", "response": None, "events": []}
+                return current
+
             for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 info = entry.get("info") or {}
+                if not isinstance(info, dict):
+                    info = {}
                 role = info.get("role") or entry.get("type")
                 text = _text_from_entry(entry)
 
-                if role == "user" and text:
+                if role == "user":
+                    # Compaction marker: user message with a compaction part and no
+                    # prompt text. Keep the auto flag for the following summary.
+                    if not text:
+                        parts = entry.get("parts")
+                        if not isinstance(parts, list):
+                            parts = entry.get("content")
+                        if isinstance(parts, list):
+                            for part in parts:
+                                if (isinstance(part, dict)
+                                        and part.get("type") == "compaction"):
+                                    pending_compaction_auto = bool(part.get("auto"))
+                                    break
+                        continue
                     if current is not None:
                         turns.append(current)
                     current = {
@@ -4347,17 +4370,63 @@ def get_opencode_session_info(
                         "response": None,
                         "events": [{"kind": "user", "text": text}],
                     }
-                elif role == "assistant" and text and current is not None:
-                    response = current["response"]
-                    current["response"] = f"{response}\n\n{text}" if response else text
-                    _append_assistant_events(current, entry)
+                    pending_compaction_auto = None
+                elif role == "compaction" or entry.get("type") == "compaction":
+                    summary_text = entry.get("summary")
+                    if not isinstance(summary_text, str) or not summary_text.strip():
+                        summary_text = text
+                    summary_text = (summary_text or "").strip()
+                    reason = str(entry.get("reason") or info.get("reason") or "")
+                    auto = pending_compaction_auto if pending_compaction_auto is not None else (reason != "manual")
+                    event = {
+                        "kind": "compaction",
+                        "summary": summary_text,
+                        "auto": bool(auto),
+                    }
+                    pending_compaction_auto = None
+                    _ensure_turn()["events"].append(event)
+                elif role == "assistant" and (
+                    info.get("summary") is True
+                    or info.get("mode") == "compaction"
+                    or info.get("agent") == "compaction"
+                ):
+                    # Compaction summary: render as a compaction block, not as
+                    # regular assistant text, so resume replay matches live output.
+                    summary_text = text
+                    if not summary_text:
+                        parts = entry.get("parts")
+                        if not isinstance(parts, list):
+                            parts = entry.get("content")
+                        if isinstance(parts, list):
+                            summary_text = "\n\n".join(
+                                str(part.get("text") or "").strip()
+                                for part in parts
+                                if isinstance(part, dict)
+                                and part.get("type") == "text"
+                                and str(part.get("text") or "").strip()
+                            ).strip()
+                    reason = str(info.get("reason") or entry.get("reason") or "")
+                    auto = pending_compaction_auto if pending_compaction_auto is not None else (reason != "manual")
+                    event = {
+                        "kind": "compaction",
+                        "summary": summary_text,
+                        "auto": bool(auto),
+                    }
+                    pending_compaction_auto = None
+                    _ensure_turn()["events"].append(event)
                 elif role == "assistant" and current is not None:
-                    # Assistant message without text (tool-only): still replay tools.
+                    if text:
+                        response = current["response"]
+                        current["response"] = f"{response}\n\n{text}" if response else text
                     _append_assistant_events(current, entry)
-                elif role == "synthetic" and current is not None:
-                    info = entry.get("info")
-                    if not isinstance(info, dict):
-                        info = {}
+                elif role == "assistant":
+                    # Assistant message before any user prompt (subagent/continuation).
+                    turn = _ensure_turn()
+                    if text:
+                        response = turn["response"]
+                        turn["response"] = f"{response}\n\n{text}" if response else text
+                    _append_assistant_events(turn, entry)
+                elif role == "synthetic":
                     metadata = entry.get("metadata")
                     if not isinstance(metadata, dict):
                         metadata = info.get("metadata") or {}
@@ -4367,7 +4436,7 @@ def get_opencode_session_info(
                         failed = _shell_result_failed(
                             metadata.get("state"), exit_code
                         )
-                        current["events"].append({
+                        _ensure_turn()["events"].append({
                             "kind": "shell",
                             "shell_id": str(
                                 metadata.get("shellID")
